@@ -1,10 +1,9 @@
 require('dotenv').config();
-console.log(process.env);
 module.exports = {
   serverPort: 7071,
   dbUser: 'root',
   dbPort: 3306,
-  dbhost: 'localhost',
+  dbhost: '127.0.0.1',
   maxConcurrentTasks: 10,
   quotaPerUser: 10, // GB
   storagePath: './tmp/',
