@@ -11,6 +11,16 @@ let dbCli = null;
 
 const taskQueue = new Map();
 
+/**
+ * This function runs a task with a given ID. It updates the task status in the database,
+ * downloads the file associated with the task if it's not already downloaded, uploads the file
+ * to FluxDrive if it's not already uploaded, and removes the local file once it's uploaded.
+ * If any step fails, it increments the task's fail count and logs the failure.
+ *
+ * @async
+ * @param {string|number} id - The ID of the task to run.
+ * @throws Will throw an error if the task fails.
+ */
 async function runTask(id) {
   console.log(`ruuning task ${id}`);
   const task = taskQueue.get(id);
@@ -55,6 +65,15 @@ async function runTask(id) {
   }
 }
 
+/**
+ * This function updates the task queue. It first removes any tasks from the queue that have been running for more than an hour.
+ * Then, if the queue has space, it fetches the latest remaining tasks from the database and adds them to the queue.
+ * It only fetches tasks that have not finished and have failed less than three times.
+ * It then runs each newly added task.
+ *
+ * @async
+ * @throws Will throw an error if the database query fails.
+ */
 async function updateQueue() {
   // remove failed tasks from queue
   const now = Math.floor(Date.now() / 1000);
@@ -81,6 +100,11 @@ async function updateQueue() {
   }
 }
 
+/**
+ * Initializes the backup service.
+ *
+ * @async
+ */
 async function init() {
   log.info('Initiating Database...');
   dbCli = await DBClient.createClient();
@@ -90,6 +114,12 @@ async function init() {
   }, 10 * 1000);
 }
 
+/**
+ * Checks if a given string is a valid URL.
+ *
+ * @param {string} string - The string to check.
+ * @returns {boolean} - Returns true if the string is a valid URL, false otherwise.
+ */
 function isValidUrl(string) {
   try {
     // eslint-disable-next-line no-new
@@ -100,6 +130,18 @@ function isValidUrl(string) {
   }
 }
 
+/**
+ * This function registers a backup task. It first extracts parameters from the request,
+ * validates the user session, and checks the validity of the provided parameters.
+ * It then checks if the user has enough storage quota and if the task is a duplicate.
+ * If all checks pass, it adds the task to the database and runs the task if there is space in the queue.
+ * If any step fails, it logs the error and sends an error message as the response.
+ *
+ * @async
+ * @param {Object} req - The request object.
+ * @param {Object} res - The response object.
+ * @throws Will throw an error if the user session is invalid, parameters are invalid, user quota is full, task is a duplicate, or database operation fails.
+ */
 async function registerBackupTask(req, res) {
   let { appname } = req.params;
   appname = appname || req.query.appname;
@@ -180,6 +222,16 @@ async function registerBackupTask(req, res) {
   }
 }
 
+/**
+ * This function retrieves a list of backup tasks for a specific application.
+ * It first extracts the application name from the request, validates the user session, and checks the validity of the application name.
+ * If any step fails, it logs the error and sends an error message as the response.
+ *
+ * @async
+ * @param {Object} req - The request object.
+ * @param {Object} res - The response object.
+ * @throws Will throw an error if the user session is invalid, application name is invalid, or database operation fails.
+ */
 async function getBackupList(req, res) {
   let { appname } = req.params;
   appname = appname || req.query.appname;
@@ -218,6 +270,7 @@ async function getBackupList(req, res) {
     res.json(errMessage);
   }
 }
+
 module.exports = {
   init,
   registerBackupTask,
