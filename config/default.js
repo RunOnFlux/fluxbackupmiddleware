@@ -1,5 +1,5 @@
 require('dotenv').config();
-console.log(process.env.HCP_APP_ID);
+console.log(process.env);
 module.exports = {
   serverPort: 7071,
   dbUser: 'root',
