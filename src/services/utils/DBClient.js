@@ -43,7 +43,6 @@ class DBClient {
   async init() {
     this.dbPass = await Vault.getKey('dbpass');
     await this.createStream();
-    console.log(this.dbPass);
     this.connection = await mySql.createConnection({
       password: this.dbPass,
       user: config.dbUser,
