@@ -31,6 +31,7 @@ class DBClient {
       stream.once('error', (err) => {
         stream.removeListener('connection', resolve);
         stream.removeListener('data', resolve);
+        console.log('error creating stream.');
         reject(err);
       });
     });
@@ -40,9 +41,9 @@ class DBClient {
   * [init]
   */
   async init() {
-    console.log(this.InitDB);
     this.dbPass = await Vault.getKey('dbpass');
     await this.createStream();
+    console.log(this.dbPass);
     this.connection = await mySql.createConnection({
       password: this.dbPass,
       user: config.dbUser,
