@@ -4,7 +4,7 @@ Stores Flux Dapp images to FluxDrive
 
 ## Requirements
 
-Requires node version 12.0 and above, mysql
+Requires node version 16.0 and above, mysql 8.0 and above
 
 ## Installation
 
@@ -22,4 +22,4 @@ Start the service with command:
 npm start
 ```
 
-Service will be started on 127.0.0.1:7071
+Service will be started on 127.0.0.1:8080
