@@ -21,7 +21,7 @@ class Vault {
           client_id: config.HCPClientID,
           client_secret: config.HCPClientSecret,
         };
-        log.info(requestData);
+        log.info(config.dbUser);
         const response = await axios({
           method: 'post',
           url: config.HCPEndpointURL,
