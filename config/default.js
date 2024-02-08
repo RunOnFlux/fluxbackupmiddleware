@@ -1,12 +1,6 @@
 require('dotenv').config();
 
-const { HCP_ENDPOINT_URL } = process.env;
-const { HCP_CLIENT_ID } = process.env;
-const { HCP_CLIENT_SECRET } = process.env;
-const { HCP_ORG_ID } = process.env;
-const { HCP_PROJECT_ID } = process.env;
-const { HCP_APP_ID } = process.env;
-module.exports = {
+const config = {
   serverPort: 7071,
   dbUser: 'root',
   dbPort: 3306,
@@ -16,11 +10,13 @@ module.exports = {
   storagePath: './tmp/',
   hostAPIPath: '/',
   fluxTeamZelId: '1hjy4bCYBJr4mny4zCE85J94RXa8W6q37',
-  HCPEndpointURL: HCP_ENDPOINT_URL,
-  HCPClientID: HCP_CLIENT_ID,
-  HCPClientSecret: HCP_CLIENT_SECRET,
-  HCPOrgID: HCP_ORG_ID,
-  HCPProjectID: HCP_PROJECT_ID,
-  HCPAppID: HCP_APP_ID,
+  HCPEndpointURL: process.env.HCP_ENDPOINT_URL,
+  HCPClientID: process.env.HCP_CLIENT_ID,
+  HCPClientSecret: process.env.HCP_CLIENT_SECRET,
+  HCPOrgID: process.env.HCP_ORG_ID,
+  HCPProjectID: process.env.HCP_PROJECT_ID,
+  HCPAppID: process.env.HCP_APP_ID,
   version: '1.0.0',
 };
+console.log(config);
+module.exports = config;
