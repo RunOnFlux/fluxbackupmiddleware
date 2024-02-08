@@ -8,13 +8,21 @@ const config = require('../../config/default');
 const path = config.storagePath;
 const apiPath = config.hostAPIPath;
 
+/**
+ * checks if a file exists
+ *
+ * @param {string} fileName - The task object.
+ */
 function fileExists(filename) {
   return fs.existsSync(path + filename);
 }
 
 /**
-* [deleteFile]
-*/
+ * Deletes given filename
+ *
+ * @param {string} fileName - The task object.
+ * @throws Will throw an error if it fails.
+ */
 function deleteFile(fileName) {
   try {
     fs.unlinkSync(path + fileName);
@@ -24,6 +32,14 @@ function deleteFile(fileName) {
   }
 }
 
+/**
+ * Downloads a file from a host for a given task.
+ *
+ * @async
+ * @param {Object} task - The task object.
+ * @returns {Promise<boolean>} - A promise that resolves to true when the file is successfully downloaded.
+ * @throws Will throw an error if the download fails.
+ */
 async function downloadFileFromHost(task) {
   return new Promise((resolve, reject) => {
     const { filename } = task;
