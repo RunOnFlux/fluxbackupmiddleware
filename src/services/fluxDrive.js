@@ -9,6 +9,12 @@ const log = require('../lib/log');
 const Vault = require('./Vault');
 const config = require('../../config/default');
 
+/**
+ * Retrieves the status from the FluxDrive server.
+ *
+ * @async
+ * @returns {Promise<Object|null>} - A promise that resolves to the status data if the request is successful, or null if the request fails.
+ */
 async function getStatus() {
   const ZELID = await Vault.getKey('zelid');
   const API_KEY = await Vault.getKey('apikey');
@@ -28,6 +34,12 @@ async function getStatus() {
   }
 }
 
+/**
+ * Retrieves filelist from the FluxDrive server.
+ *
+ * @async
+ * @returns {Promise<Object|null>} - A promise that resolves to the file list if the request is successful, or null if the request fails.
+ */
 async function getFileList() {
   const ZELID = await Vault.getKey('zelid');
   const API_KEY = await Vault.getKey('apikey');
@@ -47,6 +59,14 @@ async function getFileList() {
   }
 }
 
+/**
+ * Uploads a file to the FluxDrive server.
+ *
+ * @async
+ * @param {Object} file - The task object from task Queue.
+ * @returns {Promise<Object>} - A promise that resolves to the server's response when the file is successfully uploaded.
+ * @throws Will throw an error if the upload fails.
+ */
 async function uploadFile(file) {
   const { filename } = file;
   const filePath = config.storagePath + filename;

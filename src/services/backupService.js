@@ -101,7 +101,7 @@ async function updateQueue() {
 }
 
 /**
- * Initializes the backup service.
+ * Initializes the backup service and DB.
  *
  * @async
  */
