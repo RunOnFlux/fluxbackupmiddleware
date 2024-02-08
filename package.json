@@ -1,0 +1,42 @@
+{
+  "name": "flux-backup-middleware",
+  "version": "1.0.0",
+  "description": "",
+  "main": "server.js",
+  "scripts": {
+    "test": "node server.js",
+    "start": "node server.js",
+    "lint": "eslint ./",
+    "lint:fix": "eslint ./ --fix"
+  },
+  "author": "Ali Mahdavi",
+  "license": "ISC",
+  "dependencies": {
+    "@babel/eslint-parser": "^7.22.15",
+    "axios": "^1.6.5",
+    "bitcoinjs-message": "^2.2.0",
+    "body-parser": "^1.20.2",
+    "child_process": "^1.0.2",
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "express-rate-limit": "^7.1.5",
+    "form-data": "^4.0.0",
+    "https": "^1.0.0",
+    "memory-cache": "^0.2.0",
+    "morgan": "^1.10.0",
+    "mysql2": "^3.9.1",
+    "nano-ethereum-signer": "^0.1.2",
+    "path": "^0.12.7",
+    "qs": "^6.11.2",
+    "ssh2": "^1.14.0",
+    "timers": "^0.1.1",
+    "util": "^0.12.5",
+    "zeltrezjs": "^2.12.0"
+  },
+  "devDependencies": {
+    "eslint": "^8.14.0",
+    "eslint-config-airbnb-base": "^15.0.0",
+    "eslint-plugin-import": "^2.25.4",
+    "power-assert": "^1.6.1"
+  }
+}
