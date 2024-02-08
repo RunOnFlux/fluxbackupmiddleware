@@ -1,3 +1,4 @@
+require('dotenv').config();
 module.exports = {
   serverPort: 7071,
   dbUser: 'root',
