@@ -19,4 +19,5 @@ const config = {
   version: '1.0.0',
 };
 console.log(config);
+console.log(process.env.HCP_APP_ID);
 module.exports = config;
