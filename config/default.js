@@ -1,6 +1,6 @@
 require('dotenv').config();
 console.log(process.env.HCP_APP_ID);
-const config = {
+module.exports = {
   serverPort: 7071,
   dbUser: 'root',
   dbPort: 3306,
@@ -18,5 +18,3 @@ const config = {
   HCPAppID: process.env.HCP_APP_ID,
   version: '1.0.0',
 };
-console.log(config);
-module.exports = config;
