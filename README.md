@@ -22,4 +22,4 @@ Start the service with command:
 npm start
 ```
 
-Service will be started on 127.0.0.1:8080
+Service will be started on 127.0.0.1:2052
