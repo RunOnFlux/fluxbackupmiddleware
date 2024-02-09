@@ -255,12 +255,12 @@ async function getBackupList(req, res) {
       let i = 0;
       for (; i < result.length; i += 1) {
         if (Object.prototype.hasOwnProperty.call(temp, result[i].timestamp)) {
-          temp[result[i].timestamp].components.push({ componentName: result[i].component, hash: result[i].hash, filesize: result[i].filesize });
+          temp[result[i].timestamp].components.push({ component: result[i].component, hash: result[i].hash, filesize: result[i].filesize });
         } else {
           if (i > 0) {
             checkpoints.push({ timestamp: result[i - 1].timestamp, components: temp[result[i - 1].timestamp].components });
           }
-          temp[result[i].timestamp] = { components: [{ componentName: result[i].component, hash: result[i].hash, filesize: result[i].filesize }] };
+          temp[result[i].timestamp] = { components: [{ component: result[i].component, hash: result[i].hash, filesize: result[i].filesize }] };
         }
       }
       checkpoints.push({ timestamp: result[i - 1].timestamp, components: temp[result[i - 1].timestamp].components });
