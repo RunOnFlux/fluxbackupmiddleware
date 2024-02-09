@@ -93,9 +93,9 @@ async function updateQueue() {
     for (let i = 0; i < records.length; i += 1) {
       if (!taskQueue.has(records[i].taskId)) {
         // add task to the queue
-        taskQueue.set(records[i].taskId, records[i]);
+        taskQueue.set(Number(records[i].taskId), records[i]);
         // run task
-        runTask(records[i].taskId);
+        runTask(Number(records[i].taskId));
       }
     }
     console.log(taskQueue.entries());
@@ -211,8 +211,8 @@ async function registerBackupTask(req, res) {
     if (taskQueue.size < config.maxConcurrentTasks) {
       const task = await dbCli.getTask(taskId);
       if (task) {
-        taskQueue.set(taskId, task);
-        runTask(taskId);
+        taskQueue.set(Number(taskId), task);
+        runTask(Number(taskId));
       }
     }
     const phraseResponse = messageHelper.createDataMessage({ taskId });
