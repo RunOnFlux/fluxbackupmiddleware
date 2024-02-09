@@ -7,7 +7,8 @@ const log = require('../lib/log');
 
 const goodchars = /^[1-9a-km-zA-HJ-NP-Z]+$/;
 const ethRegex = /^0x[a-fA-F0-9]{40}$/;
-const sessionExpireTime = 1 * 60 * 60 * 1000; // 1 hours
+const sessionExpireTime = 12 * 60 * 60 * 1000;
+const signatureValidationTime = 1 * 60 * 60 * 1000;
 
 /**
  * To check if a parameter is an object and if not, return an empty object.
@@ -109,7 +110,7 @@ async function verifyLogin(req, res) {
         throw new Error('Signed message is not valid');
       }
 
-      if (+message.substring(0, 13) < (timestamp - 90000000) || +message.substring(0, 13) > timestamp) {
+      if (+message.substring(0, 13) < (timestamp - signatureValidationTime) || +message.substring(0, 13) > timestamp) {
         throw new Error('Signed message is not valid');
       }
 
