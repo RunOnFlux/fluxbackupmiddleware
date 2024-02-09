@@ -80,6 +80,7 @@ async function updateQueue() {
   const failTime = 60 * 60; // 1 hour
   taskQueue.forEach((value, key) => {
     if (now - value.startTime > failTime) {
+      console.log(`deleting ${key} from queue.`);
       taskQueue.delete(key);
     }
   });
@@ -88,7 +89,7 @@ async function updateQueue() {
     // read latest remaining tasks from db
     const emptySlots = config.maxConcurrentTasks - taskQueue.size;
     const records = await dbCli.execute(`select * from tasks where finishTime=0 and fails<3 order by timestamp limit ${Number(emptySlots)}`);
-    console.log(records);
+    // console.log(records);
     for (let i = 0; i < records.length; i += 1) {
       if (!taskQueue.has(records[i].taskId)) {
         // add task to the queue
@@ -97,6 +98,7 @@ async function updateQueue() {
         runTask(records[i].taskId);
       }
     }
+    console.log(taskQueue.entries());
   }
 }
 
@@ -271,8 +273,48 @@ async function getBackupList(req, res) {
   }
 }
 
+/**
+ * Returns task status.
+ *
+ * @async
+ * @param {Object} req - The request object.
+ * @param {Object} res - The response object.
+ * @throws Will throw an error if the user session is invalid, taskId is invalid, or database operation fails.
+ */
+async function getTaskStatus(req, res) {
+  let { taskId } = req.params;
+  taskId = taskId || req.query.taskId;
+
+  try {
+    // validate session
+    const owner = await idService.verifyUserSession(req.headers);
+    if (owner === false) {
+      throw new Error('Unauthorized. Access denied.');
+    }
+    // validate app and component name
+    if (!taskId) {
+      throw new Error('taskId not provided.');
+    }
+    console.log(taskQueue.entries());
+    let task = taskQueue.get(Number(taskId));
+    if (!task) {
+      task = await dbCli.getTask(taskId);
+    }
+
+    if (!task) {
+      throw new Error('task does not exist.');
+    }
+    res.json({ status: 'success', data: { taskId: task.taskId, status: task.status } });
+  } catch (error) {
+    log.error(error);
+    const errMessage = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    res.json(errMessage);
+  }
+}
+
 module.exports = {
   init,
   registerBackupTask,
   getBackupList,
+  getTaskStatus,
 };

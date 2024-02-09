@@ -170,7 +170,6 @@ async function verifyUserSession(headers) {
     loginPhrase: auth.loginPhrase,
     signature: auth.signature,
   };
-  console.log(headers);
 
   const verify = verifySession(auth.loginPhrase, sessionParams);
   // log.debug(`verify ${JSON.stringify(sessionParams)}:${verify}`);

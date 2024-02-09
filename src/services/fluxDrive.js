@@ -95,8 +95,8 @@ async function uploadFile(file) {
   let progress = 0;
   fileStream.on('data', (chunk) => {
     progress += chunk.length;
-    file.status = { state: 'uploading', message: 'Uploading file to FluxDrive', progress: ((progress / fileSize) * 100).toFixed(2) };
-    console.log(file.status);
+    file.status = { state: 'uploading', message: 'Uploading file to FluxDrive', progress: Number(((progress / fileSize) * 100).toFixed(2)) };
+    // console.log(file.status);
   });
   return new Promise((resolve, reject) => {
     const req = http.request(options, (res) => {

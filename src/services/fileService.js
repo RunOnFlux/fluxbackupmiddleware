@@ -69,8 +69,8 @@ async function downloadFileFromHost(task) {
         receivedBytes += chunk.length;
         const percentCompleted = (receivedBytes / totalBytes) * 100;
         // log.info(`Downloading ${filename}: ${percentCompleted.toFixed(2)}%`);
-        task.status = { state: 'downloading', message: 'Fetching file from host', progress: percentCompleted.toFixed(2) };
-        console.log(task.status);
+        task.status = { state: 'downloading', message: 'Fetching file from host', progress: Number(percentCompleted.toFixed(2)) };
+        // console.log(task.status);
       });
 
       response.pipe(file);

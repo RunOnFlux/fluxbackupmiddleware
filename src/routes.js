@@ -15,6 +15,12 @@ module.exports = (app) => {
   app.get('/getbackuplist', (req, res) => {
     backupService.getBackupList(req, res);
   });
+  app.get('/getStats', (req, res) => {
+    backupService.getStats(req, res);
+  });
+  app.get('/getTaskStatus', (req, res) => {
+    backupService.getTaskStatus(req, res);
+  });
   app.get('/getfile', (req, res) => {
     fluxDrive.getFile(req, res);
   });
