@@ -170,6 +170,7 @@ async function verifyUserSession(headers) {
     loginPhrase: auth.loginPhrase,
     signature: auth.signature,
   };
+  console.log(sessionParams);
 
   const verify = verifySession(auth.loginPhrase, sessionParams);
   // log.debug(`verify ${JSON.stringify(sessionParams)}:${verify}`);
@@ -179,7 +180,7 @@ async function verifyUserSession(headers) {
     } catch (error) {
       return false;
     }
-  }
+  } else if (signatureVerifier.verifySignature(auth.loginPhrase, auth.zelid, auth.signature) === true) return auth.zelid;
   return false;
 }
 

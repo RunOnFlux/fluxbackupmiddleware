@@ -56,6 +56,7 @@ async function runTask(id) {
     console.log(`task ${id} finished.`);
     task.status = { state: 'finished', message: 'finished', progress: 100 };
     task.finishTime = Math.floor(Date.now() / 1000);
+    task.extra = '';
     await dbCli.updateTask(task);
     taskQueue.delete(id);
   } catch (error) {
@@ -98,7 +99,7 @@ async function updateQueue() {
         runTask(Number(records[i].taskId));
       }
     }
-    console.log(taskQueue.entries());
+    // console.log(taskQueue.entries());
   }
 }
 
@@ -145,20 +146,19 @@ function isValidUrl(string) {
  * @throws Will throw an error if the user session is invalid, parameters are invalid, user quota is full, task is a duplicate, or database operation fails.
  */
 async function registerBackupTask(req, res) {
-  let { appname } = req.params;
+  let { appname } = req.body;
   appname = appname || req.query.appname;
-  let { component } = req.params;
+  let { component } = req.body;
   component = component || req.query.component;
-  let { filename } = req.params;
+  let { filename } = req.body;
   filename = filename || req.query.filename;
-  let { timestamp } = req.params;
+  let { timestamp } = req.body;
   timestamp = timestamp || req.query.timestamp;
-  let { host } = req.params;
+  let { host } = req.body;
   host = host || req.query.host;
-  let { filesize } = req.params;
+  let { filesize } = req.body;
   filesize = filesize || req.query.filesize;
   console.log(req.body);
-  console.log(req.params);
   try {
     // validate session
     const owner = await idService.verifyUserSession(req.headers);
@@ -186,6 +186,7 @@ async function registerBackupTask(req, res) {
     if (!isValidUrl(host)) {
       throw new Error('host url is not valid');
     }
+    const extra = req.headers.zelidauth;
     // check if user has enough storage quota
     const totalUsed = await dbCli.execute('select sum(filesize) as totalUsed from tasks where owner=? and removedFromFluxdrive=0', [owner]);
     console.log(totalUsed);
@@ -202,7 +203,7 @@ async function registerBackupTask(req, res) {
     }
     // add task to the db
     const newTask = {
-      owner, timestamp, filename, appname, component, filesize, host,
+      owner, timestamp, filename, appname, component, filesize, host, extra,
     };
     const result = await dbCli.addNewTask(newTask);
     const taskId = result.insertId;
@@ -255,12 +256,12 @@ async function getBackupList(req, res) {
       let i = 0;
       for (; i < result.length; i += 1) {
         if (Object.prototype.hasOwnProperty.call(temp, result[i].timestamp)) {
-          temp[result[i].timestamp].components.push({ component: result[i].component, hash: result[i].hash, filesize: result[i].filesize });
+          temp[result[i].timestamp].components.push({ component: result[i].component, file_url: `https://jetpack2_38080.app.runonflux.io/ipfs/${result[i].hash}`, file_size: result[i].filesize });
         } else {
           if (i > 0) {
             checkpoints.push({ timestamp: result[i - 1].timestamp, components: temp[result[i - 1].timestamp].components });
           }
-          temp[result[i].timestamp] = { components: [{ component: result[i].component, hash: result[i].hash, filesize: result[i].filesize }] };
+          temp[result[i].timestamp] = { components: [{ component: result[i].component, file_url: `https://jetpack2_38080.app.runonflux.io/ipfs/${result[i].hash}`, file_size: result[i].filesize }] };
         }
       }
       checkpoints.push({ timestamp: result[i - 1].timestamp, components: temp[result[i - 1].timestamp].components });

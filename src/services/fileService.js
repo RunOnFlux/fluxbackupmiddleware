@@ -43,8 +43,10 @@ function deleteFile(fileName) {
 async function downloadFileFromHost(task) {
   return new Promise((resolve, reject) => {
     const { filename } = task;
-    const url = new URL(`${task.host}${apiPath}${filename}`);
-    const headers = {};
+    const { extra } = task;
+    const { filesize } = task;
+    const url = new URL(`${task.host}`);
+    const headers = { zelidauth: extra };
     const file = fs.createWriteStream(path + filename);
     let receivedBytes = 0;
     const get = url.protocol.startsWith('https:') ? https.get : http.get;
@@ -69,22 +71,31 @@ async function downloadFileFromHost(task) {
         receivedBytes += chunk.length;
         const percentCompleted = (receivedBytes / totalBytes) * 100;
         // log.info(`Downloading ${filename}: ${percentCompleted.toFixed(2)}%`);
-        task.status = { state: 'downloading', message: 'Fetching file from host', progress: Number(percentCompleted.toFixed(2)) };
+        task.status = { state: 'downloading', message: 'Fetching file from node', progress: Number(percentCompleted.toFixed(2)) };
         // console.log(task.status);
       });
 
       response.pipe(file);
 
       file.on('finish', () => {
-        log.info(`${filename} downloaded successfully from host.`);
+        log.info(`${filename} downloaded successfully from node.`);
         task.status = { state: 'downloading', message: 'download finished', progress: 100 };
         task.downloaded = true;
         file.close(resolve(true));
+        // check file size
+        const stats = fs.statSync(path + filename);
+        console.log(`File size: ${stats.size} bytes`);
+        if (filesize !== stats.size) {
+          log.error(`File size mismatch ${filesize}<>${stats.size}`);
+          task.status = { state: 'failed', message: 'File size mismatch', progress: 0 };
+          fs.unlink(path + filename);
+          reject();
+        }
       });
 
       file.on('error', (error) => {
         log.error(`Downloading ${filename} from host failed.`);
-        task.status = { state: 'failed', message: 'Fetching file from host failed', progress: 0 };
+        task.status = { state: 'failed', message: 'Fetching file from node failed', progress: 0 };
         fs.unlink(path + filename);
         reject(error.message);
       });

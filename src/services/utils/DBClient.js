@@ -236,6 +236,7 @@ class DBClient {
         hash varchar(256),
         startTime bigint unsigned DEFAULT '0',
         finishTime bigint unsigned DEFAULT '0',
+        extra text,
         PRIMARY KEY (\`taskId\`),
         KEY \`appname_owner\` (\`appname\`,\`owner\`))ENGINE=InnoDB;`);
     } else {
