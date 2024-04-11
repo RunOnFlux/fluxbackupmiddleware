@@ -29,7 +29,7 @@ async function runTask(id) {
     task.status = { state: 'started', message: 'backup to FluxDrive started', progress: 0 };
     await dbCli.updateTask(task);
     // check if file is downloaded
-    if (!task.downloaded) {
+    if (!task.downloaded || task.localRemoved) {
       // download the file
       console.log(`downloading task ${id}.`);
       await fileManager.downloadFileFromHost(task);
@@ -196,24 +196,35 @@ async function registerBackupTask(req, res) {
       throw new Error('user quota is full.');
     }
     // check if task is a duplicate
-    const record = await dbCli.execute('select taskId from tasks where owner=? and timestamp=? and appname=? and component=?', [owner, timestamp, appname, component]);
+    const record = await dbCli.execute('select * from tasks where owner=? and timestamp=? and appname=? and component=?', [owner, timestamp, appname, component]);
     console.log(record);
-    if (record.length > 0) {
+    if (record.length > 0 && record[0].uploaded === 1) {
       throw new Error('duplicate timestamp for same appname and component.');
     }
-    // add task to the db
-    const newTask = {
-      owner, timestamp, filename, appname, component, filesize, host, extra,
-    };
-    const result = await dbCli.addNewTask(newTask);
-    const taskId = result.insertId;
-    console.log(result);
-    // run the task if there is space in queue
-    if (taskQueue.size < config.maxConcurrentTasks) {
-      const task = await dbCli.getTask(taskId);
-      if (task) {
-        taskQueue.set(Number(taskId), task);
-        runTask(Number(taskId));
+    if (record.length > 0 && record[0].uploaded === 0) {
+      // run the task if there is space in queue
+      if (taskQueue.size < config.maxConcurrentTasks) {
+        const task = await dbCli.getTask(record[0].taskId);
+        if (task) {
+          taskQueue.set(Number(taskId), task);
+          runTask(Number(taskId));
+        }
+      }
+    } else {
+      // add task to the db
+      const newTask = {
+        owner, timestamp, filename, appname, component, filesize, host, extra,
+      };
+      const result = await dbCli.addNewTask(newTask);
+      const taskId = result.insertId;
+      console.log(result);
+      // run the task if there is space in queue
+      if (taskQueue.size < config.maxConcurrentTasks) {
+        const task = await dbCli.getTask(taskId);
+        if (task) {
+          taskQueue.set(Number(taskId), task);
+          runTask(Number(taskId));
+        }
       }
     }
     const phraseResponse = messageHelper.createDataMessage({ taskId });
@@ -361,8 +372,11 @@ async function removeCheckpoint(req, res) {
         }
       }
     }
-    console.log(removedFiles);
-    res.json({ status: 'success', data: { removedFiles } });
+    if (removedFiles.length) {
+      res.json({ status: 'success', data: { removedFiles } });
+    } else {
+      res.json({ status: 'error', data: { message: 'No file removed' } });
+    }
   } catch (error) {
     log.error(error);
     const errMessage = messageHelper.createErrorMessage(error.message, error.name, error.code);
