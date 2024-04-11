@@ -141,7 +141,7 @@ async function uploadFile(file) {
           resolve(result);
         } else {
           log.error(result);
-          file.status = { state: 'failed', message: 'uploading file to FluxDrive failed', progress: 0 };
+          file.status = { state: 'failed', message: result.data.message, progress: 0 };
           reject(result);
         }
       });
