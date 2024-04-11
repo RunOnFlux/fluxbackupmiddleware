@@ -33,6 +33,30 @@ async function getStatus() {
     return null;
   }
 }
+/**
+ * Removes given hash.
+ *
+ * @async
+ * @returns {Promise<Object|null>} - A promise that resolves to the status data if the request is successful, or null if the request fails.
+ */
+async function removeFile(hash) {
+  const ZELID = await Vault.getKey('zelid');
+  const API_KEY = await Vault.getKey('apikey');
+  const FD_SERVER = await Vault.getKey('fluxDriveServer');
+  try {
+    const result = await axios({
+      method: 'post',
+      url: `http://${FD_SERVER}/api/v0/rm?arg=${hash}`,
+      headers: {
+        Authorization: `Basic ${Buffer.from(`${ZELID}:${API_KEY}`).toString('base64')}`,
+      },
+    });
+    return result.data;
+  } catch (e) {
+    log.error(e);
+    return null;
+  }
+}
 
 /**
  * Retrieves filelist from the FluxDrive server.
@@ -173,4 +197,5 @@ module.exports = {
   getFileList,
   uploadFile,
   getFile,
+  removeFile,
 };
