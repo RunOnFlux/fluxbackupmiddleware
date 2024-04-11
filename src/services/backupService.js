@@ -189,7 +189,7 @@ async function registerBackupTask(req, res) {
     const extra = req.headers.zelidauth;
     // check if user has enough storage quota
     const totalUsed = await dbCli.execute('select sum(filesize) as totalUsed from tasks where owner=? and removedFromFluxdrive=0', [owner]);
-    console.log(totalUsed);
+    let taskId = null;
     let userTotalUse = 0;
     if (totalUsed.length > 0) userTotalUse = totalUsed[0].totalUsed;
     if (userTotalUse > config.quotaPerUser * 1024 * 1024 * 1024) {
@@ -199,13 +199,15 @@ async function registerBackupTask(req, res) {
     const record = await dbCli.execute('select * from tasks where owner=? and timestamp=? and appname=? and component=?', [owner, timestamp, appname, component]);
     console.log(record);
     if (record.length > 0 && record[0].uploaded === 1) {
-      throw new Error('duplicate timestamp for same appname and component.');
-    }
-    if (record.length > 0 && record[0].uploaded === 0) {
-      // run the task if there is space in queue
+      throw new Error('Checkpoint has already been uploaded to FluxDrive.');
+    } else if (record.length > 0 && record[0].uploaded === 0) {
+      // resume the task if there is space in queue
       if (taskQueue.size < config.maxConcurrentTasks) {
-        const task = await dbCli.getTask(record[0].taskId);
+        taskId = record[0].taskId;
+        const task = await dbCli.getTask(taskId);
         if (task) {
+          task.extra = req.headers.zelidauth;
+          dbCli.updateTask(task);
           taskQueue.set(Number(taskId), task);
           runTask(Number(taskId));
         }
@@ -216,7 +218,7 @@ async function registerBackupTask(req, res) {
         owner, timestamp, filename, appname, component, filesize, host, extra,
       };
       const result = await dbCli.addNewTask(newTask);
-      const taskId = result.insertId;
+      taskId = result.insertId;
       console.log(result);
       // run the task if there is space in queue
       if (taskQueue.size < config.maxConcurrentTasks) {
