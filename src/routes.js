@@ -21,6 +21,9 @@ module.exports = (app) => {
   app.get('/getTaskStatus', (req, res) => {
     backupService.getTaskStatus(req, res);
   });
+  app.post('/removeCheckpoint', (req, res) => {
+    backupService.removeCheckpoint(req, res);
+  });
   app.get('/getfile', (req, res) => {
     fluxDrive.getFile(req, res);
   });

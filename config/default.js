@@ -1,6 +1,7 @@
 require('dotenv').config();
+
 module.exports = {
-  serverPort: 2052,
+  serverPort: 2053,
   dbUser: 'root',
   dbPort: 3306,
   dbhost: '127.0.0.1',

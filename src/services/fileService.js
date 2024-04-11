@@ -6,7 +6,7 @@ const log = require('../lib/log');
 const config = require('../../config/default');
 
 const path = config.storagePath;
-const apiPath = config.hostAPIPath;
+// const apiPath = config.hostAPIPath;
 
 /**
  * checks if a file exists

@@ -123,7 +123,6 @@ class DBClient {
 
   /**
   * [getRecord]
-  * @param {string} table [description]
   * @param {string} id [description]
   */
   async getTask(id) {
@@ -135,6 +134,16 @@ class DBClient {
       return task;
     }
     return null;
+  }
+
+  /**
+  * [removeTask]
+  * @param {string} id [description]
+  */
+  async removeTask(id) {
+    if (!this.connected) await this.init();
+    const result = await this.execute('DELETE FROM tasks where taskId = ?', [id]);
+    return result;
   }
 
   /**
@@ -189,11 +198,27 @@ class DBClient {
 
   /**
   * [getUserBackups]
-  * @param {string} id [description]
+  * @param {string} owner [description]
+  * @param {string} appname [description]
   */
   async getUserBackups(owner, appname) {
     if (!this.connected) await this.init();
     const result = await this.execute('SELECT timestamp, component, hash, filesize FROM tasks where owner = ? and appname = ? and finishTime <> 0 order by timestamp', [owner, appname]);
+    if (result.length) {
+      return result;
+    }
+    return null;
+  }
+
+  /**
+  * [getUserCheckpoint]
+  * @param {string} owner [description]
+  * @param {string} appname [description]
+  * @param {string} timestamp [description]
+  */
+  async getUserCheckpoint(owner, appname, timestamp) {
+    if (!this.connected) await this.init();
+    const result = await this.execute('SELECT taskId, timestamp, appname, component, hash, filename, filesize FROM tasks where owner = ? and appname = ? and timestamp = ? and finishTime <> 0', [owner, appname, timestamp]);
     if (result.length) {
       return result;
     }

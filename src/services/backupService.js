@@ -236,7 +236,7 @@ async function registerBackupTask(req, res) {
  * @throws Will throw an error if the user session is invalid, application name is invalid, or database operation fails.
  */
 async function getBackupList(req, res) {
-  let { appname } = req.params;
+  let { appname } = req.body;
   appname = appname || req.query.appname;
 
   try {
@@ -283,7 +283,7 @@ async function getBackupList(req, res) {
  * @throws Will throw an error if the user session is invalid, taskId is invalid, or database operation fails.
  */
 async function getTaskStatus(req, res) {
-  let { taskId } = req.params;
+  let { taskId } = req.body;
   taskId = taskId || req.query.taskId;
 
   try {
@@ -313,9 +313,67 @@ async function getTaskStatus(req, res) {
   }
 }
 
+/**
+ * Removes the provided checkpoint and it's files stored on FluxDrive.
+ *
+ * @async
+ * @param {Object} req - The request object.
+ * @param {Object} res - The response object.
+ * @throws Will throw an error if the user session is invalid, taskId is invalid, or database operation fails.
+ */
+async function removeCheckpoint(req, res) {
+  let { timestamp } = req.body;
+  timestamp = timestamp || req.query.timestamp;
+  let { appname } = req.body;
+  appname = appname || req.query.appname;
+
+  try {
+    // validate session
+    const owner = await idService.verifyUserSession(req.headers);
+    if (owner === false) {
+      throw new Error('Unauthorized. Access denied.');
+    }
+    // validate timestamp
+    if (!timestamp) {
+      throw new Error('timestamp not provided.');
+    }
+
+    // validate appname
+    if (!appname) {
+      throw new Error('appname not provided.');
+    }
+    const checkpoint = await dbCli.getUserCheckpoint(owner, appname, timestamp);
+
+    if (!checkpoint) {
+      throw new Error('checkpoint does not exist.');
+    }
+    const removedFiles = [];
+    if (Array.isArray(checkpoint)) {
+      for (let i = 0; i < checkpoint.length; i += 1) {
+        if (checkpoint[i].hash) {
+          // eslint-disable-next-line no-await-in-loop
+          await fluxDrive.removeFile(checkpoint[i].hash);
+          // eslint-disable-next-line no-await-in-loop
+          await dbCli.removeTask(checkpoint[i].taskId);
+          removedFiles.push({
+            timestamp: checkpoint[i].timestamp, hash: checkpoint[i].hash, filename: checkpoint[i].filename, filesize: checkpoint[i].filesize,
+          });
+        }
+      }
+    }
+    console.log(removedFiles);
+    res.json({ status: 'success', data: { removedFiles } });
+  } catch (error) {
+    log.error(error);
+    const errMessage = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    res.json(errMessage);
+  }
+}
+
 module.exports = {
   init,
   registerBackupTask,
   getBackupList,
   getTaskStatus,
+  removeCheckpoint,
 };
