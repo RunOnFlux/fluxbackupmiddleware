@@ -12,7 +12,7 @@ const limiter = rateLimit({
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 app.use(cors());
-app.use(limiter);
+// app.use(limiter);
 require('../routes')(app);
 
 module.exports = app;

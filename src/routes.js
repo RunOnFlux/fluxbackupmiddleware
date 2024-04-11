@@ -16,7 +16,7 @@ module.exports = (app) => {
     backupService.getBackupList(req, res);
   });
   app.get('/getStats', (req, res) => {
-    backupService.getStats(req, res);
+    // backupService.getStats(req, res);
   });
   app.get('/getTaskStatus', (req, res) => {
     backupService.getTaskStatus(req, res);
