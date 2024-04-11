@@ -7,7 +7,7 @@ const log = require('../lib/log');
 
 const goodchars = /^[1-9a-km-zA-HJ-NP-Z]+$/;
 const ethRegex = /^0x[a-fA-F0-9]{40}$/;
-const sessionExpireTime = 12 * 60 * 60 * 1000;
+const sessionExpireTime = 1 * 60 * 60 * 1000;
 const signatureValidationTime = 1 * 60 * 60 * 1000;
 
 /**
@@ -180,7 +180,13 @@ async function verifyUserSession(headers) {
     } catch (error) {
       return false;
     }
-  } else if (signatureVerifier.verifySignature(auth.loginPhrase, auth.zelid, auth.signature) === true) return auth.zelid;
+  } else if (signatureVerifier.verifySignature(auth.loginPhrase, auth.zelid, auth.signature) === true) {
+    const timestamp = new Date().getTime();
+    if (+auth.loginPhrase.substring(0, 13) < (timestamp - signatureValidationTime) || +auth.loginPhrase.substring(0, 13) > timestamp) {
+      return false;
+    }
+    return auth.zelid;
+  }
   return false;
 }
 
