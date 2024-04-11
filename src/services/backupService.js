@@ -22,7 +22,7 @@ const taskQueue = new Map();
  * @throws Will throw an error if the task fails.
  */
 async function runTask(id) {
-  console.log(`ruuning task ${id}`);
+  log.info(`ruuning task ${id}`);
   const task = taskQueue.get(id);
   try {
     task.startTime = Math.floor(Date.now() / 1000);
@@ -31,21 +31,21 @@ async function runTask(id) {
     // check if file is downloaded
     if (!task.downloaded || task.localRemoved) {
       // download the file
-      console.log(`downloading task ${id}.`);
+      log.info(`downloading task ${id}.`);
       await fileManager.downloadFileFromHost(task);
       await dbCli.updateTask(task);
     }
     // check if file is uploaded
     if (!task.uploaded) {
       // upload the file
-      console.log(`uploading task ${id}.`);
+      log.info(`uploading task ${id}.`);
       await fluxDrive.uploadFile(task);
       await dbCli.updateTask(task);
     }
     // check if the file is removed locally
     if (fileManager.fileExists(task.filename) || !task.localRemoved) {
       // remove the file locally
-      console.log(`removing local file for task ${id}.`);
+      log.info(`removing local file for task ${id}.`);
       await fileManager.deleteFile(task.filename);
       task.localRemoved = true;
       await dbCli.updateTask(task);
@@ -53,7 +53,7 @@ async function runTask(id) {
     // ask remote server to remove the file
 
     // mark the task as done and remove from queue
-    console.log(`task ${id} finished.`);
+    log.info(`task ${id} finished.`);
     task.status = { state: 'finished', message: 'finished', progress: 100 };
     task.finishTime = Math.floor(Date.now() / 1000);
     task.extra = '';
@@ -62,7 +62,7 @@ async function runTask(id) {
   } catch (error) {
     task.fails += 1;
     await dbCli.updateTask(task);
-    console.log(`task ${id} failed.`);
+    log.error(`task ${id} failed.${JSON.stringify(error)}`);
   }
 }
 
@@ -81,7 +81,7 @@ async function updateQueue() {
   const failTime = 60 * 60; // 1 hour
   taskQueue.forEach((value, key) => {
     if (now - value.startTime > failTime) {
-      console.log(`deleting ${key} from queue.`);
+      log.info(`deleting ${key} from queue.`);
       taskQueue.delete(key);
     }
   });
@@ -158,7 +158,6 @@ async function registerBackupTask(req, res) {
   host = host || req.query.host;
   let { filesize } = req.body;
   filesize = filesize || req.query.filesize;
-  console.log(req.body);
   try {
     // validate session
     const owner = await idService.verifyUserSession(req.headers);
@@ -197,7 +196,6 @@ async function registerBackupTask(req, res) {
     }
     // check if task is a duplicate
     const record = await dbCli.execute('select * from tasks where owner=? and timestamp=? and appname=? and component=?', [owner, timestamp, appname, component]);
-    console.log(record);
     if (record.length > 0 && record[0].uploaded === 1) {
       throw new Error('Checkpoint has already been uploaded to FluxDrive.');
     } else if (record.length > 0 && record[0].uploaded === 0) {
@@ -219,7 +217,6 @@ async function registerBackupTask(req, res) {
       };
       const result = await dbCli.addNewTask(newTask);
       taskId = result.insertId;
-      console.log(result);
       // run the task if there is space in queue
       if (taskQueue.size < config.maxConcurrentTasks) {
         const task = await dbCli.getTask(taskId);

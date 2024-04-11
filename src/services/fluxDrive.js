@@ -138,8 +138,12 @@ async function uploadFile(file) {
           file.uploaded = true;
           file.hash = result.files[0].hash;
           console.log(file);
+          resolve(result);
+        } else {
+          log.error(result);
+          file.status = { state: 'failed', message: 'uploading file to FluxDrive failed', progress: 0 };
+          reject(result);
         }
-        resolve(result);
       });
     });
 
