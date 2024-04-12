@@ -32,14 +32,20 @@ async function runTask(id) {
     if (!task.downloaded || task.localRemoved) {
       // download the file
       log.info(`downloading task ${id}.`);
+      task.status = { state: 'downloading', message: 'fetching file from node', progress: 0 };
+      await dbCli.updateTask(task);
       await fileManager.downloadFileFromHost(task);
+      task.status = { state: 'downloading', message: 'fetching file from node', progress: 100 };
       await dbCli.updateTask(task);
     }
     // check if file is uploaded
     if (!task.uploaded) {
       // upload the file
       log.info(`uploading task ${id}.`);
+      task.status = { state: 'uploading', message: 'uploading file to FluxDrive', progress: 0 };
+      await dbCli.updateTask(task);
       await fluxDrive.uploadFile(task);
+      task.status = { state: 'uploading', message: 'uploading file to FluxDrive', progress: 100 };
       await dbCli.updateTask(task);
     }
     // check if the file is removed locally
