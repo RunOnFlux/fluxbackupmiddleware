@@ -35,7 +35,7 @@ async function runTask(id) {
       task.status = { state: 'downloading', message: 'fetching file from node', progress: 0 };
       await dbCli.updateTask(task);
       await fileManager.downloadFileFromHost(task);
-      task.status = { state: 'downloading', message: 'fetching file from node', progress: 100 };
+      // task.status = { state: 'downloading', message: 'fetching file from node', progress: 100 };
       await dbCli.updateTask(task);
     }
     // check if file is uploaded
@@ -45,7 +45,7 @@ async function runTask(id) {
       task.status = { state: 'uploading', message: 'uploading file to FluxDrive', progress: 0 };
       await dbCli.updateTask(task);
       await fluxDrive.uploadFile(task);
-      task.status = { state: 'uploading', message: 'uploading file to FluxDrive', progress: 100 };
+      // task.status = { state: 'uploading', message: 'uploading file to FluxDrive', progress: 100 };
       await dbCli.updateTask(task);
     }
     // check if the file is removed locally
