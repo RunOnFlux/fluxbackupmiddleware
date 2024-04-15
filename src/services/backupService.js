@@ -385,7 +385,7 @@ async function removeCheckpoint(req, res) {
           // eslint-disable-next-line no-await-in-loop
           await fluxDrive.removeFile(checkpoint[i].hash);
           // eslint-disable-next-line no-await-in-loop
-          await dbCli.removeTask(checkpoint[i].taskId);
+          await dbCli.softRemoveTask(checkpoint[i].taskId);
           removedFiles.push({
             timestamp: checkpoint[i].timestamp, hash: checkpoint[i].hash, filename: checkpoint[i].filename, filesize: checkpoint[i].filesize,
           });

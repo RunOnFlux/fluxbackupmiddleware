@@ -147,6 +147,16 @@ class DBClient {
   }
 
   /**
+  * [removeTask]
+  * @param {string} id [description]
+  */
+  async softRemoveTask(id) {
+    if (!this.connected) await this.init();
+    const result = await this.execute('UPDATE tasks set removedFromFluxdrive = 1 where taskId = ?', [id]);
+    return result;
+  }
+
+  /**
   * [addNewTask]
   * @param {obj} task [description]
   */
@@ -203,7 +213,7 @@ class DBClient {
   */
   async getUserBackups(owner, appname) {
     if (!this.connected) await this.init();
-    const result = await this.execute('SELECT timestamp, component, hash, filesize FROM tasks where owner = ? and appname = ? and finishTime <> 0 and uploaded = 1 order by timestamp', [owner, appname]);
+    const result = await this.execute('SELECT timestamp, component, hash, filesize FROM tasks where owner = ? and appname = ? and uploaded = 1 and removedFromFluxdrive = 0 order by timestamp', [owner, appname]);
     if (result.length) {
       return result;
     }
