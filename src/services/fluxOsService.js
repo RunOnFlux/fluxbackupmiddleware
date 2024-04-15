@@ -36,15 +36,32 @@ async function verifyAppOwner(owner, appname) {
   if (!value) {
     const appSpecs = await getAppSpecs(appname);
     if (appSpecs) {
-      value = appSpecs.owner;
+      value = { owner: appSpecs.owner, expireHeight: appSpecs.expire + appSpecs.height };
       appOwners.put(appname, value, sessionExpireTime);
     }
   }
-  if (value && value === owner) return true;
+  if (value && value.owner === owner) return true;
+  return false;
+}
+/**
+* [getAppExpireHeight]
+*/
+async function getAppExpireHeight(appname) {
+  // eslint-disable-next-line no-param-reassign
+  let value = appOwners.get(appname);
+  if (!value) {
+    const appSpecs = await getAppSpecs(appname);
+    if (appSpecs) {
+      value = { owner: appSpecs.owner, expireHeight: appSpecs.expire + appSpecs.height };
+      appOwners.put(appname, value, sessionExpireTime);
+    }
+  }
+  if (value) return value.expireHeight;
   return false;
 }
 
 module.exports = {
   getAppSpecs,
   verifyAppOwner,
+  getAppExpireHeight,
 };

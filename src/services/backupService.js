@@ -195,6 +195,11 @@ async function registerBackupTask(req, res) {
     if (!isValidUrl(host)) {
       throw new Error('host url is not valid');
     }
+    // get app expire height
+    const appExpireHeight = await fluxOS.getAppExpireHeight(appname);
+    if (appExpireHeight === false) {
+      throw new Error("can't verify app specs, please try again");
+    }
     const extra = req.headers.zelidauth;
     // check if user has enough storage quota
     const totalUsed = await dbCli.execute('select sum(filesize) as totalUsed from tasks where owner=? and removedFromFluxdrive=0', [owner]);
@@ -223,7 +228,7 @@ async function registerBackupTask(req, res) {
     } else {
       // add task to the db
       const newTask = {
-        owner, timestamp, filename, appname, component, filesize, host, extra,
+        owner, timestamp, filename, appname, component, filesize, host, extra, appExpireHeight,
       };
       const result = await dbCli.addNewTask(newTask);
       taskId = result.insertId;
