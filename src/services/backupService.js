@@ -6,6 +6,7 @@ const idService = require('./idService');
 const messageHelper = require('./utils/messageHelper');
 const fileManager = require('./fileService');
 const fluxDrive = require('./fluxDrive');
+const fluxOS = require('./fluxOsService');
 
 let dbCli = null;
 
@@ -174,6 +175,9 @@ async function registerBackupTask(req, res) {
     if (!appname || !component) {
       throw new Error('Invalid app or component name.');
     }
+    if (!await fluxOS.verifyAppOwner(owner, appname)) {
+      throw new Error('Unauthorized. Access denied.');
+    }
     // validate timestamp
     const numberpRegex = /^\d+$/;
     if (!numberpRegex.test(timestamp)) {
@@ -264,6 +268,9 @@ async function getBackupList(req, res) {
     // validate app and component name
     if (!appname) {
       throw new Error('Invalid appname.');
+    }
+    if (!await fluxOS.verifyAppOwner(owner, appname)) {
+      throw new Error('Unauthorized. Access denied.');
     }
     const result = await dbCli.getUserBackups(owner, appname);
     const checkpoints = [];
@@ -357,6 +364,9 @@ async function removeCheckpoint(req, res) {
     // validate appname
     if (!appname) {
       throw new Error('appname not provided.');
+    }
+    if (!await fluxOS.verifyAppOwner(owner, appname)) {
+      throw new Error('Unauthorized. Access denied.');
     }
     const checkpoint = await dbCli.getUserCheckpoint(owner, appname, timestamp);
 
