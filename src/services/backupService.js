@@ -1,3 +1,4 @@
+/* eslint-disable no-await-in-loop */
 /* eslint-disable no-undef */
 const DBClient = require('./utils/DBClient');
 const log = require('../lib/log');
@@ -111,6 +112,43 @@ async function updateQueue() {
 }
 
 /**
+ * Checks expired apps and removes all backup files linked to it from FluxDrive.
+ *
+ * @async
+ * @throws Will throw an error if the database query fails.
+ */
+async function checkExpiredApps() {
+  try {
+    log.info('checkExpiredApps...');
+    let expireHeight = await fluxOS.getBlockHeight();
+    if (expireHeight !== false && expireHeight > 1000) {
+      expireHeight -= 720 * 7; // 7 days
+      // get apps that have been expired more than 7 days
+      const records = await dbCli.execute(`select * from tasks where removedFromFluxdrive = 0 and uploaded = 1 and appExpireHeight > 0  and appExpireHeight < ${Number(expireHeight)} order by appExpireHeight ASC limit 10`);
+      // eslint-disable-next-line no-restricted-syntax
+      for (record of records) {
+        // check if they have been extended
+        const appSpecs = await fluxOS.getAppSpecs(record.appname, true);
+        if (appSpecs && appSpecs !== 'Application not found') {
+          if (appSpecs.expire + appSpecs.height !== record.appExpireHeight) {
+            log.info(`id: ${record.taskId}, appname: ${record.appname} expire height updated.`);
+            record.appExpireHeight = appSpecs.expire + appSpecs.height;
+            await dbCli.updateTask(record);
+          }
+        }
+        if (appSpecs && appSpecs === 'Application not found') {
+          log.info(`id: ${record.taskId}, hash: ${record.hash} removed from FluxDrive.`);
+          await fluxDrive.removeFile(record.hash);
+          await dbCli.softRemoveTask(record.taskId);
+        }
+      }
+    }
+  } catch (error) {
+    log.error(error);
+  }
+}
+
+/**
  * Initializes the backup service and DB.
  *
  * @async
@@ -122,6 +160,10 @@ async function init() {
   setInterval(async () => {
     await updateQueue();
   }, 10 * 1000);
+  await dbCli.checkSchema();
+  setInterval(async () => {
+    await checkExpiredApps();
+  }, 60 * 60 * 1000);
 }
 
 /**

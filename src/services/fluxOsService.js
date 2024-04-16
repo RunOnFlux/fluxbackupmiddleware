@@ -10,12 +10,37 @@ const sessionExpireTime = 1 * 60 * 60 * 1000;
  * @async
  * @returns {Promise<Object|null>} - A promise that resolves to the status data if the request is successful, or null if the request fails.
  */
-async function getAppSpecs(appname) {
+async function getAppSpecs(appname, retuenApiErrors = false) {
   if (!appname) return false;
   try {
     const result = await axios({
       method: 'get',
       url: `https://api.runonflux.io/apps/appspecifications/${appname}`,
+    });
+    if (result.data && result.data.status && result.data.status === 'success') {
+      return result.data.data;
+    }
+    if (retuenApiErrors && result.data && result.data.status && result.data.status === 'error') {
+      return result.data.data.message;
+    }
+    return false;
+  } catch (e) {
+    log.error(e);
+    return false;
+  }
+}
+
+/**
+ * Retrieves FluxOS daemon block height.
+ *
+ * @async
+ * @returns {Promise<Object|null>} - A promise that resolves to the status data if the request is successful, or null if the request fails.
+ */
+async function getBlockHeight() {
+  try {
+    const result = await axios({
+      method: 'get',
+      url: 'https://api.runonflux.io/daemon/getblockcount',
     });
     if (result.data && result.data.status && result.data.status === 'success') {
       return result.data.data;
@@ -62,6 +87,7 @@ async function getAppExpireHeight(appname) {
 
 module.exports = {
   getAppSpecs,
+  getBlockHeight,
   verifyAppOwner,
   getAppExpireHeight,
 };
