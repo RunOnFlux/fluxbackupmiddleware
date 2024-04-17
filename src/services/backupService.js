@@ -129,15 +129,19 @@ async function checkExpiredApps() {
       for (record of records) {
         // check if they have been extended
         const appSpecs = await fluxOS.getAppSpecs(record.appname, true);
-        if (appSpecs && appSpecs !== 'Application not found') {
-          if (appSpecs.expire + appSpecs.height !== record.appExpireHeight) {
+        if (appSpecs && appSpecs !== 'Application not found' && appSpecs.expire + appSpecs.height !== record.appExpireHeight) {
+          if (appSpecs.owner === record.owner) {
             log.info(`id: ${record.taskId}, appname: ${record.appname} expire height updated.`);
             record.appExpireHeight = appSpecs.expire + appSpecs.height;
             await dbCli.updateTask(record);
+          } else {
+            log.info(`id: ${record.taskId}, appname: ${record.appname} has a new owner. removing file from FluxDrive`);
+            await fluxDrive.removeFile(record.hash);
+            await dbCli.softRemoveTask(record.taskId);
           }
         }
         if (appSpecs && appSpecs === 'Application not found') {
-          log.info(`id: ${record.taskId}, hash: ${record.hash} removed from FluxDrive.`);
+          log.info(`id: ${record.taskId}, appname: ${record.appname}, hash: ${record.hash} removed from FluxDrive.`);
           await fluxDrive.removeFile(record.hash);
           await dbCli.softRemoveTask(record.taskId);
         }
