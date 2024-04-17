@@ -215,7 +215,7 @@ async function registerBackupTask(req, res) {
     // validate session
     const owner = await idService.verifyUserSession(req.headers);
     if (owner === false) {
-      throw new Error('Unauthorized. Access denied.');
+      throw new Error('Unauthorized access. Session expired.');
     }
     // validate app and component name
     if (!appname || !component) {
@@ -314,7 +314,7 @@ async function getBackupList(req, res) {
     // validate session
     const owner = await idService.verifyUserSession(req.headers);
     if (owner === false) {
-      throw new Error('Unauthorized. Access denied.');
+      throw new Error('Unauthorized access. Session expired.');
     }
     // validate app and component name
     if (!appname) {
@@ -364,7 +364,7 @@ async function getTaskStatus(req, res) {
     // validate session
     const owner = await idService.verifyUserSession(req.headers);
     if (owner === false) {
-      throw new Error('Unauthorized. Access denied.');
+      throw new Error('Unauthorized access. Session expired.');
     }
     // validate app and component name
     if (!taskId) {
@@ -405,7 +405,7 @@ async function removeCheckpoint(req, res) {
     // validate session
     const owner = await idService.verifyUserSession(req.headers);
     if (owner === false) {
-      throw new Error('Unauthorized. Access denied.');
+      throw new Error('Unauthorized access. Session expired.');
     }
     // validate timestamp
     if (!timestamp) {
