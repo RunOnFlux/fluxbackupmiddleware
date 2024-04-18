@@ -255,6 +255,11 @@ async function registerBackupTask(req, res) {
     if (userTotalUse > config.quotaPerUser * 1024 * 1024 * 1024) {
       throw new Error('user quota is full.');
     }
+    // check number of files on FD for the appname
+    const totalFiles = await dbCli.execute('select count(*) as fileCount from tasks where appname=? and owner=? and removedFromFluxdrive=0', [appname, owner]);
+    if (totalFiles.length > 0 && totalFiles[0].fileCount > config.maxFilesPerApp) {
+      throw new Error(`Upload limit reached, max ${config.maxFilesPerApp} files allowed per app.`);
+    }
     // check if task is a duplicate
     const record = await dbCli.execute('select * from tasks where owner=? and timestamp=? and appname=? and component=?', [owner, timestamp, appname, component]);
     if (record.length > 0 && record[0].uploaded === 1) {
