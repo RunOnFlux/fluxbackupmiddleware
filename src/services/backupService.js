@@ -98,12 +98,13 @@ async function updateQueue() {
     // read latest remaining tasks from db
     const emptySlots = config.maxConcurrentTasks - taskQueue.size;
     const records = await dbCli.execute(`select * from tasks where finishTime=0 and fails<3 order by timestamp limit ${Number(emptySlots)}`);
-    // console.log(records);
+    if (records.length) log.debug(`${records.length} failed tasks, retrying...`);
     for (let i = 0; i < records.length; i += 1) {
       if (!taskQueue.has(records[i].taskId)) {
         // add task to the queue
         taskQueue.set(Number(records[i].taskId), records[i]);
         // run task
+        log.debug(`retrying task ${records[i].taskId}`);
         runTask(Number(records[i].taskId));
       }
     }
