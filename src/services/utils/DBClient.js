@@ -152,7 +152,7 @@ class DBClient {
   */
   async softRemoveTask(id) {
     if (!this.connected) await this.init();
-    const result = await this.execute('UPDATE tasks set removedFromFluxdrive = 1 where taskId = ?', [id]);
+    const result = await this.execute('UPDATE tasks set removedFromFluxdrive = 1, uploaded = 0 where taskId = ?', [id]);
     return result;
   }
 
