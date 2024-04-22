@@ -272,6 +272,7 @@ async function registerBackupTask(req, res) {
         const task = await dbCli.getTask(taskId);
         if (task) {
           task.extra = req.headers.zelidauth;
+          task.removed = 0;
           dbCli.updateTask(task);
           taskQueue.set(Number(taskId), task);
           runTask(Number(taskId));
