@@ -231,7 +231,7 @@ async function registerBackupTask(req, res) {
       throw new Error('timestamp is not valid');
     }
     // validate filename
-    if (filename.length < 3) {
+    if (filename.length < 3 || filename.includes('/')) {
       throw new Error('filename is not valid');
     }
     // validate filesize
