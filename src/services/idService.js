@@ -7,8 +7,8 @@ const log = require('../lib/log');
 
 const goodchars = /^[1-9a-km-zA-HJ-NP-Z]+$/;
 const ethRegex = /^0x[a-fA-F0-9]{40}$/;
-const sessionExpireTime = 1 * 60 * 60 * 1000;
-const signatureValidationTime = 1 * 60 * 60 * 1000;
+const sessionExpireTime = 1.5 * 60 * 60 * 1000;
+const signatureValidationTime = 1.5 * 60 * 60 * 1000;
 
 /**
  * To check if a parameter is an object and if not, return an empty object.
