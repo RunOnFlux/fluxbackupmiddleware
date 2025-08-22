@@ -1,6 +1,7 @@
 .DS_Store
 .vscode
 .env
+secrets.json
 node_modules/
 dev/
 tests/
