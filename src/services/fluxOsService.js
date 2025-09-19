@@ -1,11 +1,17 @@
 /* eslint-disable no-param-reassign */
 /* eslint-disable no-await-in-loop */
 const axios = require('axios');
+const https = require('https');
 const appOwners = require('memory-cache');
 const qs = require('qs');
 const zeltrezjs = require('zeltrezjs');
 const bitcoinMessage = require('bitcoinjs-message');
 const log = require('../lib/log');
+
+// Create HTTPS agent that accepts insecure connections
+const httpsAgent = new https.Agent({
+  rejectUnauthorized: false,
+});
 
 const sessionExpireTime = 1 * 60 * 60 * 1000;
 /**
@@ -20,6 +26,7 @@ async function getAppSpecs(appname, retuenApiErrors = false) {
     const result = await axios({
       method: 'get',
       url: `https://api.runonflux.io/apps/appspecifications/${appname}`,
+      httpsAgent,
     });
     if (result.data && result.data.status && result.data.status === 'success') {
       return result.data.data;
@@ -45,6 +52,7 @@ async function getBlockHeight() {
     const result = await axios({
       method: 'get',
       url: 'https://api.runonflux.io/daemon/getblockcount',
+      httpsAgent,
     });
     if (result.data && result.data.status && result.data.status === 'success') {
       return result.data.data;
@@ -99,7 +107,7 @@ async function getAppExpireHeight(appname) {
 async function getSecondaryNodeFromHAProxy(appname) {
   try {
     const statsUrl = `https://${appname}.app.runonflux.io/fluxstatistics?scope=${appname}`;
-    const response = await axios.get(statsUrl);
+    const response = await axios.get(statsUrl, { httpsAgent });
 
     if (!response.data) {
       log.error('No data received from HAProxy statistics');
@@ -171,7 +179,7 @@ async function getSecondaryNodeFromHAProxy(appname) {
 async function getLoginPhrase(node) {
   try {
     const api = `${node}/id/loginphrase`;
-    const response = await axios.get(api);
+    const response = await axios.get(api, { httpsAgent });
     if (response.data.status === 'error') {
       throw new Error(response.data.data);
     }
@@ -215,7 +223,7 @@ async function verifyLogin(zelid, privateKeySign, node) {
       loginPhrase,
     };
 
-    const response = await axios.post(`${node}/id/verifylogin`, qs.stringify(loginInfo));
+    const response = await axios.post(`${node}/id/verifylogin`, qs.stringify(loginInfo), { httpsAgent });
 
     if (response.data.status === 'success') {
       const zelidAuth = qs.stringify(loginInfo);
@@ -244,6 +252,7 @@ async function getAppsWithSyncthing() {
     const result = await axios({
       method: 'get',
       url: 'https://api.runonflux.io/apps/globalappsspecifications',
+      httpsAgent,
     });
 
     if (result.data && result.data.status && result.data.status === 'success') {
@@ -327,6 +336,7 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList) {
       },
       data: backupPayload,
       timeout: 300000, // 5 minutes timeout for backup process
+      httpsAgent,
     });
 
     if (!backupResponse.data) {
@@ -362,6 +372,7 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList) {
               zelidauth: zelidAuth,
             },
             timeout: 30000, // 30 seconds timeout
+            httpsAgent,
           });
 
           if (backupListResponse.data && backupListResponse.data.status === 'success') {
