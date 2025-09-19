@@ -7,3 +7,5 @@ dev/
 tests/
 logs/*
 tmp/*
+CLAUDE.md
+settings.local.json

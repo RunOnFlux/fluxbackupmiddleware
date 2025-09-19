@@ -278,6 +278,25 @@ class DBClient {
     } else {
       log.info('files table already exists, moving on...');
     }
+
+    // Check and create automatic_backups table
+    const autoBackupsTableList = await this.query(`SELECT * FROM INFORMATION_SCHEMA.tables
+          WHERE table_schema = '${this.InitDB}' and table_name = 'automatic_backups'`);
+    if (autoBackupsTableList.length === 0) {
+      log.info('automatic_backups table not defined yet, creating automatic_backups table...');
+      await this.query(`CREATE TABLE automatic_backups (
+        id bigint unsigned NOT NULL AUTO_INCREMENT,
+        appname varchar(128) NOT NULL UNIQUE,
+        components JSON,
+        backup_tasks JSON,
+        status varchar(64),
+        expire_counter int DEFAULT '0',
+        last_backup_timestamp bigint unsigned DEFAULT '0',
+        PRIMARY KEY (\`id\`),
+        UNIQUE KEY \`appname_unique\` (\`appname\`))ENGINE=InnoDB;`);
+    } else {
+      log.info('automatic_backups table already exists, moving on...');
+    }
   }
 }
 

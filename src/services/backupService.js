@@ -154,6 +154,70 @@ async function checkExpiredApps() {
 }
 
 /**
+ * Syncs apps with Syncthing to the automatic_backups table.
+ * Adds new apps found and increments expire_count for apps no longer present.
+ *
+ * @async
+ * @throws Will throw an error if the database query fails.
+ */
+async function syncSyncthingApps() {
+  try {
+    log.info('Syncing Syncthing apps with automatic_backups table...');
+
+    // Get all apps with Syncthing
+    const syncthingApps = await fluxOS.getAppsWithSyncthing();
+
+    if (!syncthingApps) {
+      log.error('Failed to fetch apps with Syncthing');
+      return;
+    }
+
+    // Get all apps currently in automatic_backups table
+    const existingApps = await dbCli.execute('SELECT appname, expire_counter FROM automatic_backups');
+    const existingAppNames = new Map(existingApps.map((app) => [app.appname, app.expire_counter]));
+
+    // Check for new apps to add
+    const newAppsToAdd = [];
+    syncthingApps.forEach((app) => {
+      if (!existingAppNames.has(app.appName)) {
+        newAppsToAdd.push(app);
+      }
+    });
+
+    // Add new apps to the table
+    for (let i = 0; i < newAppsToAdd.length; i += 1) {
+      const app = newAppsToAdd[i];
+      const componentsJson = JSON.stringify(app.componentNames);
+      const query = `INSERT INTO automatic_backups (appname, components, status, expire_counter, last_backup_timestamp)
+                     VALUES (?, ?, 'pending', 0, 0)`;
+      await dbCli.execute(query, [app.appName, componentsJson]);
+      log.info(`Added new app ${app.appName} to automatic_backups`);
+    }
+
+    // Check for expired apps (in DB but not in current syncthing list)
+    const currentAppNames = new Set(syncthingApps.map((app) => app.appName));
+    const expiredApps = [];
+    existingAppNames.forEach((expireCounter, appName) => {
+      if (!currentAppNames.has(appName)) {
+        expiredApps.push(appName);
+      }
+    });
+
+    // Increment expire_counter for expired apps
+    for (let i = 0; i < expiredApps.length; i += 1) {
+      const appName = expiredApps[i];
+      const query = 'UPDATE automatic_backups SET expire_counter = expire_counter + 1 WHERE appname = ?';
+      await dbCli.execute(query, [appName]);
+      log.info(`Incremented expire_counter for expired app ${appName}`);
+    }
+
+    log.info(`Sync complete. Added ${newAppsToAdd.length} new apps, marked ${expiredApps.length} as expired.`);
+  } catch (error) {
+    log.error('Error syncing Syncthing apps:', error);
+  }
+}
+
+/**
  * Initializes the backup service and DB.
  *
  * @async
@@ -169,6 +233,12 @@ async function init() {
   setInterval(async () => {
     await checkExpiredApps();
   }, 60 * 60 * 1000);
+  // Sync Syncthing apps periodically
+  setInterval(async () => {
+    await syncSyncthingApps();
+  }, 24 * 60 * 60 * 1000); // Run every 24 hours
+  // Run initial sync
+  await syncSyncthingApps();
 }
 
 /**
@@ -463,4 +533,5 @@ module.exports = {
   getBackupList,
   getTaskStatus,
   removeCheckpoint,
+  syncSyncthingApps,
 };

@@ -32,7 +32,8 @@
     "ssh2": "^1.14.0",
     "timers": "^0.1.1",
     "util": "^0.12.5",
-    "zeltrezjs": "^2.12.0"
+    "zeltrezjs": "^2.12.0",
+    "zelcorejs": "https://github.com/zelcore-io/zelcorejs"
   },
   "devDependencies": {
     "eslint": "^8.14.0",
