@@ -98,6 +98,22 @@ async function getAppExpireHeight(appname) {
 }
 
 /**
+* [getAppOwner]
+*/
+async function getAppOwner(appname) {
+  let value = appOwners.get(appname);
+  if (!value) {
+    const appSpecs = await getAppSpecs(appname);
+    if (appSpecs) {
+      value = { owner: appSpecs.owner, expireHeight: appSpecs.expire + appSpecs.height };
+      appOwners.put(appname, value, sessionExpireTime);
+    }
+  }
+  if (value) return value.owner;
+  return false;
+}
+
+/**
  * Gets the first secondary/backup node IP:port from HAProxy statistics for a given app.
  *
  * @async
@@ -345,12 +361,91 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList) {
 
     log.info(`Backup task created successfully for ${appname}`);
 
-    // Wait a bit for backup to complete
-    await new Promise((resolve) => { setTimeout(resolve, 5000); });
+    // Wait longer for backup creation to ensure files are generated
+    log.info(`Waiting for backup files to be created for ${appname}...`);
+    await new Promise((resolve) => { setTimeout(resolve, 15000); }); // Wait 15 seconds
+
+    // Get volume mount paths for all components upfront
+    const componentMounts = {};
+    for (let i = 0; i < componentList.length; i += 1) {
+      const component = componentList[i];
+      try {
+        const volumeResponse = await axios({
+          method: 'get',
+          url: `${node}/backup/getvolumedataofcomponent/${appname}/${component}/B/0/mount`,
+          headers: {
+            zelidauth: zelidAuth,
+          },
+          timeout: 10000,
+          httpsAgent,
+        });
+
+        if (volumeResponse.data && volumeResponse.data.status === 'success' && volumeResponse.data.data.mount) {
+          componentMounts[component] = volumeResponse.data.data.mount;
+          log.info(`Got mount path for component ${component}: ${componentMounts[component]}`);
+        } else {
+          log.error(`Failed to get mount path for component ${component}`);
+        }
+      } catch (error) {
+        log.error(`Error fetching volume data for component ${component}: ${error.message}`);
+      }
+    }
+
+    // Verify backup creation completed by checking task status
+    let backupReady = false;
+    let statusCheckCount = 0;
+    const maxStatusChecks = 20; // Maximum 20 checks * 5 seconds = 100 seconds total
+
+    while (!backupReady && statusCheckCount < maxStatusChecks) {
+      try {
+        // Check if backup files exist for the first component as indicator
+        const firstComponent = componentList[0];
+        const firstMount = componentMounts[firstComponent];
+
+        if (!firstMount) {
+          throw new Error(`No mount path available for component ${firstComponent}`);
+        }
+
+        const testPath = encodeURIComponent(`${firstMount}/backup/local`);
+        const testUrl = `${node}/backup/getlocalbackuplist/${testPath}/B/0/true/${appname}`;
+
+        const testResponse = await axios({
+          method: 'get',
+          url: testUrl,
+          headers: {
+            zelidauth: zelidAuth,
+          },
+          timeout: 10000,
+          httpsAgent,
+        });
+
+        if (testResponse.data && testResponse.data.status === 'success' && testResponse.data.data.length > 0) {
+          // Found backup files, proceed
+          backupReady = true;
+          log.info(`Backup files detected for ${appname}, proceeding to retrieve all components`);
+        } else {
+          statusCheckCount += 1;
+          if (statusCheckCount < maxStatusChecks) {
+            log.info(`Waiting for backup creation to complete (check ${statusCheckCount}/${maxStatusChecks})...`);
+            await new Promise((resolve) => { setTimeout(resolve, 5000); });
+          }
+        }
+      } catch (error) {
+        statusCheckCount += 1;
+        if (statusCheckCount < maxStatusChecks) {
+          log.info(`Backup not ready yet (check ${statusCheckCount}/${maxStatusChecks}): ${error.message}`);
+          await new Promise((resolve) => { setTimeout(resolve, 5000); });
+        }
+      }
+    }
+
+    if (!backupReady) {
+      log.warn(`Backup creation may not have completed for ${appname} after ${maxStatusChecks} checks, proceeding anyway`);
+    }
 
     // Get backup lists for each component
     const backupResults = [];
-    const maxRetries = 3;
+    const maxRetries = 10;
 
     for (let i = 0; i < componentList.length; i += 1) {
       const component = componentList[i];
@@ -359,11 +454,16 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList) {
 
       while (retryCount < maxRetries && !componentBackupData) {
         try {
-          // Encode the path for URL
-          const backupPath = encodeURIComponent(`/home/fluxuser/zelflux/ZelApps/flux${component}_${appname}/backup/local`);
+          // Use the cached mount path for this component
+          const mount = componentMounts[component];
+          if (!mount) {
+            throw new Error(`No mount path available for component ${component}`);
+          }
+
+          const backupPath = encodeURIComponent(`${mount}/backup/local`);
           const backupListUrl = `${node}/backup/getlocalbackuplist/${backupPath}/B/0/true/${appname}`;
 
-          log.info(`Fetching backup list for component ${component}, attempt ${retryCount + 1}, url ${backupListUrl}`);
+          log.info(`Fetching backup list for component ${component}, attempt ${retryCount + 1}, mount: ${mount}`);
 
           const backupListResponse = await axios({
             method: 'get',
@@ -372,19 +472,25 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList) {
               zelidauth: zelidAuth,
             },
             timeout: 30000, // 30 seconds timeout
-            httpsAgent,
           });
 
           if (backupListResponse.data && backupListResponse.data.status === 'success') {
-            // Filter backup files for this specific component
-            const componentBackups = backupListResponse.data.data.filter((backup) => backup.name.includes(`backup_${component}.tar.gz`));
+            // Filter backup files for this specific component and get the latest one
+            const allBackups = backupListResponse.data.data.filter((backup) => backup.name.includes(`backup_${component}.tar.gz`));
 
-            componentBackupData = {
-              component,
-              backups: componentBackups,
-            };
+            if (allBackups.length > 0) {
+              // Sort by create timestamp (descending) and get the latest
+              const latestBackup = allBackups.sort((a, b) => Number(b.create) - Number(a.create))[0];
 
-            log.info(`Found ${componentBackups.length} backup(s) for component ${component}`);
+              const encodedFileName = encodeURIComponent(latestBackup.name);
+              componentBackupData = {
+                component,
+                backups: latestBackup,
+                host: `${node}/backup/downloadlocalfile/${backupPath}%2F${encodedFileName}/${appname}`,
+              };
+
+              log.info(`Found ${allBackups.length} backup(s) for component ${component}, selected latest: ${latestBackup.name} (created: ${latestBackup.create})`);
+            }
           } else {
             log.info(`No backup data found for component ${component}, attempt ${retryCount + 1}`);
             log.info(backupListResponse.data.data);
@@ -397,7 +503,7 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList) {
 
         // Wait before retry
         if (retryCount < maxRetries && !componentBackupData) {
-          await new Promise((resolve) => { setTimeout(resolve, 2000); });
+          await new Promise((resolve) => { setTimeout(resolve, 5000); });
         }
       }
 
@@ -433,6 +539,7 @@ module.exports = {
   getAppSpecs,
   getBlockHeight,
   verifyAppOwner,
+  getAppOwner,
   getAppExpireHeight,
   verifyLogin,
   getAppsWithSyncthing,

@@ -8,6 +8,7 @@ const messageHelper = require('./utils/messageHelper');
 const fileManager = require('./fileService');
 const fluxDrive = require('./fluxDrive');
 const fluxOS = require('./fluxOsService');
+const Vault = require('./Vault');
 
 let dbCli = null;
 
@@ -218,30 +219,6 @@ async function syncSyncthingApps() {
 }
 
 /**
- * Initializes the backup service and DB.
- *
- * @async
- */
-async function init() {
-  log.info('Initiating Database...');
-  dbCli = await DBClient.createClient();
-  await dbCli.checkSchema();
-  setInterval(async () => {
-    await updateQueue();
-  }, 10 * 1000);
-  await dbCli.checkSchema();
-  setInterval(async () => {
-    await checkExpiredApps();
-  }, 60 * 60 * 1000);
-  // Sync Syncthing apps periodically
-  setInterval(async () => {
-    await syncSyncthingApps();
-  }, 24 * 60 * 60 * 1000); // Run every 24 hours
-  // Run initial sync
-  await syncSyncthingApps();
-}
-
-/**
  * Checks if a given string is a valid URL.
  *
  * @param {string} string - The string to check.
@@ -267,26 +244,45 @@ function isValidUrl(string) {
  * @async
  * @param {Object} req - The request object.
  * @param {Object} res - The response object.
+ * @param {Object} taskObj - Optional task object containing all required variables (appname, component, timestamp, host, filesize, owner, filename)
  * @throws Will throw an error if the user session is invalid, parameters are invalid, user quota is full, task is a duplicate, or database operation fails.
  */
-async function registerBackupTask(req, res) {
-  let { appname } = req.body;
-  appname = appname || req.query.appname;
-  let { component } = req.body;
-  component = component || req.query.component;
-  let { filename } = req.body;
-  filename = filename || req.query.filename;
-  let { timestamp } = req.body;
-  timestamp = timestamp || req.query.timestamp;
-  let { host } = req.body;
-  host = host || req.query.host;
-  let { filesize } = req.body;
-  filesize = filesize || req.query.filesize;
+async function registerBackupTask(req, res, taskObj = null) {
+  let appname;
+  let component;
+  let filename;
+  let timestamp;
+  let host;
+  let filesize;
+  let owner;
+
+  // If taskObj is provided, use its values; otherwise extract from request
+  if (taskObj) {
+    ({
+      appname, component, timestamp, host, filesize, owner, filename,
+    } = taskObj);
+  } else {
+    ({ appname } = req.body);
+    appname = appname || req.query.appname;
+    ({ component } = req.body);
+    component = component || req.query.component;
+    ({ filename } = req.body);
+    filename = filename || req.query.filename;
+    ({ timestamp } = req.body);
+    timestamp = timestamp || req.query.timestamp;
+    ({ host } = req.body);
+    host = host || req.query.host;
+    ({ filesize } = req.body);
+    filesize = filesize || req.query.filesize;
+  }
+
   try {
-    // validate session
-    const owner = await idService.verifyUserSession(req.headers);
-    if (owner === false) {
-      throw new Error('Unauthorized access. Session expired.');
+    // validate session only if owner is not provided via taskObj
+    if (!owner) {
+      owner = await idService.verifyUserSession(req.headers);
+      if (owner === false) {
+        throw new Error('Unauthorized access. Session expired.');
+      }
     }
     // validate app and component name
     if (!appname || !component) {
@@ -317,7 +313,8 @@ async function registerBackupTask(req, res) {
     if (appExpireHeight === false) {
       throw new Error("can't verify app specs, please try again");
     }
-    const extra = req.headers.zelidauth;
+    // When taskObj is provided, extra can be empty
+    const extra = taskObj ? '' : req.headers.zelidauth;
     // check if user has enough storage quota
     const totalUsed = await dbCli.execute('select sum(filesize) as totalUsed from tasks where owner=? and removedFromFluxdrive=0', [owner]);
     let taskId = null;
@@ -341,7 +338,7 @@ async function registerBackupTask(req, res) {
         taskId = record[0].taskId;
         const task = await dbCli.getTask(taskId);
         if (task) {
-          task.extra = req.headers.zelidauth;
+          task.extra = taskObj ? '' : req.headers.zelidauth;
           task.removedFromFluxDrive = 0;
           dbCli.updateTask(task);
           taskQueue.set(Number(taskId), task);
@@ -527,6 +524,199 @@ async function removeCheckpoint(req, res) {
   }
 }
 
+/**
+ * Processes automatic backups by fetching the next scheduled backup from the database,
+ * creating backup tasks on the node, and registering them for processing.
+ *
+ * @async
+ * @returns {Promise<boolean>} - Returns true if successful, false if failed
+ */
+async function processAutomaticBackup() {
+  const maxRetries = 3;
+  let retryCount = 0;
+  let automaticBackup = null;
+
+  try {
+    // Calculate timestamp for 7 days ago
+    const sevenDaysAgo = Date.now() - (7 * 24 * 60 * 60 * 1000);
+
+    // Fetch first item from automatic_backups table with lowest last_backup_timestamp and status not 'failing'
+    // Only include records where last_backup_timestamp is older than 7 days
+    const backups = await dbCli.execute(
+      'SELECT * FROM automatic_backups WHERE status != ? AND last_backup_timestamp < ? ORDER BY last_backup_timestamp ASC LIMIT 1',
+      ['failing', sevenDaysAgo],
+    );
+
+    if (backups.length === 0) {
+      log.info('No automatic backups to process');
+      return false;
+    }
+
+    // eslint-disable-next-line prefer-destructuring
+    automaticBackup = backups[0];
+    const { id, appname, components } = automaticBackup;
+    const componentList = JSON.parse(components);
+
+    // Set last_backup_timestamp to current time
+    const currentTime = Date.now();
+    await dbCli.execute(
+      'UPDATE automatic_backups SET last_backup_timestamp = ? WHERE id = ?',
+      [currentTime, id],
+    );
+
+    log.info(`Processing automatic backup for app: ${appname}`);
+
+    // Retry loop for node operations
+    while (retryCount < maxRetries) {
+      try {
+        // Get secondary node from HAProxy
+        const nodeAddress = await fluxOS.getSecondaryNodeFromHAProxy(appname);
+        if (!nodeAddress) {
+          throw new Error(`Failed to get secondary node for ${appname}`);
+        }
+
+        const node = `http://${nodeAddress}`;
+        log.info(`Using node: ${node}`);
+
+        // Get zelidAuth from node
+        const zelidAuth = await fluxOS.verifyLogin(
+          await Vault.getKey('teamFluxID'),
+          await Vault.getKey('teamPK'),
+          node,
+        );
+
+        if (!zelidAuth) {
+          throw new Error('Failed to authenticate with node');
+        }
+
+        // Get app owner
+        const owner = await fluxOS.getAppOwner(appname);
+        if (!owner) {
+          throw new Error(`Failed to get app owner for ${appname}`);
+        }
+
+        // Create backup task on node
+        const backupResult = await fluxOS.createBackupTaskOnNode(node, zelidAuth, appname, componentList);
+        if (!backupResult || !backupResult.components) {
+          throw new Error('Failed to create backup tasks on node');
+        }
+
+        log.info(`Created backup tasks for ${backupResult.totalComponents} components`);
+
+        // Register backup tasks for each component
+        const taskIds = [];
+        // eslint-disable-next-line no-restricted-syntax
+        for (const componentData of backupResult.components) {
+          if (componentData.backups && componentData.host) {
+            const taskObj = {
+              appname,
+              component: componentData.component,
+              timestamp: componentData.backups.create,
+              host: componentData.host,
+              filesize: componentData.backups.size,
+              owner,
+              filename: componentData.backups.name,
+            };
+
+            try {
+              // Mock req and res objects for registerBackupTask
+              const mockReq = { body: {}, query: {}, headers: {} };
+              let taskId = null;
+              const mockRes = {
+                json: (data) => {
+                  if (data.status === 'success' && data.data && data.data.taskId) {
+                    taskId = data.data.taskId;
+                  }
+                },
+              };
+
+              await registerBackupTask(mockReq, mockRes, taskObj);
+              if (taskId) {
+                taskIds.push(taskId);
+                log.info(`Registered task ${taskId} for component ${componentData.component}`);
+              }
+            } catch (error) {
+              log.error(`Failed to register task for component ${componentData.component}:`, error.message);
+            }
+          }
+        }
+
+        // Update automatic_backups record with task IDs and set status to 'done'
+        const backupTasksJson = JSON.stringify(taskIds);
+        await dbCli.execute(
+          'UPDATE automatic_backups SET backup_tasks = ?, status = ? WHERE id = ?',
+          [backupTasksJson, 'done', id],
+        );
+
+        log.info(`Successfully processed automatic backup for ${appname}. Created ${taskIds.length} tasks.`);
+        return true;
+      } catch (error) {
+        retryCount += 1;
+        log.error(`Attempt ${retryCount}/${maxRetries} failed for automatic backup ${appname}:`, error.message);
+
+        if (retryCount < maxRetries) {
+          log.info('Waiting 20 seconds before retry...');
+          await new Promise((resolve) => { setTimeout(resolve, 20000); });
+        }
+      }
+    }
+
+    // If all retries failed, update status to 'failing'
+    await dbCli.execute(
+      'UPDATE automatic_backups SET status = ? WHERE id = ?',
+      ['failing', id],
+    );
+
+    log.error(`All retries failed for automatic backup ${appname}. Status set to failing.`);
+    return false;
+  } catch (error) {
+    log.error('Error in processAutomaticBackup:', error.message);
+
+    // Update status to failing if we have the backup record
+    if (automaticBackup) {
+      try {
+        await dbCli.execute(
+          'UPDATE automatic_backups SET status = ? WHERE id = ?',
+          ['failing', automaticBackup.id],
+        );
+      } catch (updateError) {
+        log.error('Failed to update status to failing:', updateError.message);
+      }
+    }
+
+    return false;
+  }
+}
+
+/**
+ * Initializes the backup service and DB.
+ *
+ * @async
+ */
+async function init() {
+  log.info('Initiating Database...');
+  dbCli = await DBClient.createClient();
+  await dbCli.checkSchema();
+  setInterval(async () => {
+    await updateQueue();
+  }, 10 * 1000);
+  await dbCli.checkSchema();
+  setInterval(async () => {
+    await checkExpiredApps();
+  }, 60 * 60 * 1000);
+  // Sync Syncthing apps periodically
+  setInterval(async () => {
+    await syncSyncthingApps();
+  }, 24 * 60 * 60 * 1000); // Run every 24 hours
+  // Run initial sync
+  await syncSyncthingApps();
+
+  // Process automatic backups every 10 minutes
+  setInterval(async () => {
+    await processAutomaticBackup();
+  }, 10 * 60 * 1000); // Run every 10 minutes
+}
+
 module.exports = {
   init,
   registerBackupTask,
@@ -534,4 +724,5 @@ module.exports = {
   getTaskStatus,
   removeCheckpoint,
   syncSyncthingApps,
+  processAutomaticBackup,
 };

@@ -4,6 +4,8 @@ const http = require('http');
 const https = require('https');
 const log = require('../lib/log');
 const config = require('../../config/default');
+const fluxOS = require('./fluxOsService');
+const Vault = require('./Vault');
 
 const path = config.storagePath;
 // const apiPath = config.hostAPIPath;
@@ -41,13 +43,28 @@ function deleteFile(fileName) {
  * @throws Will throw an error if the download fails.
  */
 async function downloadFileFromHost(task) {
-  return new Promise((resolve, reject) => {
+  return new Promise(async (resolve, reject) => {
     try {
       const { filename } = task;
-      const { extra } = task;
       const { filesize } = task;
       const url = new URL(`${task.host}`);
-      const headers = { zelidauth: extra };
+
+      // Construct node URL from hostname and port
+      const protocol = url.protocol.startsWith('https:') ? 'https' : 'http';
+      const node = `${protocol}://${url.hostname}${url.port ? `:${url.port}` : ''}`;
+
+      // Get fresh zelidauth token
+      const zelidauth = await fluxOS.verifyLogin(
+        await Vault.getKey('teamFluxID'),
+        await Vault.getKey('teamPK'),
+        node,
+      );
+
+      if (!zelidauth) {
+        throw new Error('Failed to authenticate with node');
+      }
+
+      const headers = { zelidauth };
       const file = fs.createWriteStream(path + filename);
       let receivedBytes = 0;
       const get = url.protocol.startsWith('https:') ? https.get : http.get;
