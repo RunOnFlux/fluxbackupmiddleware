@@ -297,6 +297,46 @@ class DBClient {
     } else {
       log.info('automatic_backups table already exists, moving on...');
     }
+
+    // Check if backup_type column exists in tasks table, if not add it
+    const backupTypeColumnCheck = await this.query(`
+      SELECT COLUMN_NAME
+      FROM INFORMATION_SCHEMA.COLUMNS
+      WHERE TABLE_SCHEMA = '${this.InitDB}'
+      AND TABLE_NAME = 'tasks'
+      AND COLUMN_NAME = 'backup_type'
+    `);
+
+    if (backupTypeColumnCheck.length === 0) {
+      log.info('Adding backup_type column to tasks table...');
+      await this.query(`
+        ALTER TABLE tasks
+        ADD COLUMN backup_type VARCHAR(32) DEFAULT 'manual' AFTER extra
+      `);
+      log.info('backup_type column added successfully');
+    } else {
+      log.info('backup_type column already exists, moving on...');
+    }
+
+    // Add index on backup_type for faster queries
+    const backupTypeIndexCheck = await this.query(`
+      SELECT INDEX_NAME
+      FROM INFORMATION_SCHEMA.STATISTICS
+      WHERE TABLE_SCHEMA = '${this.InitDB}'
+      AND TABLE_NAME = 'tasks'
+      AND INDEX_NAME = 'backup_type_idx'
+    `);
+
+    if (backupTypeIndexCheck.length === 0) {
+      log.info('Adding index on backup_type column...');
+      await this.query(`
+        ALTER TABLE tasks
+        ADD INDEX backup_type_idx (backup_type, appname, owner, removedFromFluxdrive)
+      `);
+      log.info('backup_type index added successfully');
+    } else {
+      log.info('backup_type index already exists, moving on...');
+    }
   }
 }
 
