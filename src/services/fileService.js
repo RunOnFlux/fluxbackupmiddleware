@@ -10,6 +10,12 @@ const Vault = require('./Vault');
 const path = config.storagePath;
 // const apiPath = config.hostAPIPath;
 
+// Ensure the storage directory exists on module load
+if (!fs.existsSync(path)) {
+  fs.mkdirSync(path, { recursive: true });
+  log.info(`Created storage directory: ${path}`);
+}
+
 /**
  * checks if a file exists
  *
@@ -96,21 +102,42 @@ async function downloadFileFromHost(task) {
         response.pipe(file);
 
         file.on('finish', () => {
-          log.info(`${filename} downloaded successfully from node.`);
-          task.status = { state: 'downloading', message: 'download finished', progress: 100 };
-          task.downloaded = true;
-          file.close(resolve(true));
-          // check file size
-          const stats = fs.statSync(path + filename);
-          console.log(`File size: ${stats.size} bytes`);
-          if (filesize !== stats.size) {
-            log.error(`File size mismatch ${filesize}<>${stats.size}`);
-            task.status = { state: 'failed', message: 'File size mismatch', progress: 0 };
-            fs.unlink(path + filename, (err) => {
-              if (err) log.error(`Failed to delete file ${filename}:`, err);
-            });
-            reject();
-          }
+          // Close the file stream first and wait for it to complete
+          file.close((closeErr) => {
+            if (closeErr) {
+              log.error(`Error closing file ${filename}:`, closeErr);
+              task.status = { state: 'failed', message: 'Error closing file', progress: 0 };
+              reject(closeErr);
+              return;
+            }
+
+            // Now check if the file exists and verify its size
+            try {
+              const stats = fs.statSync(path + filename);
+              console.log(`File size: ${stats.size} bytes`);
+
+              if (filesize !== stats.size) {
+                log.error(`File size mismatch ${filesize}<>${stats.size}`);
+                task.status = { state: 'failed', message: 'File size mismatch', progress: 0 };
+                task.downloaded = false;
+                fs.unlink(path + filename, (err) => {
+                  if (err) log.error(`Failed to delete file ${filename}:`, err);
+                });
+                reject(new Error('File size mismatch'));
+              } else {
+                // File downloaded successfully and size matches
+                log.info(`${filename} downloaded successfully from node.`);
+                task.status = { state: 'downloading', message: 'download finished', progress: 100 };
+                task.downloaded = true;
+                resolve(true);
+              }
+            } catch (statError) {
+              log.error(`Error checking file stats for ${filename}:`, statError);
+              task.status = { state: 'failed', message: 'Failed to verify downloaded file', progress: 0 };
+              task.downloaded = false;
+              reject(statError);
+            }
+          });
         });
 
         file.on('error', (error) => {
