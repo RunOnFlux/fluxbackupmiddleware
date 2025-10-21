@@ -106,7 +106,9 @@ async function downloadFileFromHost(task) {
           if (filesize !== stats.size) {
             log.error(`File size mismatch ${filesize}<>${stats.size}`);
             task.status = { state: 'failed', message: 'File size mismatch', progress: 0 };
-            fs.unlink(path + filename);
+            fs.unlink(path + filename, (err) => {
+              if (err) log.error(`Failed to delete file ${filename}:`, err);
+            });
             reject();
           }
         });
@@ -114,7 +116,9 @@ async function downloadFileFromHost(task) {
         file.on('error', (error) => {
           log.error(`Downloading ${filename} from host failed.`);
           task.status = { state: 'failed', message: 'Fetching file from node failed', progress: 0 };
-          fs.unlink(path + filename);
+          fs.unlink(path + filename, (err) => {
+            if (err) log.error(`Failed to delete file ${filename}:`, err);
+          });
           reject(error.message);
         });
       });
