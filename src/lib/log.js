@@ -44,13 +44,42 @@ function debug(args) {
   }
 }
 
-function error(args) {
+function error(...args) {
   try {
-    // console.error(args);
+    // Process multiple arguments and handle various error types
+    let message = '';
+
+    args.forEach((arg, index) => {
+      if (arg === null) {
+        message += 'null';
+      } else if (arg === undefined) {
+        message += 'undefined';
+      } else if (arg instanceof Error) {
+        // Handle Error objects
+        message += arg.stack || arg.message || arg.toString();
+      } else if (typeof arg === 'object') {
+        // Handle regular objects
+        try {
+          message += JSON.stringify(arg, null, 2);
+        } catch (e) {
+          message += arg.toString();
+        }
+      } else {
+        // Handle strings, numbers, etc.
+        message += String(arg);
+      }
+
+      // Add space between arguments
+      if (index < args.length - 1) {
+        message += ' ';
+      }
+    });
+
+    // console.error(message);
     // write to file
     const filepath = `${logsDirPath}error.log`;
-    writeToFile(filepath, args);
-    debug(args);
+    writeToFile(filepath, message);
+    debug(message);
   } catch (err) {
     console.error('This shall not have happened');
     console.error(err);

@@ -791,7 +791,35 @@ async function processAutomaticBackup() {
     // eslint-disable-next-line prefer-destructuring
     automaticBackup = backups[0];
     const { id, appname, components } = automaticBackup;
-    const componentList = JSON.parse(components);
+
+    // Handle components - MySQL might return it as already parsed array or as JSON string
+    let componentList;
+
+    if (Array.isArray(components)) {
+      // Already an array (MySQL JSON column auto-parsed)
+      componentList = components;
+    } else if (typeof components === 'string') {
+      // It's a string, try to parse it
+      try {
+        componentList = JSON.parse(components);
+      } catch (jsonError) {
+        // If JSON parsing fails, treat as comma-separated string
+        log.info(`Components field is not valid JSON for ${appname}, treating as comma-separated string`);
+        componentList = components.split(',').map((comp) => comp.trim()).filter((comp) => comp);
+      }
+    } else if (typeof components === 'object' && components !== null) {
+      // It's an object but not an array, convert to array
+      componentList = [components];
+    } else {
+      // Fallback to empty array
+      log.error(`Unexpected components format for ${appname}:`, components);
+      componentList = [];
+    }
+
+    // Final validation - ensure it's an array
+    if (!Array.isArray(componentList)) {
+      componentList = [];
+    }
 
     // Set last_backup_timestamp to current time
     const currentTime = Date.now();
@@ -966,7 +994,7 @@ async function init() {
   // Process automatic backups every 10 minutes
   setInterval(async () => {
     await processAutomaticBackup();
-  }, 10 * 60 * 1000); // Run every 10 minutes
+  }, 1 * 60 * 1000); // Run every 10 minutes
 
   // Periodic cleanup of old automatic backups (catches failed removals)
   setInterval(async () => {
