@@ -137,7 +137,7 @@ async function uploadFile(file) {
           console.log(`${fileName} uploaded successfully!`);
           file.uploaded = true;
           file.hash = result.files[0].hash;
-          console.log(file);
+          // console.log(file);
           resolve(result);
         } else {
           log.error(result);
