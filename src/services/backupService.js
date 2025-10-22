@@ -870,12 +870,15 @@ async function processAutomaticBackup() {
         // Register backup tasks for each component
         const taskIds = [];
         // eslint-disable-next-line no-restricted-syntax
+        let backupTimestamp = 0;
+        // eslint-disable-next-line no-restricted-syntax
         for (const componentData of backupResult.components) {
           if (componentData.backups && componentData.host) {
+            if (backupTimestamp === 0) backupTimestamp = componentData.backups.create;
             const taskObj = {
               appname,
               component: componentData.component,
-              timestamp: componentData.backups.create,
+              timestamp: backupTimestamp,
               host: componentData.host,
               filesize: componentData.backups.size,
               owner,
