@@ -133,7 +133,9 @@ async function getAppOwner(appname) {
  */
 async function getSecondaryNodeFromHAProxy(appname) {
   try {
-    const statsUrl = `https://${appname}.app.runonflux.io/fluxstatistics?scope=${appname}`;
+    // Add underscore to scope to ensure exact appname matching (e.g., "rc_" instead of "rc")
+    // This prevents matching apps like "search" when looking for "rc"
+    const statsUrl = `https://${appname}.app.runonflux.io/fluxstatistics?scope=${appname}_`;
     const response = await axios.get(statsUrl, { httpsAgent });
 
     if (!response.data) {
@@ -145,23 +147,26 @@ async function getSecondaryNodeFromHAProxy(appname) {
 
     // Parse the HTML to find backend servers
     // Look for rows with backend servers and their status
-    // HAProxy marks backup/secondary servers with backup_up or backup_down indicators
     const serverRowRegex = /<tr class="(?:active_up|backup_up|active_down|backup_down)[^"]*"[^>]*>([\s\S]*?)<\/tr>/gi;
 
     let secondaryNode = null;
+    const activeNodes = [];
     let match = serverRowRegex.exec(htmlContent);
 
     // Find server rows and extract IP:port
     while (match !== null) {
       const rowContent = match[1];
+      const ipMatch = rowContent.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+)/);
 
-      // Check if this is a backup/secondary server (not primary/active)
-      if (match[0].includes('backup_up')) {
-        // Extract IP:port from the row
-        const ipMatch = rowContent.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+)/);
-        if (ipMatch) {
+      if (ipMatch) {
+        // Check if this is a backup/secondary server
+        if (match[0].includes('backup_up')) {
           [secondaryNode] = ipMatch;
-          break; // Found the first secondary node
+          break; // Found the first backup node
+        }
+        // Collect active nodes as fallback
+        if (match[0].includes('active_up')) {
+          activeNodes.push(ipMatch[0]);
         }
       }
       match = serverRowRegex.exec(htmlContent);
@@ -190,12 +195,20 @@ async function getSecondaryNodeFromHAProxy(appname) {
       }
     }
 
-    if (secondaryNode) {
-      log.info(`First secondary node for ${appname}: ${secondaryNode}`);
+    // If no backup node found but we have active nodes, use the second active node (or first if only one)
+    if (!secondaryNode && activeNodes.length > 0) {
+      // Prefer the second node if available, otherwise use the first
+      secondaryNode = activeNodes[Math.min(1, activeNodes.length - 1)];
+      log.info(`No backup nodes found for ${appname}, using active node: ${secondaryNode}`);
       return secondaryNode;
     }
 
-    log.warn(`No secondary node found for ${appname}`);
+    if (secondaryNode) {
+      log.info(`Secondary/backup node for ${appname}: ${secondaryNode}`);
+      return secondaryNode;
+    }
+
+    log.warn(`No nodes found for ${appname}`);
     return null;
   } catch (error) {
     log.error(`Failed to get HAProxy statistics for ${appname}`, { error: error.message });
