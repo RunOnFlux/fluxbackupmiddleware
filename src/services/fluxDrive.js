@@ -132,7 +132,7 @@ async function uploadFile(file) {
 
       res.on('end', () => {
         const result = JSON.parse(data);
-        console.log(result);
+        // console.log(result);
         if (result.status === 'success') {
           console.log(`${fileName} uploaded successfully!`);
           file.uploaded = true;

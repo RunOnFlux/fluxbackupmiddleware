@@ -49,27 +49,33 @@ function deleteFile(fileName) {
  * @throws Will throw an error if the download fails.
  */
 async function downloadFileFromHost(task) {
-  return new Promise(async (resolve, reject) => {
+  const { filename } = task;
+  const { filesize } = task;
+  const url = new URL(`${task.host}`);
+
+  // Construct node URL from hostname and port
+  const protocol = url.protocol.startsWith('https:') ? 'https' : 'http';
+  const node = `${protocol}://${url.hostname}${url.port ? `:${url.port}` : ''}`;
+
+  // Get fresh zelidauth token first (outside of Promise)
+  let zelidauth;
+  try {
+    zelidauth = await fluxOS.verifyLogin(
+      await Vault.getKey('teamFluxID'),
+      await Vault.getKey('teamPK'),
+      node,
+    );
+  } catch (authError) {
+    log.error('Failed to authenticate with node:', authError);
+    throw authError;
+  }
+
+  if (!zelidauth) {
+    throw new Error('Failed to authenticate with node');
+  }
+
+  return new Promise((resolve, reject) => {
     try {
-      const { filename } = task;
-      const { filesize } = task;
-      const url = new URL(`${task.host}`);
-
-      // Construct node URL from hostname and port
-      const protocol = url.protocol.startsWith('https:') ? 'https' : 'http';
-      const node = `${protocol}://${url.hostname}${url.port ? `:${url.port}` : ''}`;
-
-      // Get fresh zelidauth token
-      const zelidauth = await fluxOS.verifyLogin(
-        await Vault.getKey('teamFluxID'),
-        await Vault.getKey('teamPK'),
-        node,
-      );
-
-      if (!zelidauth) {
-        throw new Error('Failed to authenticate with node');
-      }
-
       const headers = { zelidauth };
       const file = fs.createWriteStream(path + filename);
       let receivedBytes = 0;
@@ -80,14 +86,14 @@ async function downloadFileFromHost(task) {
         path: url.pathname + url.search,
         headers,
       };
-      console.log(options);
-      // eslint-disable-next-line consistent-return
+      // console.log(options);
       get(options, (response) => {
         // Check if the server responded with a redirect
         if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
           response.headers.location = new URL(response.headers.location, url).href;
           // Start a new download using the redirected URL
-          return downloadFileFromHost(task);
+          downloadFileFromHost(task).then(resolve).catch(reject);
+          return;
         }
         const totalBytes = response.headers['content-length'];
 

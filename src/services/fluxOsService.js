@@ -243,7 +243,7 @@ async function verifyLogin(zelid, privateKeySign, node) {
 
     if (response.data.status === 'success') {
       const zelidAuth = qs.stringify(loginInfo);
-      log.info(`Authentication successful, zelidAuth: ${zelidAuth}`);
+      log.info('Authentication successful');
       return zelidAuth;
     }
 
