@@ -313,7 +313,7 @@ async function getAppsWithSyncthing() {
         }
 
         // If we found at least one Syncthing component, add all components to results
-        if (hasSyncthingComponent && app.name.startsWith('wordpress')) {
+        if (hasSyncthingComponent && (true || app.name.startsWith('wordpress'))) {
           appsWithSyncthing.push({
             appName: app.name,
             componentNames: allComponentNames,
@@ -374,7 +374,7 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList) {
 
     // Wait longer for backup creation to ensure files are generated
     log.info(`Waiting for backup files to be created for ${appname}...`);
-    await new Promise((resolve) => { setTimeout(resolve, 3 * 60 * 1000); }); // Wait 3 minutes
+    await new Promise((resolve) => { setTimeout(resolve, 5 * 60 * 1000); }); // Wait 5 minutes
 
     // Get volume mount paths for all components upfront
     const componentMounts = {};
