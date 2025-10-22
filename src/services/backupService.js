@@ -914,7 +914,7 @@ async function processAutomaticBackup() {
           log.info('All new automatic backup tasks completed successfully. Proceeding with cleanup...');
 
           // Remove old automatic backup files (excluding the newly created ones)
-          log.info(`Removing old automatic backup files for ${appname}`);
+          // log.info(`Removing old automatic backup files for ${appname}`);
           const cleanupResult = await removeOldAutomaticBackupFiles(appname, owner, taskIds);
           log.info(`Cleanup complete: ${cleanupResult.removed} old files removed, ${cleanupResult.failed} failed (will retry later)`);
 
