@@ -908,7 +908,7 @@ async function processAutomaticBackup() {
 
         // Wait for all new backup tasks to complete successfully
         log.info(`Waiting for ${taskIds.length} new automatic backup tasks to complete...`);
-        const tasksCompleted = await waitForTasksToComplete(taskIds, 60);
+        const tasksCompleted = await waitForTasksToComplete(taskIds, 15);
 
         if (tasksCompleted) {
           log.info('All new automatic backup tasks completed successfully. Proceeding with cleanup...');
