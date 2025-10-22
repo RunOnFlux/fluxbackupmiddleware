@@ -73,7 +73,7 @@ async function downloadFileFromHost(task) {
   if (!zelidauth) {
     throw new Error('Failed to authenticate with node');
   }
-
+  log.info(`Downloading ${filename} from ${url.href}`);
   return new Promise((resolve, reject) => {
     try {
       const headers = { zelidauth };
@@ -119,6 +119,13 @@ async function downloadFileFromHost(task) {
 
             // Now check if the file exists and verify its size
             try {
+              if (!fs.existsSync(path + filename)) {
+                const errorMessage = `File ${path + filename} does not exist after download.`;
+                log.error(errorMessage);
+                task.status = { state: 'failed', message: 'File does not exist after download', progress: 0 };
+                task.downloaded = false;
+                reject(new Error(errorMessage));
+              }
               const stats = fs.statSync(path + filename);
               console.log(`File size: ${stats.size} bytes`);
 

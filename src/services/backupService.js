@@ -554,7 +554,6 @@ async function waitForTasksToComplete(taskIds, timeoutMinutes = 60) {
   while (Date.now() - startTime < timeout) {
     let allCompleted = true;
     let anyFailed = false;
-
     for (let i = 0; i < taskIds.length; i += 1) {
       const taskId = taskIds[i];
       const task = await dbCli.getTask(taskId);
