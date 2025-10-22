@@ -98,8 +98,8 @@ async function updateQueue() {
   if (taskQueue.size < config.maxConcurrentTasks) {
     // read latest remaining tasks from db
     const emptySlots = config.maxConcurrentTasks - taskQueue.size;
-    const records = await dbCli.execute(`select * from tasks where finishTime=0 and fails<3 order by timestamp limit ${Number(emptySlots)}`);
-    if (records.length) log.debug(`${records.length} failed tasks, retrying...`);
+    const records = await dbCli.execute(`select * from tasks where finishTime=0 and fails<4 order by timestamp limit ${Number(emptySlots)}`);
+    // if (records.length) log.debug(`${records.length} failed tasks, retrying...`);
     for (let i = 0; i < records.length; i += 1) {
       if (!taskQueue.has(records[i].taskId)) {
         // add task to the queue
@@ -108,7 +108,7 @@ async function updateQueue() {
         log.debug(`retrying task ${records[i].taskId}`);
         runTask(Number(records[i].taskId));
       } else {
-        log.warn(`task ${records[i].taskId} already in queue.`);
+        // log.warn(`task ${records[i].taskId} already in queue.`);
       }
     }
     // console.log(taskQueue.entries());
