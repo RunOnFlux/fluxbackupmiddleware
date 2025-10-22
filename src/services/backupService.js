@@ -998,7 +998,7 @@ async function init() {
   // Process automatic backups every 10 minutes
   setInterval(async () => {
     await processAutomaticBackup();
-  }, 10 * 60 * 1000); // Run every 10 minutes
+  }, 15 * 60 * 1000); // Run every 15 minutes
 
   // Periodic cleanup of old automatic backups (catches failed removals)
   setInterval(async () => {
