@@ -87,7 +87,7 @@ async function runTask(id) {
 async function updateQueue() {
   // remove failed tasks from queue
   const now = Math.floor(Date.now() / 1000);
-  const failTime = 60 * 60; // 1 hour
+  const failTime = 30 * 60; // 30 minutes
   taskQueue.forEach((value, key) => {
     if (now - value.startTime > failTime) {
       log.info(`deleting ${key} from queue.`);
@@ -107,6 +107,8 @@ async function updateQueue() {
         // run task
         log.debug(`retrying task ${records[i].taskId}`);
         runTask(Number(records[i].taskId));
+      } else {
+        log.warn(`task ${records[i].taskId} already in queue.`);
       }
     }
     // console.log(taskQueue.entries());
@@ -982,7 +984,7 @@ async function init() {
   await dbCli.checkSchema();
   setInterval(async () => {
     await updateQueue();
-  }, 10 * 1000);
+  }, 20 * 1000);
   await dbCli.checkSchema();
   setInterval(async () => {
     await checkExpiredApps();
