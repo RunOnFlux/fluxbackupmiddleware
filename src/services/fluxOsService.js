@@ -363,7 +363,7 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList) {
 
     // Wait longer for backup creation to ensure files are generated
     log.info(`Waiting for backup files to be created for ${appname}...`);
-    await new Promise((resolve) => { setTimeout(resolve, 120000); }); // Wait 2 minutes
+    await new Promise((resolve) => { setTimeout(resolve, 3 * 60 * 1000); }); // Wait 3 minutes
 
     // Get volume mount paths for all components upfront
     const componentMounts = {};
