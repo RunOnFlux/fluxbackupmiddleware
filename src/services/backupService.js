@@ -991,10 +991,10 @@ async function init() {
   // Run initial sync
   await syncSyncthingApps();
 
-  // Process automatic backups every 10 minutes
+  // Process automatic backups every 7 minutes
   setInterval(async () => {
     await processAutomaticBackup();
-  }, 5 * 60 * 1000); // Run every 5 minutes
+  }, 7 * 60 * 1000); // Run every 7 minutes
 
   // Periodic cleanup of old automatic backups (catches failed removals)
   setInterval(async () => {
