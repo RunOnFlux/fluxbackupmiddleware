@@ -547,7 +547,7 @@ async function waitForTasksToComplete(taskIds, timeoutMinutes = 60) {
 
   const startTime = Date.now();
   const timeout = timeoutMinutes * 60 * 1000;
-  const checkInterval = 10000; // Check every 10 seconds
+  const checkInterval = 30000; // Check every 30 seconds
 
   log.info(`Waiting for ${taskIds.length} tasks to complete: ${taskIds.join(', ')}`);
 
@@ -913,7 +913,7 @@ async function processAutomaticBackup() {
 
         // Wait for all new backup tasks to complete successfully
         log.info(`Waiting for ${taskIds.length} new automatic backup tasks to complete...`);
-        const tasksCompleted = await waitForTasksToComplete(taskIds, 15);
+        const tasksCompleted = await waitForTasksToComplete(taskIds, 60);
 
         if (tasksCompleted) {
           log.info('All new automatic backup tasks completed successfully. Proceeding with cleanup...');
