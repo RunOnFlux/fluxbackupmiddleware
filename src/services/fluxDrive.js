@@ -132,12 +132,12 @@ async function uploadFile(file) {
 
       res.on('end', () => {
         const result = JSON.parse(data);
-        console.log(result);
+        // console.log(result);
         if (result.status === 'success') {
           console.log(`${fileName} uploaded successfully!`);
           file.uploaded = true;
           file.hash = result.files[0].hash;
-          console.log(file);
+          // console.log(file);
           resolve(result);
         } else {
           log.error(result);
