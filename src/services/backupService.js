@@ -126,7 +126,7 @@ async function checkExpiredApps() {
     log.info('checkExpiredApps...');
     let expireHeight = await fluxOS.getBlockHeight();
     if (expireHeight !== false && expireHeight > 1000) {
-      expireHeight -= 720 * 7; // 7 days
+      expireHeight -= 720 * 7 * 4; // 7 days
       // get apps that have been expired more than 7 days
       const records = await dbCli.execute(`select * from tasks where removedFromFluxdrive = 0 and uploaded = 1 and appExpireHeight > 0  and appExpireHeight < ${Number(expireHeight)} order by appExpireHeight ASC limit 10`);
       // eslint-disable-next-line no-restricted-syntax
