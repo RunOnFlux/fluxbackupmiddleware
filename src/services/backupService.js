@@ -404,7 +404,19 @@ async function getBackupList(req, res) {
     if (!await fluxOS.verifyAppOwner(owner, appname)) {
       throw new Error('Unauthorized. Access denied.');
     }
-    const result = await dbCli.getUserBackups(owner, appname);
+
+    // If owner is fluxteam, get the real app owner for backup retrieval
+    let backupOwner = owner;
+    const teamFluxID = await Vault.getKey('teamFluxID');
+    if (owner === teamFluxID) {
+      const realOwner = await fluxOS.getAppOwner(appname);
+      if (realOwner) {
+        backupOwner = realOwner;
+        log.info(`Using real owner ${realOwner} for fluxteam backup retrieval of app ${appname}`);
+      }
+    }
+
+    const result = await dbCli.getUserBackups(backupOwner, appname);
     const checkpoints = [];
     if (Array.isArray(result)) {
       const temp = {};
