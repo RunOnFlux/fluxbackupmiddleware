@@ -1,5 +1,6 @@
 /* eslint-disable no-await-in-loop */
 /* eslint-disable no-undef */
+const axios = require('axios');
 const DBClient = require('./utils/DBClient');
 const log = require('../lib/log');
 const config = require('../../config/default');
@@ -778,6 +779,65 @@ async function cleanupOldAutomaticBackups() {
 }
 
 /**
+ * Removes backup file from remote host
+ * Converts the download URL to removal URL and sends request with team authentication
+ * @async
+ * @param {string} host - The host URL from task (download URL)
+ * @param {number} taskId - The task ID for updating database
+ * @returns {Promise<boolean>} - true if removal was successful, false otherwise
+ */
+async function removeBackupFromRemoteHost(host, taskId) {
+  try {
+    // Convert download URL to removal URL
+    // From: http://99.132.138.126:16177/backup/downloadlocalfile/...
+    // To:   http://99.132.138.126:16177/backup/removebackupfile/...
+    const removalUrl = host.replace('/backup/downloadlocalfile/', '/backup/removebackupfile/');
+
+    log.info(`Attempting to remove remote file for task ${taskId} from: ${removalUrl}`);
+
+    // Get team credentials for authentication
+    const teamFluxID = await Vault.getKey('teamFluxID');
+    const teamPK = await Vault.getKey('teamPK');
+
+    // Parse URL to get node address
+    const urlParts = new URL(removalUrl);
+    const nodeUrl = `${urlParts.protocol}//${urlParts.host}`;
+
+    // Get zelidAuth for the request
+    const zelidAuth = await fluxOS.verifyLogin(teamFluxID, teamPK, nodeUrl);
+
+    if (!zelidAuth) {
+      log.error(`Failed to authenticate with node for task ${taskId}`);
+      return false;
+    }
+
+    // Make the removal request using axios
+    const response = await axios.get(removalUrl, {
+      headers: {
+        zelidauth: zelidAuth,
+      },
+      timeout: 30000, // 30 second timeout
+    });
+
+    // Check if removal was successful
+    if (response.data && response.data.status === 'success') {
+      log.info(`Successfully removed remote file for task ${taskId}`);
+
+      // Update the task to mark remoteRemoved as 1
+      await dbCli.execute('UPDATE tasks SET remoteRemoved = 1 WHERE taskId = ?', [taskId]);
+
+      return true;
+    }
+
+    log.error(`Failed to remove remote file for task ${taskId}. Response:`, response.data);
+    return false;
+  } catch (error) {
+    log.error(`Error removing remote file for task ${taskId}:`, error.message);
+    return false;
+  }
+}
+
+/**
  * Processes automatic backups by fetching the next scheduled backup from the database,
  * creating backup tasks on the node, and registering them for processing.
  *
@@ -932,6 +992,25 @@ async function processAutomaticBackup() {
 
         if (tasksCompleted) {
           log.info('All new automatic backup tasks completed successfully. Proceeding with cleanup...');
+
+          // Remove backup files from remote hosts
+          log.info(`Removing backup files from remote hosts for ${taskIds.length} tasks...`);
+          let remoteRemovalCount = 0;
+          // Using traditional for loop to avoid ESLint no-restricted-syntax error
+          for (let i = 0; i < taskIds.length; i += 1) {
+            const taskId = taskIds[i];
+            // Get task details to get the host URL
+            // eslint-disable-next-line no-await-in-loop
+            const taskDetails = await dbCli.execute('SELECT host FROM tasks WHERE taskId = ?', [taskId]);
+            if (taskDetails.length > 0 && taskDetails[0].host) {
+              // eslint-disable-next-line no-await-in-loop
+              const removalSuccess = await removeBackupFromRemoteHost(taskDetails[0].host, taskId);
+              if (removalSuccess) {
+                remoteRemovalCount += 1;
+              }
+            }
+          }
+          log.info(`Remote file removal complete: ${remoteRemovalCount}/${taskIds.length} files removed from nodes`);
 
           // Remove old automatic backup files (excluding the newly created ones)
           // log.info(`Removing old automatic backup files for ${appname}`);
