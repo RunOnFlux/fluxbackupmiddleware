@@ -633,11 +633,14 @@ async function removeOldAutomaticBackupFiles(appname, owner, excludeTaskIds = []
   }
 
   try {
-    log.info(`Removing old automatic backup files for app: ${appname}`);
+    log.info(`Removing automatic backup files older than 2 weeks for app: ${appname}`);
 
     const excludeIds = excludeTaskIds.join(',');
 
-    // Query for old automatic backups that haven't been removed yet
+    // Calculate timestamp for 2 weeks ago (14 days * 24 hours * 60 minutes * 60 seconds)
+    const twoWeeksAgoTimestamp = Math.floor(Date.now() / 1000) - (14 * 24 * 60 * 60);
+
+    // Query for old automatic backups that haven't been removed yet and are older than 2 weeks
     // This will include previously failed removals automatically
     const query = `
       SELECT taskId, hash, filename, filesize, timestamp
@@ -648,17 +651,18 @@ async function removeOldAutomaticBackupFiles(appname, owner, excludeTaskIds = []
       AND uploaded = 1
       AND removedFromFluxdrive = 0
       AND finishTime <> 0
+      AND timestamp < ?
       AND taskId NOT IN (${excludeIds})
     `;
 
-    const oldTasks = await dbCli.execute(query, [appname, owner]);
+    const oldTasks = await dbCli.execute(query, [appname, owner, twoWeeksAgoTimestamp]);
 
     if (!oldTasks || oldTasks.length === 0) {
-      log.info(`No old automatic backup files to remove for ${appname}`);
+      log.info(`No automatic backup files older than 2 weeks to remove for ${appname}`);
       return { removed: 0, failed: 0 };
     }
 
-    log.info(`Found ${oldTasks.length} old automatic backup files to remove for ${appname}`);
+    log.info(`Found ${oldTasks.length} automatic backup files older than 2 weeks to remove for ${appname}`);
 
     let removedCount = 0;
     let failedCount = 0;
