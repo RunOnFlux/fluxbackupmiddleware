@@ -581,8 +581,22 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList) {
           });
 
           if (backupListResponse.data && backupListResponse.data.status === 'success') {
+            const responseData = backupListResponse.data.data;
+            log.info(`Backup list response for component ${component}: received ${Array.isArray(responseData) ? responseData.length : 0} files`);
+
+            // Log all file names received for debugging
+            if (Array.isArray(responseData) && responseData.length > 0) {
+              const fileNames = responseData.map((f) => f.name).join(', ');
+              log.info(`Files in backup directory for ${component}: ${fileNames}`);
+            } else {
+              log.warn(`No files found in backup directory for component ${component}, attempt ${retryCount + 1}`);
+            }
+
             // Filter backup files for this specific component and get the latest one
-            const allBackups = backupListResponse.data.data.filter((backup) => backup.name.includes(`backup_${component}.tar.gz`));
+            const expectedPattern = `backup_${component}.tar.gz`;
+            const allBackups = responseData.filter((backup) => backup.name.includes(expectedPattern));
+
+            log.info(`Filtering for pattern "${expectedPattern}": found ${allBackups.length} matching backup(s)`);
 
             if (allBackups.length > 0) {
               // Sort by create timestamp (descending) and get the latest
@@ -596,10 +610,11 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList) {
               };
 
               log.info(`Found ${allBackups.length} backup(s) for component ${component}, selected latest: ${latestBackup.name} (created: ${latestBackup.create})`);
+            } else {
+              log.warn(`No backups matching pattern "${expectedPattern}" for component ${component}, attempt ${retryCount + 1}`);
             }
           } else {
-            log.info(`No backup data found for component ${component}, attempt ${retryCount + 1}`);
-            log.info(backupListResponse.data.data);
+            log.warn(`Backup list request failed for component ${component}, attempt ${retryCount + 1}. Status: ${backupListResponse.data?.status}, Message: ${backupListResponse.data?.data || 'unknown'}`);
           }
         } catch (error) {
           log.error(`Error fetching backup list for component ${component}, attempt ${retryCount + 1}: ${error.message}`);
