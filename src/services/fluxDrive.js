@@ -1,6 +1,7 @@
 /* eslint-disable no-param-reassign */
 const axios = require('axios');
 const http = require('http');
+const https = require('https');
 const FormData = require('form-data');
 const { URL } = require('url');
 const fs = require('fs');
@@ -8,6 +9,21 @@ const path = require('path');
 const log = require('../lib/log');
 const Vault = require('./Vault');
 const config = require('../../config/default');
+
+/**
+ * Builds a full URL for FluxDrive API endpoints.
+ * Handles both URLs with and without protocol prefix.
+ *
+ * @param {string} serverUrl - The FluxDrive server URL (with or without protocol)
+ * @param {string} endpoint - The API endpoint path
+ * @returns {string} - The full URL with protocol
+ */
+function buildFluxDriveUrl(serverUrl, endpoint) {
+  if (serverUrl.startsWith('http://') || serverUrl.startsWith('https://')) {
+    return `${serverUrl}${endpoint}`;
+  }
+  return `http://${serverUrl}${endpoint}`;
+}
 
 /**
  * Retrieves the status from the FluxDrive server.
@@ -22,7 +38,7 @@ async function getStatus() {
   try {
     const result = await axios({
       method: 'post',
-      url: `http://${FD_SERVER}/api/v0/status`,
+      url: buildFluxDriveUrl(FD_SERVER, '/api/v0/status'),
       headers: {
         Authorization: `Basic ${Buffer.from(`${ZELID}:${API_KEY}`).toString('base64')}`,
       },
@@ -46,7 +62,7 @@ async function removeFile(hash) {
   try {
     const result = await axios({
       method: 'post',
-      url: `http://${FD_SERVER}/api/v0/rm?arg=${hash}`,
+      url: buildFluxDriveUrl(FD_SERVER, `/api/v0/rm?arg=${hash}`),
       headers: {
         Authorization: `Basic ${Buffer.from(`${ZELID}:${API_KEY}`).toString('base64')}`,
       },
@@ -71,7 +87,7 @@ async function getFileList() {
   try {
     const result = await axios({
       method: 'post',
-      url: `http://${FD_SERVER}/api/v0/ls`,
+      url: buildFluxDriveUrl(FD_SERVER, '/api/v0/ls'),
       headers: {
         Authorization: `Basic ${Buffer.from(`${ZELID}:${API_KEY}`).toString('base64')}`,
       },
@@ -102,14 +118,16 @@ async function uploadFile(file) {
   const fileSize = fs.statSync(filePath).size;
   const fileStream = fs.createReadStream(filePath);
   form.append('file', fileStream);
-  const {
-    hostname, port,
-  } = new URL(`http://${FD_SERVER}/api/v0/put`);
+  
+  const fullUrl = buildFluxDriveUrl(FD_SERVER, '/api/v0/put');
+  const parsedUrl = new URL(fullUrl);
+  const isHttps = parsedUrl.protocol === 'https:';
+  const httpModule = isHttps ? https : http;
 
   const options = {
-    hostname,
-    path: '/api/v0/put',
-    port,
+    hostname: parsedUrl.hostname,
+    path: parsedUrl.pathname + parsedUrl.search,
+    port: parsedUrl.port,
     method: 'POST',
     headers: {
       ...form.getHeaders(),
@@ -123,7 +141,7 @@ async function uploadFile(file) {
     // console.log(file.status);
   });
   return new Promise((resolve, reject) => {
-    const req = http.request(options, (res) => {
+    const req = httpModule.request(options, (res) => {
       let data = '';
 
       res.on('data', (chunk) => {
@@ -133,15 +151,15 @@ async function uploadFile(file) {
       res.on('end', () => {
         const result = JSON.parse(data);
         // console.log(result);
-        if (result.status === 'success') {
+        if (result.hash) {
           console.log(`${fileName} uploaded successfully!`);
           file.uploaded = true;
-          file.hash = result.files[0].hash;
+          file.hash = result.hash;
           // console.log(file);
           resolve(result);
         } else {
           log.error(result);
-          file.status = { state: 'failed', message: result.data.message, progress: 0 };
+          file.status = { state: 'failed', message: result.message || 'Upload failed', progress: 0 };
           reject(result);
         }
       });
@@ -165,7 +183,7 @@ async function getFile(req, res) {
   try {
     axios({
       method: 'post',
-      url: `http://${FD_SERVER}/api/v0/cat?arg=${filename}`,
+      url: buildFluxDriveUrl(FD_SERVER, `/api/v0/cat?arg=${filename}`),
       responseType: 'stream',
       timeout: 60000,
       headers: {

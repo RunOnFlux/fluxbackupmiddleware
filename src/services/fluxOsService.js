@@ -195,12 +195,94 @@ async function getSecondaryNodeFromHAProxy(appname) {
       }
     }
 
-    // If no backup node found but we have active nodes, use the second active node (or first if only one)
-    if (!secondaryNode && activeNodes.length > 0) {
-      // Prefer the second node if available, otherwise use the first
-      secondaryNode = activeNodes[Math.min(1, activeNodes.length - 1)];
-      log.info(`No backup nodes found for ${appname}, using active node: ${secondaryNode}`);
+    // If no backup node found but we have multiple active nodes
+    if (!secondaryNode && activeNodes.length > 1) {
+      // Use the second active node
+      [, secondaryNode] = activeNodes;
+      log.info(`No backup nodes found for ${appname}, using second active node: ${secondaryNode}`);
       return secondaryNode;
+    }
+
+    // If we have one node or no nodes from HAProxy, get nodes from Flux location API
+    if (!secondaryNode && activeNodes.length <= 1) {
+      const logMessage = activeNodes.length === 0
+        ? `No nodes found in HAProxy for ${appname}, checking Flux location API`
+        : `Only one node found in HAProxy for ${appname}, checking Flux location API for additional nodes`;
+      log.info(logMessage);
+
+      try {
+        const locationUrl = `https://api.runonflux.io/apps/location/${appname}`;
+        const locationResponse = await axios.get(locationUrl, { httpsAgent });
+
+        if (locationResponse.data && locationResponse.data.status === 'success' && locationResponse.data.data) {
+          const locations = locationResponse.data.data;
+
+          if (locations.length === 0) {
+            log.error(`No locations found for ${appname} in location API`);
+            return activeNodes.length > 0 ? activeNodes[0] : null;
+          }
+
+          // Parse location API nodes - they may include port (e.g., "1.2.3.4:16157") or just IP
+          const parseLocationNode = (location) => {
+            if (location.ip.includes(':')) {
+              // Port is included in the IP field
+              return location.ip;
+            }
+            // No port provided, use default
+            return `${location.ip}:16127`;
+          };
+
+          let haproxyIp = null;
+          if (activeNodes.length > 0) {
+            // Extract just the IP from HAProxy node for comparison
+            const [haproxyNode] = activeNodes;
+            [haproxyIp] = haproxyNode.split(':');
+          }
+
+          // If we have a HAProxy node, find a different one from location API
+          if (haproxyIp) {
+            // Find a location with different IP than HAProxy node
+            const alternativeLocation = locations.find((location) => {
+              const locationIp = location.ip.includes(':') ? location.ip.split(':')[0] : location.ip;
+              return locationIp !== haproxyIp;
+            });
+
+            if (alternativeLocation) {
+              secondaryNode = parseLocationNode(alternativeLocation);
+              log.info(`Found alternative node from Flux location API: ${secondaryNode}`);
+              return secondaryNode;
+            }
+
+            // If all location nodes are the same as HAProxy node, use the HAProxy node
+            [secondaryNode] = activeNodes;
+            log.warn(`All nodes from location API match HAProxy node, using: ${secondaryNode}`);
+            return secondaryNode;
+          }
+
+          // No HAProxy nodes at all, use nodes from location API
+          // Pick the second node if available, otherwise the first
+          const nodeIndex = Math.min(1, locations.length - 1);
+          secondaryNode = parseLocationNode(locations[nodeIndex]);
+          log.info(`No HAProxy nodes available, using location API node: ${secondaryNode}`);
+          return secondaryNode;
+        }
+
+        log.error(`Invalid response from location API for ${appname}`);
+        return activeNodes.length > 0 ? activeNodes[0] : null;
+      } catch (locationError) {
+        log.error(`Failed to get location data for ${appname}:`, locationError.message);
+
+        // If we have a HAProxy node, fall back to it
+        if (activeNodes.length > 0) {
+          [secondaryNode] = activeNodes;
+          log.info(`Location API failed, using single HAProxy node: ${secondaryNode}`);
+          return secondaryNode;
+        }
+
+        // No nodes available at all
+        log.error(`No nodes available from HAProxy or location API for ${appname}`);
+        return null;
+      }
     }
 
     if (secondaryNode) {
@@ -499,8 +581,22 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList) {
           });
 
           if (backupListResponse.data && backupListResponse.data.status === 'success') {
+            const responseData = backupListResponse.data.data;
+            log.info(`Backup list response for component ${component}: received ${Array.isArray(responseData) ? responseData.length : 0} files`);
+
+            // Log all file names received for debugging
+            if (Array.isArray(responseData) && responseData.length > 0) {
+              const fileNames = responseData.map((f) => f.name).join(', ');
+              log.info(`Files in backup directory for ${component}: ${fileNames}`);
+            } else {
+              log.warn(`No files found in backup directory for component ${component}, attempt ${retryCount + 1}`);
+            }
+
             // Filter backup files for this specific component and get the latest one
-            const allBackups = backupListResponse.data.data.filter((backup) => backup.name.includes(`backup_${component}.tar.gz`));
+            const expectedPattern = `backup_${component}.tar.gz`;
+            const allBackups = responseData.filter((backup) => backup.name.includes(expectedPattern));
+
+            log.info(`Filtering for pattern "${expectedPattern}": found ${allBackups.length} matching backup(s)`);
 
             if (allBackups.length > 0) {
               // Sort by create timestamp (descending) and get the latest
@@ -514,10 +610,11 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList) {
               };
 
               log.info(`Found ${allBackups.length} backup(s) for component ${component}, selected latest: ${latestBackup.name} (created: ${latestBackup.create})`);
+            } else {
+              log.warn(`No backups matching pattern "${expectedPattern}" for component ${component}, attempt ${retryCount + 1}`);
             }
           } else {
-            log.info(`No backup data found for component ${component}, attempt ${retryCount + 1}`);
-            log.info(backupListResponse.data.data);
+            log.warn(`Backup list request failed for component ${component}, attempt ${retryCount + 1}. Status: ${backupListResponse.data?.status}, Message: ${backupListResponse.data?.data || 'unknown'}`);
           }
         } catch (error) {
           log.error(`Error fetching backup list for component ${component}, attempt ${retryCount + 1}: ${error.message}`);

@@ -1,5 +1,6 @@
 /* eslint-disable no-await-in-loop */
 /* eslint-disable no-undef */
+const axios = require('axios');
 const DBClient = require('./utils/DBClient');
 const log = require('../lib/log');
 const config = require('../../config/default');
@@ -126,7 +127,7 @@ async function checkExpiredApps() {
     log.info('checkExpiredApps...');
     let expireHeight = await fluxOS.getBlockHeight();
     if (expireHeight !== false && expireHeight > 1000) {
-      expireHeight -= 720 * 7; // 7 days
+      expireHeight -= 720 * 7 * 4; // 7 days
       // get apps that have been expired more than 7 days
       const records = await dbCli.execute(`select * from tasks where removedFromFluxdrive = 0 and uploaded = 1 and appExpireHeight > 0  and appExpireHeight < ${Number(expireHeight)} order by appExpireHeight ASC limit 10`);
       // eslint-disable-next-line no-restricted-syntax
@@ -404,7 +405,19 @@ async function getBackupList(req, res) {
     if (!await fluxOS.verifyAppOwner(owner, appname)) {
       throw new Error('Unauthorized. Access denied.');
     }
-    const result = await dbCli.getUserBackups(owner, appname);
+
+    // If owner is fluxteam, get the real app owner for backup retrieval
+    let backupOwner = owner;
+    const teamFluxID = await Vault.getKey('teamFluxID');
+    if (owner === teamFluxID) {
+      const realOwner = await fluxOS.getAppOwner(appname);
+      if (realOwner) {
+        backupOwner = realOwner;
+        log.info(`Using real owner ${realOwner} for fluxteam backup retrieval of app ${appname}`);
+      }
+    }
+
+    const result = await dbCli.getUserBackups(backupOwner, appname);
     const checkpoints = [];
     if (Array.isArray(result)) {
       const temp = {};
@@ -621,11 +634,14 @@ async function removeOldAutomaticBackupFiles(appname, owner, excludeTaskIds = []
   }
 
   try {
-    log.info(`Removing old automatic backup files for app: ${appname}`);
+    log.info(`Removing automatic backup files older than 2 weeks for app: ${appname}`);
 
     const excludeIds = excludeTaskIds.join(',');
 
-    // Query for old automatic backups that haven't been removed yet
+    // Calculate timestamp for 2 weeks ago (14 days * 24 hours * 60 minutes * 60 seconds)
+    const twoWeeksAgoTimestamp = Math.floor(Date.now() / 1000) - (14 * 24 * 60 * 60);
+
+    // Query for old automatic backups that haven't been removed yet and are older than 2 weeks
     // This will include previously failed removals automatically
     const query = `
       SELECT taskId, hash, filename, filesize, timestamp
@@ -636,17 +652,18 @@ async function removeOldAutomaticBackupFiles(appname, owner, excludeTaskIds = []
       AND uploaded = 1
       AND removedFromFluxdrive = 0
       AND finishTime <> 0
+      AND timestamp < ?
       AND taskId NOT IN (${excludeIds})
     `;
 
-    const oldTasks = await dbCli.execute(query, [appname, owner]);
+    const oldTasks = await dbCli.execute(query, [appname, owner, twoWeeksAgoTimestamp]);
 
     if (!oldTasks || oldTasks.length === 0) {
-      log.info(`No old automatic backup files to remove for ${appname}`);
+      log.info(`No automatic backup files older than 2 weeks to remove for ${appname}`);
       return { removed: 0, failed: 0 };
     }
 
-    log.info(`Found ${oldTasks.length} old automatic backup files to remove for ${appname}`);
+    log.info(`Found ${oldTasks.length} automatic backup files older than 2 weeks to remove for ${appname}`);
 
     let removedCount = 0;
     let failedCount = 0;
@@ -758,6 +775,65 @@ async function cleanupOldAutomaticBackups() {
   } catch (error) {
     log.error('Error in cleanupOldAutomaticBackups:', error.message);
     return { totalRemoved: 0, totalFailed: 0, appsProcessed: 0 };
+  }
+}
+
+/**
+ * Removes backup file from remote host
+ * Converts the download URL to removal URL and sends request with team authentication
+ * @async
+ * @param {string} host - The host URL from task (download URL)
+ * @param {number} taskId - The task ID for updating database
+ * @returns {Promise<boolean>} - true if removal was successful, false otherwise
+ */
+async function removeBackupFromRemoteHost(host, taskId) {
+  try {
+    // Convert download URL to removal URL
+    // From: http://99.132.138.126:16177/backup/downloadlocalfile/...
+    // To:   http://99.132.138.126:16177/backup/removebackupfile/...
+    const removalUrl = host.replace('/backup/downloadlocalfile/', '/backup/removebackupfile/');
+
+    log.info(`Attempting to remove remote file for task ${taskId} from: ${removalUrl}`);
+
+    // Get team credentials for authentication
+    const teamFluxID = await Vault.getKey('teamFluxID');
+    const teamPK = await Vault.getKey('teamPK');
+
+    // Parse URL to get node address
+    const urlParts = new URL(removalUrl);
+    const nodeUrl = `${urlParts.protocol}//${urlParts.host}`;
+
+    // Get zelidAuth for the request
+    const zelidAuth = await fluxOS.verifyLogin(teamFluxID, teamPK, nodeUrl);
+
+    if (!zelidAuth) {
+      log.error(`Failed to authenticate with node for task ${taskId}`);
+      return false;
+    }
+
+    // Make the removal request using axios
+    const response = await axios.get(removalUrl, {
+      headers: {
+        zelidauth: zelidAuth,
+      },
+      timeout: 30000, // 30 second timeout
+    });
+
+    // Check if removal was successful
+    if (response.data && response.data.status === 'success') {
+      log.info(`Successfully removed remote file for task ${taskId}`);
+
+      // Update the task to mark remoteRemoved as 1
+      await dbCli.execute('UPDATE tasks SET remoteRemoved = 1 WHERE taskId = ?', [taskId]);
+
+      return true;
+    }
+
+    log.error(`Failed to remove remote file for task ${taskId}. Response:`, response.data);
+    return false;
+  } catch (error) {
+    log.error(`Error removing remote file for task ${taskId}:`, error.message);
+    return false;
   }
 }
 
@@ -916,6 +992,25 @@ async function processAutomaticBackup() {
 
         if (tasksCompleted) {
           log.info('All new automatic backup tasks completed successfully. Proceeding with cleanup...');
+
+          // Remove backup files from remote hosts
+          log.info(`Removing backup files from remote hosts for ${taskIds.length} tasks...`);
+          let remoteRemovalCount = 0;
+          // Using traditional for loop to avoid ESLint no-restricted-syntax error
+          for (let i = 0; i < taskIds.length; i += 1) {
+            const taskId = taskIds[i];
+            // Get task details to get the host URL
+            // eslint-disable-next-line no-await-in-loop
+            const taskDetails = await dbCli.execute('SELECT host FROM tasks WHERE taskId = ?', [taskId]);
+            if (taskDetails.length > 0 && taskDetails[0].host) {
+              // eslint-disable-next-line no-await-in-loop
+              const removalSuccess = await removeBackupFromRemoteHost(taskDetails[0].host, taskId);
+              if (removalSuccess) {
+                remoteRemovalCount += 1;
+              }
+            }
+          }
+          log.info(`Remote file removal complete: ${remoteRemovalCount}/${taskIds.length} files removed from nodes`);
 
           // Remove old automatic backup files (excluding the newly created ones)
           // log.info(`Removing old automatic backup files for ${appname}`);
