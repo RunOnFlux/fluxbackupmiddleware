@@ -757,7 +757,7 @@ async function cleanupOldAutomaticBackups() {
         try {
           excludeTaskIds = JSON.parse(latestBackup[0].backup_tasks);
         } catch (e) {
-          log.warn(`Failed to parse backup_tasks for ${appname}`);
+          // log.warn(`Failed to parse backup_tasks for ${appname}`);
         }
       }
 
