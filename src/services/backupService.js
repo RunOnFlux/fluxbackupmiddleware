@@ -122,7 +122,7 @@ async function runTask(id) {
     }
     task.fails += 1;
     await dbCli.updateTask(task);
-    log.error(`task ${id} failed:`, message, error instanceof Error ? error : undefined);
+    log.error(`task ${id} failed:`, error instanceof Error ? error : message);
   }
 }
 
@@ -1156,7 +1156,7 @@ async function processAutomaticBackup() {
       stage: lastFailure?.stage || 'automatic_backup',
       reason: lastFailure?.reason || 'All retries exhausted',
       taskFailures: lastFailure?.taskFailures || [],
-      retryCount: maxRetries,
+      retryCount,
       maxRetries,
     });
     return false;
@@ -1179,7 +1179,7 @@ async function processAutomaticBackup() {
         stage: inferFailureStage(error),
         reason: getErrorMessage(error),
         taskFailures: error.taskFailures || lastFailure?.taskFailures || [],
-        retryCount: maxRetries,
+        retryCount,
         maxRetries,
       });
     }
