@@ -12,33 +12,24 @@
   "author": "Ali Mahdavi",
   "license": "ISC",
   "dependencies": {
-    "@babel/eslint-parser": "^7.22.15",
-    "axios": "^1.6.5",
+    "axios": "^1.17.0",
     "bitcoinjs-message": "^2.2.0",
     "body-parser": "^1.20.2",
-    "child_process": "^1.0.2",
     "cors": "^2.8.5",
     "dotenv": "^16.4.1",
     "express": "^4.19.2",
     "express-rate-limit": "^7.1.5",
-    "form-data": "^4.0.0",
-    "https": "^1.0.0",
+    "form-data": "^4.0.5",
     "memory-cache": "^0.2.0",
-    "morgan": "^1.10.0",
-    "mysql2": "^3.9.7",
+    "mysql2": "^3.9.8",
     "nano-ethereum-signer": "^0.1.2",
-    "path": "^0.12.7",
     "qs": "^6.11.2",
-    "ssh2": "^1.14.0",
-    "timers": "^0.1.1",
-    "util": "^0.12.5",
-    "zeltrezjs": "^2.12.0",
-    "zelcorejs": "https://github.com/zelcore-io/zelcorejs"
+    "zeltrezjs": "^2.12.0"
   },
   "devDependencies": {
+    "@babel/eslint-parser": "^7.22.15",
     "eslint": "^8.14.0",
     "eslint-config-airbnb-base": "^15.0.0",
-    "eslint-plugin-import": "^2.25.4",
-    "power-assert": "^1.6.1"
+    "eslint-plugin-import": "^2.25.4"
   }
 }
