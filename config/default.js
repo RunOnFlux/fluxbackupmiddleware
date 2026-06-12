@@ -17,5 +17,6 @@ module.exports = {
   HCPOrgID: process.env.HCP_ORG_ID,
   HCPProjectID: process.env.HCP_PROJECT_ID,
   HCPAppID: process.env.HCP_APP_ID,
+  discordWebhookUrl: process.env.DISCORD_WEBHOOK_URL,
   version: '1.0.0',
 };
