@@ -64,7 +64,7 @@ async function notifyAutomaticBackupFailure({
     `**Reason:** ${reason}`,
   ];
 
-  if (retryCount && maxRetries) {
+  if (typeof retryCount === 'number' && typeof maxRetries === 'number') {
     lines.push(`**Retries:** ${retryCount}/${maxRetries}`);
   }
 
@@ -79,7 +79,7 @@ async function notifyAutomaticBackupFailure({
     log.info(`Discord notification sent for automatic backup failure (${appname})`);
     return true;
   } catch (error) {
-    log.error('Failed to send Discord notification:', error.message);
+    log.error('Failed to send Discord notification:', error);
     return false;
   }
 }
