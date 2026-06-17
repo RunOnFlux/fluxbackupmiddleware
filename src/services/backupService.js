@@ -10,10 +10,109 @@ const fileManager = require('./fileService');
 const fluxDrive = require('./fluxDrive');
 const fluxOS = require('./fluxOsService');
 const Vault = require('./Vault');
+const discordNotifier = require('./discordNotifier');
 
 let dbCli = null;
 
 const taskQueue = new Map();
+
+function getErrorMessage(error) {
+  if (error instanceof Error) return error.message;
+  if (typeof error === 'string') return error;
+  return String(error);
+}
+
+function createBackupFailure(reason, stage, taskFailures = []) {
+  const error = new Error(reason);
+  error.stage = stage;
+  error.taskFailures = taskFailures;
+  return error;
+}
+
+function inferFailureStage(error) {
+  if (error.stage) return error.stage;
+
+  const message = getErrorMessage(error);
+  if (message.includes('secondary node')) return 'node_selection';
+  if (message.includes('authenticate')) return 'node_auth';
+  if (message.includes('app owner')) return 'app_owner';
+  if (message.includes('create backup tasks')) return 'create_backup';
+  if (message.includes('Could not queue backup')) return 'create_backup';
+  if (message.includes('Timeout waiting for tasks')) return 'task_timeout';
+  return 'automatic_backup';
+}
+
+function buildTaskFailure(task, taskId, reason) {
+  return {
+    taskId,
+    component: task?.component || 'unknown',
+    message: task?.status?.message || reason,
+    fails: task?.fails || 0,
+  };
+}
+
+async function collectTaskFailures(taskIds, reason) {
+  const failures = [];
+  for (let i = 0; i < taskIds.length; i += 1) {
+    const taskId = taskIds[i];
+    const task = await dbCli.getTask(taskId);
+    failures.push(buildTaskFailure(task, taskId, reason));
+  }
+  return failures;
+}
+
+function getRegistrationErrorFromResponse(data) {
+  if (!data) {
+    return 'No response from backup task registration';
+  }
+
+  if (data.status === 'error' && data.data) {
+    return data.data.message || 'Backup task registration was rejected';
+  }
+
+  if (data.status === 'success' && data.data) {
+    if (data.data.taskId) {
+      return null;
+    }
+    return 'Backup task was not assigned an ID (database or queue issue)';
+  }
+
+  return 'Unexpected response from backup task registration';
+}
+
+function createRegistrationMocks() {
+  let lastResponse = null;
+  const mockRes = {
+    json: (data) => {
+      lastResponse = data;
+    },
+  };
+
+  return {
+    mockRes,
+    getTaskId: () => (
+      lastResponse?.status === 'success' && lastResponse?.data?.taskId
+        ? lastResponse.data.taskId
+        : null
+    ),
+    getError: () => getRegistrationErrorFromResponse(lastResponse),
+  };
+}
+
+function summarizeRegistrationFailures(failures) {
+  if (!failures.length) {
+    return 'Backup files were created on the node but could not be queued for upload';
+  }
+
+  const messages = [...new Set(failures.map((failure) => failure.message))];
+  const components = failures.map((failure) => failure.component).join(', ');
+
+  if (messages.length === 1) {
+    return `Could not queue backup for components [${components}]: ${messages[0]}`;
+  }
+
+  return `Could not queue backup for ${failures.length} components (${components})`;
+}
 
 /**
  * This function runs a task with a given ID. It updates the task status in the database,
@@ -70,9 +169,13 @@ async function runTask(id) {
     await dbCli.updateTask(task);
     taskQueue.delete(id);
   } catch (error) {
+    const message = getErrorMessage(error);
+    if (!task.status || task.status.state !== 'failed') {
+      task.status = { state: 'failed', message, progress: 0 };
+    }
     task.fails += 1;
     await dbCli.updateTask(task);
-    log.error(`task ${id} failed.${JSON.stringify(error)}`);
+    log.error(`task ${id} failed:`, error instanceof Error ? error : message);
   }
 }
 
@@ -341,9 +444,9 @@ async function registerBackupTask(req, res, taskObj = null) {
     if (record.length > 0 && record[0].uploaded === 1) {
       throw new Error('Checkpoint has already been uploaded to FluxDrive.');
     } else if (record.length > 0 && record[0].uploaded === 0) {
-      // resume the task if there is space in queue
+      // Resume existing task; return its ID even if the queue is full (updateQueue will retry)
+      taskId = record[0].taskId;
       if (taskQueue.size < config.maxConcurrentTasks) {
-        taskId = record[0].taskId;
         const task = await dbCli.getTask(taskId);
         if (task) {
           task.extra = taskObj ? '' : req.headers.zelidauth;
@@ -360,6 +463,9 @@ async function registerBackupTask(req, res, taskObj = null) {
       };
       const result = await dbCli.addNewTask(newTask);
       taskId = result.insertId;
+      if (!taskId) {
+        throw new Error('Failed to create backup task in database');
+      }
       // run the task if there is space in queue
       if (taskQueue.size < config.maxConcurrentTasks) {
         const task = await dbCli.getTask(taskId);
@@ -550,12 +656,12 @@ async function removeCheckpoint(req, res) {
  * @async
  * @param {Array<number>} taskIds - Array of task IDs to monitor
  * @param {number} timeoutMinutes - Timeout in minutes (default: 60)
- * @returns {Promise<boolean>} - True if all tasks completed successfully, false otherwise
+ * @returns {Promise<{success: boolean, failures: Array<Object>}>}
  */
 async function waitForTasksToComplete(taskIds, timeoutMinutes = 60) {
   if (!taskIds || taskIds.length === 0) {
     log.info('No tasks to wait for');
-    return true;
+    return { success: true, failures: [] };
   }
 
   const startTime = Date.now();
@@ -566,55 +672,66 @@ async function waitForTasksToComplete(taskIds, timeoutMinutes = 60) {
 
   while (Date.now() - startTime < timeout) {
     let allCompleted = true;
-    let anyFailed = false;
+    let failureReason = null;
+    let failedTaskId = null;
+
     for (let i = 0; i < taskIds.length; i += 1) {
       const taskId = taskIds[i];
       const task = await dbCli.getTask(taskId);
 
       if (!task) {
-        log.error(`Task ${taskId} not found`);
-        anyFailed = true;
+        failureReason = 'Task not found in database';
+        failedTaskId = taskId;
         break;
       }
 
-      // Check if task failed too many times
       if (task.fails >= 3) {
-        log.error(`Task ${taskId} failed ${task.fails} times`);
-        anyFailed = true;
+        failureReason = `Task failed ${task.fails} times`;
+        failedTaskId = taskId;
+        log.error(`Task ${taskId} failed ${task.fails} times: ${task.status?.message || failureReason}`);
         break;
       }
 
-      // Check if task is still in progress
       if (task.finishTime === 0) {
         allCompleted = false;
         break;
       }
 
-      // Check if task uploaded successfully
       if (task.uploaded !== 1) {
-        log.error(`Task ${taskId} did not upload successfully`);
-        anyFailed = true;
+        failureReason = task.status?.message || 'Task did not upload successfully';
+        failedTaskId = taskId;
+        log.error(`Task ${taskId} did not upload successfully: ${failureReason}`);
         break;
       }
     }
 
-    if (anyFailed) {
+    if (failureReason) {
       log.error('Some tasks failed. Aborting cleanup.');
-      return false;
+      const failures = await collectTaskFailures(taskIds, failureReason);
+      if (failedTaskId) {
+        const failedIndex = failures.findIndex((failure) => failure.taskId === failedTaskId);
+        if (failedIndex >= 0) {
+          failures[failedIndex].message = failureReason;
+        }
+      }
+      return { success: false, failures };
     }
 
     if (allCompleted) {
       log.info('All tasks completed successfully');
-      return true;
+      return { success: true, failures: [] };
     }
 
-    // Wait before checking again
     log.debug(`Still waiting for tasks to complete... (${Math.floor((Date.now() - startTime) / 1000)}s elapsed)`);
     await new Promise((resolve) => { setTimeout(resolve, checkInterval); });
   }
 
-  log.error(`Timeout waiting for tasks to complete after ${timeoutMinutes} minutes`);
-  return false;
+  const timeoutReason = `Timeout waiting for tasks to complete after ${timeoutMinutes} minutes`;
+  log.error(timeoutReason);
+  return {
+    success: false,
+    failures: await collectTaskFailures(taskIds, timeoutReason),
+  };
 }
 
 /**
@@ -848,6 +965,7 @@ async function processAutomaticBackup() {
   const maxRetries = 3;
   let retryCount = 0;
   let automaticBackup = null;
+  let lastFailure = null;
 
   try {
     // Calculate timestamp for 7 days ago
@@ -946,6 +1064,7 @@ async function processAutomaticBackup() {
 
         // Register backup tasks for each component
         const taskIds = [];
+        const registrationFailures = [];
         // eslint-disable-next-line no-restricted-syntax
         let backupTimestamp = 0;
         // eslint-disable-next-line no-restricted-syntax
@@ -964,33 +1083,56 @@ async function processAutomaticBackup() {
             };
 
             try {
-              // Mock req and res objects for registerBackupTask
               const mockReq = { body: {}, query: {}, headers: {} };
-              let taskId = null;
-              const mockRes = {
-                json: (data) => {
-                  if (data.status === 'success' && data.data && data.data.taskId) {
-                    taskId = data.data.taskId;
-                  }
-                },
-              };
+              const { mockRes, getTaskId, getError } = createRegistrationMocks();
 
               await registerBackupTask(mockReq, mockRes, taskObj);
+              const taskId = getTaskId();
               if (taskId) {
                 taskIds.push(taskId);
                 log.info(`Registered task ${taskId} for component ${componentData.component}`);
+              } else {
+                const registrationError = getError();
+                log.error(`Failed to queue backup for component ${componentData.component}:`, registrationError);
+                registrationFailures.push({
+                  taskId: null,
+                  component: componentData.component,
+                  message: registrationError,
+                  fails: 0,
+                });
               }
             } catch (error) {
-              log.error(`Failed to register task for component ${componentData.component}:`, error.message);
+              log.error(`Failed to register task for component ${componentData.component}:`, error);
+              registrationFailures.push({
+                taskId: null,
+                component: componentData.component,
+                message: getErrorMessage(error),
+                fails: 0,
+              });
             }
+          } else {
+            registrationFailures.push({
+              taskId: null,
+              component: componentData.component,
+              message: componentData.error || 'Backup file was not found on the Flux node after creation',
+              fails: 0,
+            });
           }
+        }
+
+        if (taskIds.length === 0) {
+          throw createBackupFailure(
+            summarizeRegistrationFailures(registrationFailures),
+            'create_backup',
+            registrationFailures,
+          );
         }
 
         // Wait for all new backup tasks to complete successfully
         log.info(`Waiting for ${taskIds.length} new automatic backup tasks to complete...`);
-        const tasksCompleted = await waitForTasksToComplete(taskIds, 60);
+        const waitResult = await waitForTasksToComplete(taskIds, 60);
 
-        if (tasksCompleted) {
+        if (waitResult.success) {
           log.info('All new automatic backup tasks completed successfully. Proceeding with cleanup...');
 
           // Remove backup files from remote hosts
@@ -1027,11 +1169,24 @@ async function processAutomaticBackup() {
           log.info(`Successfully processed automatic backup for ${appname}. Created ${taskIds.length} tasks.`);
           return true;
         }
-        log.error('New backup tasks did not complete successfully. Keeping old backups intact.');
-        throw new Error('New backup tasks failed to complete');
+
+        const taskFailureSummary = waitResult.failures
+          .map((failure) => `${failure.component}: ${failure.message}`)
+          .join('; ');
+        log.error('New backup tasks did not complete successfully. Keeping old backups intact.', taskFailureSummary);
+        throw createBackupFailure(
+          taskFailureSummary || 'New backup tasks failed to complete',
+          'task_pipeline',
+          waitResult.failures,
+        );
       } catch (error) {
         retryCount += 1;
-        log.error(`Attempt ${retryCount}/${maxRetries} failed for automatic backup ${appname}:`, error.message);
+        lastFailure = {
+          stage: inferFailureStage(error),
+          reason: getErrorMessage(error),
+          taskFailures: error.taskFailures || [],
+        };
+        log.error(`Attempt ${retryCount}/${maxRetries} failed for automatic backup ${appname}:`, lastFailure.reason);
 
         if (retryCount < maxRetries) {
           log.info('Waiting 20 seconds before retry...');
@@ -1046,7 +1201,15 @@ async function processAutomaticBackup() {
       ['failing', id],
     );
 
-    log.error(`All retries failed for automatic backup ${appname}. Status set to failing.`);
+    log.error(`All retries failed for automatic backup ${appname}. Status set to failing.`, lastFailure?.reason);
+    await discordNotifier.notifyAutomaticBackupFailure({
+      appname,
+      stage: lastFailure?.stage || 'automatic_backup',
+      reason: lastFailure?.reason || 'All retries exhausted',
+      taskFailures: lastFailure?.taskFailures || [],
+      retryCount,
+      maxRetries,
+    });
     return false;
   } catch (error) {
     log.error('Error in processAutomaticBackup:', error.message);
@@ -1061,6 +1224,15 @@ async function processAutomaticBackup() {
       } catch (updateError) {
         log.error('Failed to update status to failing:', updateError.message);
       }
+
+      await discordNotifier.notifyAutomaticBackupFailure({
+        appname: automaticBackup.appname,
+        stage: inferFailureStage(error),
+        reason: getErrorMessage(error),
+        taskFailures: error.taskFailures || lastFailure?.taskFailures || [],
+        retryCount,
+        maxRetries,
+      });
     }
 
     return false;
