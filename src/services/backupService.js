@@ -699,8 +699,9 @@ async function removeOldAutomaticBackupFiles(appname, owner, excludeTaskIds = []
 
     const excludeIds = excludeTaskIds.join(',');
 
-    // Calculate timestamp for 2 weeks ago (14 days * 24 hours * 60 minutes * 60 seconds)
-    const twoWeeksAgoTimestamp = Math.floor(Date.now() / 1000) - (14 * 24 * 60 * 60);
+    // Calculate timestamp for 2 weeks ago in milliseconds
+    // The tasks table uses milliseconds for the timestamp field
+    const twoWeeksAgoTimestamp = Date.now() - (14 * 24 * 60 * 60 * 1000);
 
     // Query for old automatic backups that haven't been removed yet and are older than 2 weeks
     // This will include previously failed removals automatically
