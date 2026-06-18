@@ -194,7 +194,7 @@ class DBClient {
       // eslint-disable-next-line no-prototype-builtins
       if (key !== 'taskId') {
         fields += ` ${key}=?,`;
-        if (key === 'status') params.push(JSON.stringify(task[key]));
+        if (key === 'status') params.push(typeof task[key] === 'string' ? task[key] : JSON.stringify(task[key]));
         else params.push(task[key]);
       }
     }
