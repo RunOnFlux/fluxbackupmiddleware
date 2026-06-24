@@ -191,8 +191,13 @@ class DBClient {
       fields += `${key},`;
       values += '?,';
       if (key === 'status') {
-        const sanitizedStatus = sanitizeStatus(task[key]);
-        params.push(JSON.stringify(sanitizedStatus));
+        const statusValue = task[key];
+        if (typeof statusValue === 'string') {
+          params.push(statusValue);
+        } else {
+          const sanitizedStatus = sanitizeStatus(statusValue);
+          params.push(JSON.stringify(sanitizedStatus));
+        }
       } else {
         params.push(task[key]);
       }
