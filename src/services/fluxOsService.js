@@ -346,6 +346,34 @@ async function verifyLogin(zelid, privateKeySign, node) {
 }
 
 /**
+ * Checks whether an app is expired via global app specifications.
+ * Expired apps return success with an empty data array.
+ *
+ * @async
+ * @param {string} appname
+ * @returns {Promise<boolean|null>} - true if expired, false if active, null if check failed
+ */
+async function isAppExpiredInGlobalSpecs(appname) {
+  try {
+    const result = await axios({
+      method: 'get',
+      url: `https://api.runonflux.io/apps/globalappsspecifications?appname=${encodeURIComponent(appname)}`,
+      httpsAgent,
+    });
+
+    if (result.data?.status === 'success' && Array.isArray(result.data.data)) {
+      return result.data.data.length === 0;
+    }
+
+    log.warn(`Unexpected globalappsspecifications response for ${appname}`);
+    return null;
+  } catch (error) {
+    log.error(`Failed to check global app specifications for ${appname}:`, error.message);
+    return null;
+  }
+}
+
+/**
  * Retrieves all global app specifications and filters for apps with Syncthing components.
  * Syncthing components are identified by containerData starting with 's:', 'r:', or 'g:'.
  *
@@ -648,6 +676,7 @@ module.exports = {
   getAppExpireHeight,
   verifyLogin,
   getAppsWithSyncthing,
+  isAppExpiredInGlobalSpecs,
   getSecondaryNodeFromHAProxy,
   createBackupTaskOnNode,
 };

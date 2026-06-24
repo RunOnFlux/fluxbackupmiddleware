@@ -979,8 +979,8 @@ async function processAutomaticBackup() {
     // Fetch first item from automatic_backups table with lowest last_backup_timestamp.
     // Only include records where last_backup_timestamp is older than 7 days (failing apps are retried after this window).
     const backups = await dbCli.execute(
-      'SELECT * FROM automatic_backups WHERE last_backup_timestamp < ? ORDER BY last_backup_timestamp ASC LIMIT 1',
-      [sevenDaysAgo],
+      'SELECT * FROM automatic_backups WHERE status != ? AND last_backup_timestamp < ? ORDER BY last_backup_timestamp ASC LIMIT 1',
+      ['cancelled', sevenDaysAgo],
     );
 
     if (backups.length === 0) {
@@ -991,6 +991,19 @@ async function processAutomaticBackup() {
     // eslint-disable-next-line prefer-destructuring
     automaticBackup = backups[0];
     const { id, appname, components } = automaticBackup;
+
+    const isExpired = await fluxOS.isAppExpiredInGlobalSpecs(appname);
+    if (isExpired === true) {
+      log.info(`Automatic backup cancelled for ${appname}: app is expired`);
+      await dbCli.execute(
+        'UPDATE automatic_backups SET status = ?, last_backup_timestamp = ?, expire_counter = expire_counter + 1 WHERE id = ?',
+        ['cancelled', Date.now(), id],
+      );
+      return false;
+    }
+    if (isExpired === null) {
+      log.warn(`Could not verify expiration status for ${appname}, proceeding with backup`);
+    }
 
     // Handle components - MySQL might return it as already parsed array or as JSON string
     let componentList;
