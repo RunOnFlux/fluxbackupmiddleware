@@ -5,6 +5,26 @@ const config = require('../../../config/default');
 const log = require('../../lib/log');
 const Vault = require('../Vault');
 
+/**
+ * Sanitizes status object to ensure it doesn't exceed database column limit.
+ * Truncates message to fit within VARCHAR(256) limit when JSON-serialized.
+ * @param {Object} status - The status object with state, message, and progress
+ * @returns {Object} - Sanitized status object
+ */
+function sanitizeStatus(status) {
+  if (!status || typeof status !== 'object') {
+    return status;
+  }
+  const sanitized = { ...status };
+  // Reserve ~35 chars for JSON structure: {"state":"","progress":0}
+  // Maximum message length to stay under 256 chars total
+  const maxMessageLength = 180;
+  if (sanitized.message && sanitized.message.length > maxMessageLength) {
+    sanitized.message = `${sanitized.message.substring(0, maxMessageLength - 3)}...`;
+  }
+  return sanitized;
+}
+
 class DBClient {
   constructor() {
     this.connection = {};
@@ -170,7 +190,17 @@ class DBClient {
     for (const key in task) {
       fields += `${key},`;
       values += '?,';
-      params.push(task[key]);
+      if (key === 'status') {
+        const statusValue = task[key];
+        if (typeof statusValue === 'string') {
+          params.push(statusValue);
+        } else {
+          const sanitizedStatus = sanitizeStatus(statusValue);
+          params.push(JSON.stringify(sanitizedStatus));
+        }
+      } else {
+        params.push(task[key]);
+      }
     }
     fields = fields.slice(0, -1);
     values = values.slice(0, -1);

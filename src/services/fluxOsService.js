@@ -124,8 +124,128 @@ async function getAppOwner(appname) {
   return false;
 }
 
+const DEFAULT_FLUX_API_PORT = 16127;
+
+function extractNodeIp(ipOrHostPort) {
+  return ipOrHostPort.includes(':') ? ipOrHostPort.split(':')[0] : ipOrHostPort;
+}
+
+function formatLocationNode(ipOrHostPort) {
+  if (ipOrHostPort.includes(':')) {
+    return ipOrHostPort;
+  }
+  return `${ipOrHostPort}:${DEFAULT_FLUX_API_PORT}`;
+}
+
+function parseSecondaryNodeFromHAProxyStats(htmlContent, appname) {
+  const serverRowRegex = /<tr class="(?:active_up|backup_up|active_down|backup_down)[^"]*"[^>]*>([\s\S]*?)<\/tr>/gi;
+
+  let secondaryNode = null;
+  const activeNodes = [];
+  let match = serverRowRegex.exec(htmlContent);
+
+  while (match !== null) {
+    const rowContent = match[1];
+    const ipMatch = rowContent.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+)/);
+
+    if (ipMatch) {
+      if (match[0].includes('backup_up')) {
+        [secondaryNode] = ipMatch;
+        break;
+      }
+      if (match[0].includes('active_up')) {
+        activeNodes.push(ipMatch[0]);
+      }
+    }
+    match = serverRowRegex.exec(htmlContent);
+  }
+
+  if (!secondaryNode) {
+    const tableRegex = /<table[^>]*>[\s\S]*?<\/table>/gi;
+    const tables = htmlContent.match(tableRegex);
+
+    if (tables) {
+      tables.forEach((table) => {
+        if (!secondaryNode && table.includes(appname) && table.includes('Backend')) {
+          const backupServerRegex = /<tr[^>]*class="[^"]*backup[^"]*"[^>]*>[\s\S]*?<td[^>]*>(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+)[^<]*<\/td>[\s\S]*?<td[^>]*>UP<\/td>/gi;
+          const backupMatch = backupServerRegex.exec(table);
+          if (backupMatch) {
+            [, secondaryNode] = backupMatch;
+          }
+        }
+      });
+    }
+  }
+
+  if (!secondaryNode && activeNodes.length > 1) {
+    [, secondaryNode] = activeNodes;
+    log.info(`No backup nodes found for ${appname}, using second active node: ${secondaryNode}`);
+  }
+
+  return secondaryNode;
+}
+
+async function getPrimaryNodeIp(appname) {
+  try {
+    const appIpsUrl = `https://fdm-fn-1-2.runonflux.io/api/appips/${appname}`;
+    const response = await axios.get(appIpsUrl, { httpsAgent });
+
+    if (response.data?.status === 'success' && response.data?.data?.ips?.length > 0) {
+      const [primaryIp] = response.data.data.ips;
+      log.info(`Primary node IP for ${appname} from appips: ${primaryIp}`);
+      return primaryIp;
+    }
+
+    log.error(`No primary IP found in appips response for ${appname}`);
+    return null;
+  } catch (error) {
+    log.error(`Failed to get primary node IP for ${appname}:`, error.message);
+    return null;
+  }
+}
+
+async function getSecondaryNodeFromLocationApi(appname, primaryIp = null) {
+  try {
+    const locationUrl = `https://api.runonflux.io/apps/location/${appname}`;
+    const locationResponse = await axios.get(locationUrl, { httpsAgent });
+
+    if (!locationResponse.data || locationResponse.data.status !== 'success' || !locationResponse.data.data) {
+      log.error(`Invalid response from location API for ${appname}`);
+      return null;
+    }
+
+    const locations = locationResponse.data.data;
+    if (locations.length === 0) {
+      log.error(`No locations found for ${appname} in location API`);
+      return null;
+    }
+
+    if (primaryIp) {
+      const alternativeLocation = locations.find(
+        (location) => extractNodeIp(location.ip) !== primaryIp,
+      );
+
+      if (alternativeLocation) {
+        const secondaryNode = formatLocationNode(alternativeLocation.ip);
+        log.info(`Found secondary node from location API (primary ${primaryIp}): ${secondaryNode}`);
+        return secondaryNode;
+      }
+
+      log.warn(`All location nodes match primary IP ${primaryIp} for ${appname}`);
+      return null;
+    }
+
+    log.error(`Cannot select secondary node for ${appname}: primary IP is required`);
+    return null;
+  } catch (error) {
+    log.error(`Failed to get location data for ${appname}:`, error.message);
+    return null;
+  }
+}
+
 /**
- * Gets the first secondary/backup node IP:port from HAProxy statistics for a given app.
+ * Gets the first secondary/backup node IP:port for a given app.
+ * Uses HAProxy statistics first, then falls back to appips + location API.
  *
  * @async
  * @param {string} appname - The name of the application
@@ -133,169 +253,33 @@ async function getAppOwner(appname) {
  */
 async function getSecondaryNodeFromHAProxy(appname) {
   try {
-    // Add underscore to scope to ensure exact appname matching (e.g., "rc_" instead of "rc")
-    // This prevents matching apps like "search" when looking for "rc"
     const statsUrl = `https://${appname}.app.runonflux.io/fluxstatistics?scope=${appname}_`;
     const response = await axios.get(statsUrl, { httpsAgent });
 
     if (!response.data) {
-      log.error('No data received from HAProxy statistics');
-      return null;
-    }
-
-    const htmlContent = response.data;
-
-    // Parse the HTML to find backend servers
-    // Look for rows with backend servers and their status
-    const serverRowRegex = /<tr class="(?:active_up|backup_up|active_down|backup_down)[^"]*"[^>]*>([\s\S]*?)<\/tr>/gi;
-
-    let secondaryNode = null;
-    const activeNodes = [];
-    let match = serverRowRegex.exec(htmlContent);
-
-    // Find server rows and extract IP:port
-    while (match !== null) {
-      const rowContent = match[1];
-      const ipMatch = rowContent.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+)/);
-
-      if (ipMatch) {
-        // Check if this is a backup/secondary server
-        if (match[0].includes('backup_up')) {
-          [secondaryNode] = ipMatch;
-          break; // Found the first backup node
-        }
-        // Collect active nodes as fallback
-        if (match[0].includes('active_up')) {
-          activeNodes.push(ipMatch[0]);
-        }
+      log.error(`No data received from HAProxy statistics for ${appname}`);
+    } else {
+      const secondaryNode = parseSecondaryNodeFromHAProxyStats(response.data, appname);
+      if (secondaryNode) {
+        log.info(`Secondary/backup node for ${appname}: ${secondaryNode}`);
+        return secondaryNode;
       }
-      match = serverRowRegex.exec(htmlContent);
+
+      log.info(`HAProxy statistics for ${appname} did not yield a secondary node`);
     }
-
-    // Alternative parsing if the above doesn't work
-    if (!secondaryNode) {
-      // Look for backup servers in the backend section
-      const tableRegex = /<table[^>]*>[\s\S]*?<\/table>/gi;
-      const tables = htmlContent.match(tableRegex);
-
-      if (tables) {
-        tables.forEach((table) => {
-          if (!secondaryNode) {
-            // Look for backend servers table
-            if (table.includes(appname) && table.includes('Backend')) {
-              // Find rows with backup servers that are UP
-              const backupServerRegex = /<tr[^>]*class="[^"]*backup[^"]*"[^>]*>[\s\S]*?<td[^>]*>(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+)[^<]*<\/td>[\s\S]*?<td[^>]*>UP<\/td>/gi;
-              const backupMatch = backupServerRegex.exec(table);
-              if (backupMatch) {
-                [, secondaryNode] = backupMatch;
-              }
-            }
-          }
-        });
-      }
-    }
-
-    // If no backup node found but we have multiple active nodes
-    if (!secondaryNode && activeNodes.length > 1) {
-      // Use the second active node
-      [, secondaryNode] = activeNodes;
-      log.info(`No backup nodes found for ${appname}, using second active node: ${secondaryNode}`);
-      return secondaryNode;
-    }
-
-    // If we have one node or no nodes from HAProxy, get nodes from Flux location API
-    if (!secondaryNode && activeNodes.length <= 1) {
-      const logMessage = activeNodes.length === 0
-        ? `No nodes found in HAProxy for ${appname}, checking Flux location API`
-        : `Only one node found in HAProxy for ${appname}, checking Flux location API for additional nodes`;
-      log.info(logMessage);
-
-      try {
-        const locationUrl = `https://api.runonflux.io/apps/location/${appname}`;
-        const locationResponse = await axios.get(locationUrl, { httpsAgent });
-
-        if (locationResponse.data && locationResponse.data.status === 'success' && locationResponse.data.data) {
-          const locations = locationResponse.data.data;
-
-          if (locations.length === 0) {
-            log.error(`No locations found for ${appname} in location API`);
-            return activeNodes.length > 0 ? activeNodes[0] : null;
-          }
-
-          // Parse location API nodes - they may include port (e.g., "1.2.3.4:16157") or just IP
-          const parseLocationNode = (location) => {
-            if (location.ip.includes(':')) {
-              // Port is included in the IP field
-              return location.ip;
-            }
-            // No port provided, use default
-            return `${location.ip}:16127`;
-          };
-
-          let haproxyIp = null;
-          if (activeNodes.length > 0) {
-            // Extract just the IP from HAProxy node for comparison
-            const [haproxyNode] = activeNodes;
-            [haproxyIp] = haproxyNode.split(':');
-          }
-
-          // If we have a HAProxy node, find a different one from location API
-          if (haproxyIp) {
-            // Find a location with different IP than HAProxy node
-            const alternativeLocation = locations.find((location) => {
-              const locationIp = location.ip.includes(':') ? location.ip.split(':')[0] : location.ip;
-              return locationIp !== haproxyIp;
-            });
-
-            if (alternativeLocation) {
-              secondaryNode = parseLocationNode(alternativeLocation);
-              log.info(`Found alternative node from Flux location API: ${secondaryNode}`);
-              return secondaryNode;
-            }
-
-            // If all location nodes are the same as HAProxy node, use the HAProxy node
-            [secondaryNode] = activeNodes;
-            log.warn(`All nodes from location API match HAProxy node, using: ${secondaryNode}`);
-            return secondaryNode;
-          }
-
-          // No HAProxy nodes at all, use nodes from location API
-          // Pick the second node if available, otherwise the first
-          const nodeIndex = Math.min(1, locations.length - 1);
-          secondaryNode = parseLocationNode(locations[nodeIndex]);
-          log.info(`No HAProxy nodes available, using location API node: ${secondaryNode}`);
-          return secondaryNode;
-        }
-
-        log.error(`Invalid response from location API for ${appname}`);
-        return activeNodes.length > 0 ? activeNodes[0] : null;
-      } catch (locationError) {
-        log.error(`Failed to get location data for ${appname}:`, locationError.message);
-
-        // If we have a HAProxy node, fall back to it
-        if (activeNodes.length > 0) {
-          [secondaryNode] = activeNodes;
-          log.info(`Location API failed, using single HAProxy node: ${secondaryNode}`);
-          return secondaryNode;
-        }
-
-        // No nodes available at all
-        log.error(`No nodes available from HAProxy or location API for ${appname}`);
-        return null;
-      }
-    }
-
-    if (secondaryNode) {
-      log.info(`Secondary/backup node for ${appname}: ${secondaryNode}`);
-      return secondaryNode;
-    }
-
-    log.warn(`No nodes found for ${appname}`);
-    return null;
   } catch (error) {
     log.error(`Failed to get HAProxy statistics for ${appname}`, { error: error.message });
+  }
+
+  log.info(`Using appips/location fallback for secondary node selection (${appname})`);
+  const primaryIp = await getPrimaryNodeIp(appname);
+  if (!primaryIp) {
+    log.error(
+      `Failed to select secondary node for ${appname}: appips did not return a primary IP; location API fallback requires primary node identification`,
+    );
     return null;
   }
+  return getSecondaryNodeFromLocationApi(appname, primaryIp);
 }
 
 async function getLoginPhrase(node) {

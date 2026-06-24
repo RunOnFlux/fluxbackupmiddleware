@@ -37,7 +37,7 @@ function inferFailureStage(error) {
   if (message.includes('authenticate')) return 'node_auth';
   if (message.includes('app owner')) return 'app_owner';
   if (message.includes('create backup tasks')) return 'create_backup';
-  if (message.includes('registered')) return 'create_backup';
+  if (message.includes('Could not queue backup')) return 'create_backup';
   if (message.includes('Timeout waiting for tasks')) return 'task_timeout';
   return 'automatic_backup';
 }
@@ -59,6 +59,59 @@ async function collectTaskFailures(taskIds, reason) {
     failures.push(buildTaskFailure(task, taskId, reason));
   }
   return failures;
+}
+
+function getRegistrationErrorFromResponse(data) {
+  if (!data) {
+    return 'No response from backup task registration';
+  }
+
+  if (data.status === 'error' && data.data) {
+    return data.data.message || 'Backup task registration was rejected';
+  }
+
+  if (data.status === 'success' && data.data) {
+    if (data.data.taskId) {
+      return null;
+    }
+    return 'Backup task was not assigned an ID (database or queue issue)';
+  }
+
+  return 'Unexpected response from backup task registration';
+}
+
+function createRegistrationMocks() {
+  let lastResponse = null;
+  const mockRes = {
+    json: (data) => {
+      lastResponse = data;
+    },
+  };
+
+  return {
+    mockRes,
+    getTaskId: () => (
+      lastResponse?.status === 'success' && lastResponse?.data?.taskId
+        ? lastResponse.data.taskId
+        : null
+    ),
+    getError: () => getRegistrationErrorFromResponse(lastResponse),
+  };
+}
+
+function summarizeRegistrationFailures(failures) {
+  if (!failures.length) {
+    return 'Backup files were created on the node but could not be queued for upload';
+  }
+
+  const messages = [...new Set(failures.map((failure) => failure.message))];
+  const components = failures.map((failure) => failure.component).join(', ');
+
+  if (messages.length === 1) {
+    return `Could not queue backup for components [${components}]: ${messages[0]}`;
+  }
+
+  return `Could not queue backup for ${failures.length} components (${components})`;
 }
 
 /**
@@ -391,9 +444,9 @@ async function registerBackupTask(req, res, taskObj = null) {
     if (record.length > 0 && record[0].uploaded === 1) {
       throw new Error('Checkpoint has already been uploaded to FluxDrive.');
     } else if (record.length > 0 && record[0].uploaded === 0) {
-      // resume the task if there is space in queue
+      // Resume existing task; return its ID even if the queue is full (updateQueue will retry)
+      taskId = record[0].taskId;
       if (taskQueue.size < config.maxConcurrentTasks) {
-        taskId = record[0].taskId;
         const task = await dbCli.getTask(taskId);
         if (task) {
           task.extra = taskObj ? '' : req.headers.zelidauth;
@@ -410,6 +463,9 @@ async function registerBackupTask(req, res, taskObj = null) {
       };
       const result = await dbCli.addNewTask(newTask);
       taskId = result.insertId;
+      if (!taskId) {
+        throw new Error('Failed to create backup task in database');
+      }
       // run the task if there is space in queue
       if (taskQueue.size < config.maxConcurrentTasks) {
         const task = await dbCli.getTask(taskId);
@@ -920,11 +976,11 @@ async function processAutomaticBackup() {
     // Calculate timestamp for 7 days ago
     const sevenDaysAgo = Date.now() - (7 * 24 * 60 * 60 * 1000);
 
-    // Fetch first item from automatic_backups table with lowest last_backup_timestamp and status not 'failing'
-    // Only include records where last_backup_timestamp is older than 7 days
+    // Fetch first item from automatic_backups table with lowest last_backup_timestamp.
+    // Only include records where last_backup_timestamp is older than 7 days (failing apps are retried after this window).
     const backups = await dbCli.execute(
-      'SELECT * FROM automatic_backups WHERE status != ? AND last_backup_timestamp < ? ORDER BY last_backup_timestamp ASC LIMIT 1',
-      ['failing', sevenDaysAgo],
+      'SELECT * FROM automatic_backups WHERE last_backup_timestamp < ? ORDER BY last_backup_timestamp ASC LIMIT 1',
+      [sevenDaysAgo],
     );
 
     if (backups.length === 0) {
@@ -965,12 +1021,16 @@ async function processAutomaticBackup() {
       componentList = [];
     }
 
-    // Set last_backup_timestamp to current time
+    // Set last_backup_timestamp to current time and reset failing status for retry
     const currentTime = Date.now();
     await dbCli.execute(
-      'UPDATE automatic_backups SET last_backup_timestamp = ? WHERE id = ?',
-      [currentTime, id],
+      'UPDATE automatic_backups SET last_backup_timestamp = ?, status = ? WHERE id = ?',
+      [currentTime, 'pending', id],
     );
+
+    if (automaticBackup.status === 'failing') {
+      log.info(`Retrying automatic backup for ${appname} after previous failure (7-day window elapsed)`);
+    }
 
     log.info(`Processing automatic backup for app: ${appname}`);
 
@@ -1032,31 +1092,26 @@ async function processAutomaticBackup() {
             };
 
             try {
-              // Mock req and res objects for registerBackupTask
               const mockReq = { body: {}, query: {}, headers: {} };
-              let taskId = null;
-              const mockRes = {
-                json: (data) => {
-                  if (data.status === 'success' && data.data && data.data.taskId) {
-                    taskId = data.data.taskId;
-                  }
-                },
-              };
+              const { mockRes, getTaskId, getError } = createRegistrationMocks();
 
               await registerBackupTask(mockReq, mockRes, taskObj);
+              const taskId = getTaskId();
               if (taskId) {
                 taskIds.push(taskId);
                 log.info(`Registered task ${taskId} for component ${componentData.component}`);
               } else {
+                const registrationError = getError();
+                log.error(`Failed to queue backup for component ${componentData.component}:`, registrationError);
                 registrationFailures.push({
                   taskId: null,
                   component: componentData.component,
-                  message: 'Task registration returned no taskId',
+                  message: registrationError,
                   fails: 0,
                 });
               }
             } catch (error) {
-              log.error(`Failed to register task for component ${componentData.component}:`, error.message);
+              log.error(`Failed to register task for component ${componentData.component}:`, error);
               registrationFailures.push({
                 taskId: null,
                 component: componentData.component,
@@ -1068,7 +1123,7 @@ async function processAutomaticBackup() {
             registrationFailures.push({
               taskId: null,
               component: componentData.component,
-              message: componentData.error || 'No backup file created on node',
+              message: componentData.error || 'Backup file was not found on the Flux node after creation',
               fails: 0,
             });
           }
@@ -1076,7 +1131,7 @@ async function processAutomaticBackup() {
 
         if (taskIds.length === 0) {
           throw createBackupFailure(
-            'No backup tasks were registered',
+            summarizeRegistrationFailures(registrationFailures),
             'create_backup',
             registrationFailures,
           );

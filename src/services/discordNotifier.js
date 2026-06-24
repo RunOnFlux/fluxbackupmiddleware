@@ -23,9 +23,12 @@ function formatTaskFailures(taskFailures) {
 
   return taskFailures
     .map((failure) => {
-      const taskLabel = failure.taskId ? `Task ${failure.taskId}` : 'Task n/a';
-      const failCount = failure.fails ? ` [${failure.fails} fails]` : '';
-      return `- ${taskLabel} (${failure.component}): ${failure.message}${failCount}`;
+      const component = failure.component || 'unknown';
+      const failCount = failure.fails ? ` (${failure.fails} attempts)` : '';
+      if (failure.taskId) {
+        return `- **${component}** — task #${failure.taskId}${failCount}: ${failure.message}`;
+      }
+      return `- **${component}**: ${failure.message}`;
     })
     .join('\n');
 }
@@ -70,7 +73,7 @@ async function notifyAutomaticBackupFailure({
 
   const taskFailureLines = formatTaskFailures(taskFailures);
   if (taskFailureLines) {
-    lines.push('**Task failures:**');
+    lines.push('**Details:**');
     lines.push(taskFailureLines);
   }
 
