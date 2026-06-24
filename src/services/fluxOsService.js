@@ -578,7 +578,7 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList) {
 
             // Filter backup files for this specific component and get the latest one
             const expectedPattern = `backup_${component}.tar.gz`;
-            const allBackups = responseData.filter((backup) => backup.name.includes(expectedPattern));
+            const allBackups = responseData.filter((backup) => backup.name.toLowerCase().includes(expectedPattern.toLowerCase()));
 
             log.info(`Filtering for pattern "${expectedPattern}": found ${allBackups.length} matching backup(s)`);
 

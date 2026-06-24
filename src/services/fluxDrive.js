@@ -62,7 +62,8 @@ async function removeFile(hash) {
   try {
     const result = await axios({
       method: 'post',
-      url: buildFluxDriveUrl(FD_SERVER, `/api/v0/rm?arg=${hash}`),
+      url: buildFluxDriveUrl(FD_SERVER, '/api/v0/rm'),
+      data: { hash },
       headers: {
         Authorization: `Basic ${Buffer.from(`${ZELID}:${API_KEY}`).toString('base64')}`,
       },
@@ -183,7 +184,8 @@ async function getFile(req, res) {
   try {
     axios({
       method: 'post',
-      url: buildFluxDriveUrl(FD_SERVER, `/api/v0/cat?arg=${filename}`),
+      url: buildFluxDriveUrl(FD_SERVER, '/api/v0/cat'),
+      data: { hash: filename },
       responseType: 'stream',
       timeout: 60000,
       headers: {

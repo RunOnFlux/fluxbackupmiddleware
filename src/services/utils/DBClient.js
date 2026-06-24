@@ -219,10 +219,8 @@ class DBClient {
       // eslint-disable-next-line no-prototype-builtins
       if (key !== 'taskId') {
         fields += ` ${key}=?,`;
-        if (key === 'status') {
-          const sanitizedStatus = sanitizeStatus(task[key]);
-          params.push(JSON.stringify(sanitizedStatus));
-        } else params.push(task[key]);
+        if (key === 'status') params.push(typeof task[key] === 'string' ? task[key] : JSON.stringify(task[key]));
+        else params.push(task[key]);
       }
     }
     fields = fields.slice(0, -1);

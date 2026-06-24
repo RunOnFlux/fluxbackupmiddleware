@@ -755,8 +755,9 @@ async function removeOldAutomaticBackupFiles(appname, owner, excludeTaskIds = []
 
     const excludeIds = excludeTaskIds.join(',');
 
-    // Calculate timestamp for 2 weeks ago (14 days * 24 hours * 60 minutes * 60 seconds)
-    const twoWeeksAgoTimestamp = Math.floor(Date.now() / 1000) - (14 * 24 * 60 * 60);
+    // Calculate timestamp for 2 weeks ago in milliseconds
+    // The tasks table uses milliseconds for the timestamp field
+    const twoWeeksAgoTimestamp = Date.now() - (14 * 24 * 60 * 60 * 1000);
 
     // Query for old automatic backups that haven't been removed yet and are older than 2 weeks
     // This will include previously failed removals automatically
@@ -860,25 +861,29 @@ async function cleanupOldAutomaticBackups() {
     for (let i = 0; i < appsWithOldBackups.length; i += 1) {
       const { appname, owner } = appsWithOldBackups[i];
 
-      // Get the latest automatic backup tasks for this app (to exclude from deletion)
-      const latestBackupQuery = `
-        SELECT backup_tasks
-        FROM automatic_backups
+      // Get the latest automatic backup tasks for this app directly from tasks table
+      // We exclude the latest task for EACH component to ensure we don't delete the current backup
+      const latestTaskQuery = `
+        SELECT taskId
+        FROM tasks t1
         WHERE appname = ?
+        AND owner = ?
+        AND backup_type = 'automatic'
+        AND timestamp = (
+          SELECT MAX(timestamp)
+          FROM tasks t2
+          WHERE t2.appname = t1.appname
+          AND t2.owner = t1.owner
+          AND t2.component = t1.component
+          AND t2.backup_type = 'automatic'
+        )
       `;
 
-      const latestBackup = await dbCli.execute(latestBackupQuery, [appname]);
+      const latestTasks = await dbCli.execute(latestTaskQuery, [appname, owner]);
 
-      let excludeTaskIds = [];
-      if (latestBackup && latestBackup.length > 0 && latestBackup[0].backup_tasks) {
-        try {
-          excludeTaskIds = JSON.parse(latestBackup[0].backup_tasks);
-        } catch (e) {
-          // log.warn(`Failed to parse backup_tasks for ${appname}`);
-        }
-      }
+      const excludeTaskIds = latestTasks.map((t) => t.taskId);
 
-      // Only cleanup if we have tasks to exclude (current backups)
+      // Only cleanup if we have tasks to exclude (safeguard to ensure we keep at least the latest backup)
       if (excludeTaskIds.length > 0) {
         const result = await removeOldAutomaticBackupFiles(appname, owner, excludeTaskIds);
         totalRemoved += result.removed;
@@ -1263,8 +1268,9 @@ async function init() {
   setInterval(async () => {
     await syncSyncthingApps();
   }, 24 * 60 * 60 * 1000); // Run every 24 hours
-  // Run initial sync
+  // Run initial sync and cleanup
   await syncSyncthingApps();
+  await cleanupOldAutomaticBackups();
 
   // Process automatic backups every 10 minutes
   setInterval(async () => {
