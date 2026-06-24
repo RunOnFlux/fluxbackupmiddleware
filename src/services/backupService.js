@@ -971,11 +971,11 @@ async function processAutomaticBackup() {
     // Calculate timestamp for 7 days ago
     const sevenDaysAgo = Date.now() - (7 * 24 * 60 * 60 * 1000);
 
-    // Fetch first item from automatic_backups table with lowest last_backup_timestamp and status not 'failing'
-    // Only include records where last_backup_timestamp is older than 7 days
+    // Fetch first item from automatic_backups table with lowest last_backup_timestamp.
+    // Only include records where last_backup_timestamp is older than 7 days (failing apps are retried after this window).
     const backups = await dbCli.execute(
-      'SELECT * FROM automatic_backups WHERE status != ? AND last_backup_timestamp < ? ORDER BY last_backup_timestamp ASC LIMIT 1',
-      ['failing', sevenDaysAgo],
+      'SELECT * FROM automatic_backups WHERE last_backup_timestamp < ? ORDER BY last_backup_timestamp ASC LIMIT 1',
+      [sevenDaysAgo],
     );
 
     if (backups.length === 0) {
@@ -1016,12 +1016,16 @@ async function processAutomaticBackup() {
       componentList = [];
     }
 
-    // Set last_backup_timestamp to current time
+    // Set last_backup_timestamp to current time and reset failing status for retry
     const currentTime = Date.now();
     await dbCli.execute(
-      'UPDATE automatic_backups SET last_backup_timestamp = ? WHERE id = ?',
-      [currentTime, id],
+      'UPDATE automatic_backups SET last_backup_timestamp = ?, status = ? WHERE id = ?',
+      [currentTime, 'pending', id],
     );
+
+    if (automaticBackup.status === 'failing') {
+      log.info(`Retrying automatic backup for ${appname} after previous failure (7-day window elapsed)`);
+    }
 
     log.info(`Processing automatic backup for app: ${appname}`);
 
