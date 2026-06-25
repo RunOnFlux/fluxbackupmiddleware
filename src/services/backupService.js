@@ -16,6 +16,37 @@ let dbCli = null;
 
 const taskQueue = new Map();
 
+function getQuotaLimitBytes() {
+  return config.quotaPerUser * 1024 * 1024 * 1024;
+}
+
+async function getUserStorageUsed(owner, excludeTaskId = null) {
+  let query = 'select sum(filesize) as totalUsed from tasks where owner=? and removedFromFluxdrive=0';
+  const params = [owner];
+  if (excludeTaskId !== null) {
+    query += ' and taskId != ?';
+    params.push(excludeTaskId);
+  }
+  const totalUsed = await dbCli.execute(query, params);
+  if (totalUsed.length > 0 && totalUsed[0].totalUsed) {
+    return Number(totalUsed[0].totalUsed);
+  }
+  return 0;
+}
+
+async function wouldExceedUserQuota(owner, filesize, excludeTaskId = null) {
+  const quotaLimit = getQuotaLimitBytes();
+  const normalizedFilesize = Number(filesize);
+  if (!Number.isFinite(normalizedFilesize) || normalizedFilesize < 0) {
+    return true;
+  }
+  if (normalizedFilesize > quotaLimit) {
+    return true;
+  }
+  const usedBytes = await getUserStorageUsed(owner, excludeTaskId);
+  return usedBytes + normalizedFilesize > quotaLimit;
+}
+
 function getErrorMessage(error) {
   if (error instanceof Error) return error.message;
   if (typeof error === 'string') return error;
@@ -114,6 +145,17 @@ function summarizeRegistrationFailures(failures) {
   return `Could not queue backup for ${failures.length} components (${components})`;
 }
 
+async function cancelTaskDueToQuota(task, taskId, filesize) {
+  log.warn(`Cancelling task ${taskId}: backup file size ${filesize} exceeds user quota`);
+  task.status = { state: 'cancelled', message: 'user quota exceeded', progress: 0 };
+  task.finishTime = Math.floor(Date.now() / 1000);
+  await removeBackupFromRemoteHost(task.host, taskId);
+  task.removedFromFluxdrive = 1;
+  task.uploaded = 0;
+  await dbCli.updateTask(task);
+  taskQueue.delete(Number(taskId));
+}
+
 /**
  * This function runs a task with a given ID. It updates the task status in the database,
  * downloads the file associated with the task if it's not already downloaded, uploads the file
@@ -133,6 +175,12 @@ async function runTask(id) {
     await dbCli.updateTask(task);
     // check if file is downloaded
     if (!task.downloaded || task.localRemoved) {
+      const remoteFilesize = await fileManager.getRemoteFileSize(task);
+      const backupFilesize = remoteFilesize ?? Number(task.filesize);
+      if (await wouldExceedUserQuota(task.owner, backupFilesize, task.taskId)) {
+        await cancelTaskDueToQuota(task, id, backupFilesize);
+        return;
+      }
       // download the file
       log.info(`downloading task ${id}.`);
       task.status = { state: 'downloading', message: 'fetching file from node', progress: 0 };
@@ -426,12 +474,14 @@ async function registerBackupTask(req, res, taskObj = null) {
     }
     // When taskObj is provided, extra can be empty
     const extra = taskObj ? '' : req.headers.zelidauth;
+    // check if task is a duplicate (needed before quota check to avoid double-counting)
+    const record = await dbCli.execute('select * from tasks where owner=? and timestamp=? and appname=? and component=?', [owner, timestamp, appname, component]);
+    if (record.length > 0 && record[0].uploaded === 1) {
+      throw new Error('Checkpoint has already been uploaded to FluxDrive.');
+    }
+    const excludeTaskId = record.length > 0 && record[0].uploaded === 0 ? record[0].taskId : null;
     // check if user has enough storage quota
-    const totalUsed = await dbCli.execute('select sum(filesize) as totalUsed from tasks where owner=? and removedFromFluxdrive=0', [owner]);
-    let taskId = null;
-    let userTotalUse = 0;
-    if (totalUsed.length > 0) userTotalUse = totalUsed[0].totalUsed;
-    if (userTotalUse > config.quotaPerUser * 1024 * 1024 * 1024) {
+    if (await wouldExceedUserQuota(owner, filesize, excludeTaskId)) {
       throw new Error('user quota is full.');
     }
     // check number of files on FD for the appname
@@ -439,11 +489,8 @@ async function registerBackupTask(req, res, taskObj = null) {
     if (totalFiles.length > 0 && totalFiles[0].fileCount > config.maxFilesPerApp) {
       throw new Error(`Upload limit reached, max ${config.maxFilesPerApp} files allowed per app.`);
     }
-    // check if task is a duplicate
-    const record = await dbCli.execute('select * from tasks where owner=? and timestamp=? and appname=? and component=?', [owner, timestamp, appname, component]);
-    if (record.length > 0 && record[0].uploaded === 1) {
-      throw new Error('Checkpoint has already been uploaded to FluxDrive.');
-    } else if (record.length > 0 && record[0].uploaded === 0) {
+    let taskId = null;
+    if (record.length > 0 && record[0].uploaded === 0) {
       // Resume existing task; return its ID even if the queue is full (updateQueue will retry)
       taskId = record[0].taskId;
       if (taskQueue.size < config.maxConcurrentTasks) {
