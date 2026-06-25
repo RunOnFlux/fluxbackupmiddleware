@@ -80,7 +80,8 @@ async function getRemoteFileSize(task) {
       response.resume();
       const contentLength = response.headers['content-length'];
       if (response.statusCode >= 200 && response.statusCode < 300 && contentLength) {
-        resolve(Number(contentLength));
+        const parsedLength = Number(contentLength);
+        resolve(Number.isFinite(parsedLength) ? parsedLength : null);
         return;
       }
       resolve(null);
