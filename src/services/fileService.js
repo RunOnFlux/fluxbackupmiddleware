@@ -41,6 +41,61 @@ function deleteFile(fileName) {
 }
 
 /**
+ * Probes the remote backup file size before downloading.
+ *
+ * @async
+ * @param {Object} task
+ * @returns {Promise<number|null>}
+ */
+async function getRemoteFileSize(task) {
+  const url = new URL(`${task.host}`);
+  const protocol = url.protocol.startsWith('https:') ? 'https' : 'http';
+  const node = `${protocol}://${url.hostname}${url.port ? `:${url.port}` : ''}`;
+
+  let zelidauth;
+  try {
+    zelidauth = await fluxOS.verifyLogin(
+      await Vault.getKey('teamFluxID'),
+      await Vault.getKey('teamPK'),
+      node,
+    );
+  } catch (authError) {
+    log.error('Failed to authenticate with node for file size probe:', authError);
+    return null;
+  }
+
+  if (!zelidauth) {
+    return null;
+  }
+
+  return new Promise((resolve) => {
+    const requestFn = url.protocol.startsWith('https:') ? https.request : http.request;
+    const request = requestFn({
+      hostname: url.hostname,
+      port: url.port,
+      path: url.pathname + url.search,
+      method: 'HEAD',
+      headers: { zelidauth },
+    }, (response) => {
+      response.resume();
+      const contentLength = response.headers['content-length'];
+      if (response.statusCode >= 200 && response.statusCode < 300 && contentLength) {
+        resolve(Number(contentLength));
+        return;
+      }
+      resolve(null);
+    });
+
+    request.on('error', () => resolve(null));
+    request.setTimeout(15000, () => {
+      request.destroy();
+      resolve(null);
+    });
+    request.end();
+  });
+}
+
+/**
  * Downloads a file from a host for a given task.
  *
  * @async
@@ -173,5 +228,6 @@ async function downloadFileFromHost(task) {
 module.exports = {
   fileExists,
   deleteFile,
+  getRemoteFileSize,
   downloadFileFromHost,
 };
