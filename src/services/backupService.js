@@ -150,7 +150,8 @@ async function cancelTaskDueToQuota(task, taskId, filesize) {
   task.status = { state: 'cancelled', message: 'user quota exceeded', progress: 0 };
   task.finishTime = Math.floor(Date.now() / 1000);
   await removeBackupFromRemoteHost(task.host, taskId);
-  await dbCli.softRemoveTask(taskId);
+  task.removedFromFluxdrive = 1;
+  task.uploaded = 0;
   await dbCli.updateTask(task);
   taskQueue.delete(Number(taskId));
 }
