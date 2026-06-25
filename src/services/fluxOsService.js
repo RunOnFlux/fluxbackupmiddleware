@@ -126,6 +126,24 @@ async function getAppOwner(appname) {
 
 const DEFAULT_FLUX_API_PORT = 16127;
 
+function getFdmIndex(appName) {
+  const firstLetter = appName.substring(0, 1).toLowerCase();
+  if (firstLetter.match(/[h-n]/)) {
+    return 2;
+  }
+  if (firstLetter.match(/[o-u]/)) {
+    return 3;
+  }
+  if (firstLetter.match(/[v-z]/)) {
+    return 4;
+  }
+  return 1;
+}
+
+function getFdmBaseUrl(appName) {
+  return `https://fdm-fn-1-${getFdmIndex(appName)}.runonflux.io`;
+}
+
 function extractNodeIp(ipOrHostPort) {
   return ipOrHostPort.includes(':') ? ipOrHostPort.split(':')[0] : ipOrHostPort;
 }
@@ -187,7 +205,7 @@ function parseSecondaryNodeFromHAProxyStats(htmlContent, appname) {
 
 async function getPrimaryNodeIp(appname) {
   try {
-    const appIpsUrl = `https://fdm-fn-1-2.runonflux.io/api/appips/${appname}`;
+    const appIpsUrl = `${getFdmBaseUrl(appname)}/api/appips/${appname}`;
     const response = await axios.get(appIpsUrl, { httpsAgent });
 
     if (response.data?.status === 'success' && response.data?.data?.ips?.length > 0) {
@@ -245,7 +263,7 @@ async function getSecondaryNodeFromLocationApi(appname, primaryIp = null) {
 
 /**
  * Gets the first secondary/backup node IP:port for a given app.
- * Uses HAProxy statistics first, then falls back to appips + location API.
+ * Uses FDM HAProxy statistics first, then falls back to FDM appips + location API.
  *
  * @async
  * @param {string} appname - The name of the application
@@ -253,7 +271,7 @@ async function getSecondaryNodeFromLocationApi(appname, primaryIp = null) {
  */
 async function getSecondaryNodeFromHAProxy(appname) {
   try {
-    const statsUrl = `https://${appname}.app.runonflux.io/fluxstatistics?scope=${appname}_`;
+    const statsUrl = `${getFdmBaseUrl(appname)}/fluxstatistics?scope=${appname}_`;
     const response = await axios.get(statsUrl, { httpsAgent });
 
     if (!response.data) {
