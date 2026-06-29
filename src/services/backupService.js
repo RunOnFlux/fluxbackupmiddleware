@@ -50,6 +50,17 @@ async function wouldExceedUserQuota(owner, filesize, excludeTaskId = null) {
 function getErrorMessage(error) {
   if (error instanceof Error) return error.message;
   if (typeof error === 'string') return error;
+  if (error === null || error === undefined) return String(error);
+  if (typeof error === 'object') {
+    if (typeof error.message === 'string' && error.message.length > 0) {
+      return error.message;
+    }
+    try {
+      return JSON.stringify(error);
+    } catch {
+      return String(error);
+    }
+  }
   return String(error);
 }
 
