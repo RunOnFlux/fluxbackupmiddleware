@@ -8,6 +8,7 @@ const zeltrezjs = require('zeltrezjs');
 const bitcoinMessage = require('bitcoinjs-message');
 const log = require('../lib/log');
 const Vault = require('./Vault');
+const enterpriseCrypto = require('./enterpriseCrypto');
 
 // Create HTTPS agent that accepts insecure connections
 const httpsAgent = new https.Agent({
@@ -393,7 +394,8 @@ async function isAppExpiredInGlobalSpecs(appname) {
 
 /**
  * Retrieves all global app specifications and filters for apps with Syncthing components.
- * Syncthing components are identified by containerData starting with 's:', 'r:', or 'g:'.
+ * Plain apps are checked directly. Enterprise apps (encrypted compose) are decrypted
+ * on ArcaneOS nodes before checking containerData prefixes s:, r:, or g:.
  *
  * @async
  * @returns {Promise<Array|false>} - A promise that resolves to an array of apps with Syncthing components,
@@ -403,52 +405,78 @@ async function getAppsWithSyncthing() {
   try {
     const result = await axios({
       method: 'get',
-      url: 'https://api.runonflux.io/apps/globalappsspecifications',
+      url: `${enterpriseCrypto.FLUX_API}/apps/globalappsspecifications`,
       httpsAgent,
+      timeout: 120000,
+      headers: { 'x-apicache-bypass': 'true' },
     });
 
-    if (result.data && result.data.status && result.data.status === 'success') {
-      const allApps = result.data.data;
-      const appsWithSyncthing = [];
-
-      allApps.forEach((app) => {
-        let hasSyncthingComponent = false;
-        const allComponentNames = [];
-
-        // Check if the app has compose (multi-component) structure
-        if (app.compose && Array.isArray(app.compose)) {
-          app.compose.forEach((component) => {
-            const componentName = component.name || 'unnamed-component';
-            allComponentNames.push(componentName);
-
-            if (component.containerData
-                && (component.containerData.startsWith('s:')
-                || component.containerData.startsWith('r:')
-                || component.containerData.startsWith('g:'))) {
-              hasSyncthingComponent = true;
-            }
-          });
-        } else if (app.containerData
-                 && (app.containerData.startsWith('s:')
-                 || app.containerData.startsWith('r:')
-                 || app.containerData.startsWith('g:'))) {
-          // Check single component apps
-          hasSyncthingComponent = true;
-          allComponentNames.push('main');
-        }
-
-        // If we found at least one Syncthing component, add all components to results
-        if (hasSyncthingComponent && (true || app.name.startsWith('wordpress'))) {
-          appsWithSyncthing.push({
-            appName: app.name,
-            componentNames: allComponentNames,
-          });
-        }
-      });
-
-      return appsWithSyncthing;
+    if (!result.data || result.data.status !== 'success' || !Array.isArray(result.data.data)) {
+      return false;
     }
-    return false;
+
+    const allApps = result.data.data;
+    const appsWithSyncthing = [];
+
+    const plainApps = allApps.filter((app) => !enterpriseCrypto.isEnterpriseApp(app));
+    const enterpriseApps = allApps.filter((app) => enterpriseCrypto.isEnterpriseApp(app));
+
+    plainApps.forEach((app) => {
+      const entry = enterpriseCrypto.buildSyncthingAppEntry(app);
+      if (entry) {
+        appsWithSyncthing.push(entry);
+      }
+    });
+
+    if (enterpriseApps.length > 0) {
+      const teamFluxID = await Vault.getKey('teamFluxID');
+      const teamPK = await Vault.getKey('teamPK');
+
+      if (!teamFluxID || !teamPK) {
+        log.error('teamFluxID and teamPK are required to decrypt enterprise apps');
+        return appsWithSyncthing;
+      }
+
+      let arcaneSessions = [];
+      try {
+        arcaneSessions = await enterpriseCrypto.createArcaneNodeSessions(
+          teamFluxID,
+          teamPK,
+          enterpriseCrypto.ARCANE_NODE_RETRY_COUNT,
+        );
+        log.info(
+          `Decrypting ${enterpriseApps.length} enterprise apps using ArcaneOS nodes: ${arcaneSessions.map((s) => s.nodeBase).join(', ')}`,
+        );
+      } catch (error) {
+        log.error('Failed to prepare ArcaneOS node sessions for enterprise decryption:', error.message);
+        return appsWithSyncthing;
+      }
+
+      for (let i = 0; i < enterpriseApps.length; i += 1) {
+        const app = enterpriseApps[i];
+        try {
+          const decryptedFields = await enterpriseCrypto.decryptEnterpriseSpecWithRetry(
+            app,
+            arcaneSessions,
+          );
+          const decryptedSpec = {
+            ...app,
+            compose: decryptedFields.compose || [],
+            contacts: decryptedFields.contacts || [],
+          };
+          const entry = enterpriseCrypto.buildSyncthingAppEntry(decryptedSpec);
+          if (entry) {
+            appsWithSyncthing.push(entry);
+            log.info(`Enterprise Syncthing app discovered: ${entry.appName}`);
+          }
+        } catch (error) {
+          log.warn(`Failed to decrypt enterprise app ${app.name} after ArcaneOS retries: ${error.message}`);
+        }
+      }
+    }
+
+    log.info(`Found ${appsWithSyncthing.length} apps with Syncthing (${plainApps.length} plain, ${enterpriseApps.length} enterprise checked)`);
+    return appsWithSyncthing;
   } catch (e) {
     log.error('Failed to fetch global app specifications', e);
     return false;
