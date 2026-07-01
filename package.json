@@ -5,6 +5,7 @@
   "main": "server.js",
   "scripts": {
     "test": "node server.js",
+    "test:enterprise-syncthing": "node scripts/test-enterprise-syncthing.js",
     "start": "node server.js",
     "lint": "eslint ./",
     "lint:fix": "eslint ./ --fix"
