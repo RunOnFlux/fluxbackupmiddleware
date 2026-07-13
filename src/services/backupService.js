@@ -65,6 +65,31 @@ function getErrorMessage(error) {
   return String(error);
 }
 
+async function logFluxDriveStoredSize() {
+  try {
+    const rows = await dbCli.execute(`
+      SELECT COUNT(*) AS fileCount, COALESCE(SUM(filesize), 0) AS totalBytes
+      FROM tasks
+      WHERE uploaded = 1
+      AND removedFromFluxdrive = 0
+    `);
+    const inventory = rows?.[0];
+    const totalBytes = Number(inventory?.totalBytes ?? 0);
+    const fileCount = Number(inventory?.fileCount ?? 0);
+
+    if (!Number.isFinite(totalBytes) || !Number.isFinite(fileCount)) {
+      log.warn('Could not calculate FluxDrive stored backup size from database values');
+      return;
+    }
+
+    const totalMiB = (totalBytes / (1024 * 1024)).toFixed(2);
+    const totalGiB = (totalBytes / (1024 * 1024 * 1024)).toFixed(2);
+    log.info(`FluxDrive active storage at startup: files=${fileCount}, totalSize=${totalBytes} bytes (${totalMiB} MiB, ${totalGiB} GiB)`);
+  } catch (error) {
+    log.warn(`Could not log FluxDrive stored backup size at startup: ${getErrorMessage(error)}`);
+  }
+}
+
 function getFluxDriveRemovalError(removeResult) {
   if (!removeResult || removeResult.status === 'error' || removeResult.success === false) {
     return removeResult?.message || 'FluxDrive rejected the file removal';
@@ -1476,6 +1501,7 @@ async function init() {
   log.info('Initiating Database...');
   dbCli = await DBClient.createClient();
   await dbCli.checkSchema();
+  await logFluxDriveStoredSize();
   setInterval(async () => {
     await updateQueue();
   }, 20 * 1000);
