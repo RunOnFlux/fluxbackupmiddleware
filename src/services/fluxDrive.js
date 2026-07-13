@@ -25,6 +25,34 @@ function buildFluxDriveUrl(serverUrl, endpoint) {
   return `http://${serverUrl}${endpoint}`;
 }
 
+function getUploadFailureReason(result, fallback) {
+  if (typeof result === 'string' && result.length > 0) {
+    return result;
+  }
+  if (typeof result?.message === 'string' && result.message.length > 0) {
+    return result.message;
+  }
+  if (typeof result?.error === 'string' && result.error.length > 0) {
+    return result.error;
+  }
+  if (typeof result?.reason === 'string' && result.reason.length > 0) {
+    return result.reason;
+  }
+  if (typeof result?.data === 'string' && result.data.length > 0) {
+    return result.data;
+  }
+  if (typeof result?.data?.message === 'string' && result.data.message.length > 0) {
+    return result.data.message;
+  }
+  return fallback;
+}
+
+function logUploadFailure(file, fileName, fileSize, reason, statusCode = null) {
+  const sizeMiB = (fileSize / (1024 * 1024)).toFixed(2);
+  const status = statusCode === null ? '' : `, httpStatus=${statusCode}`;
+  log.error(`FluxDrive upload failed: taskId=${file.taskId}, appname=${file.appname}, file=${fileName}, size=${fileSize} bytes (${sizeMiB} MiB)${status}, reason=${reason}`);
+}
+
 /**
  * Retrieves the status from the FluxDrive server.
  *
@@ -119,7 +147,7 @@ async function uploadFile(file) {
   const fileSize = fs.statSync(filePath).size;
   const fileStream = fs.createReadStream(filePath);
   form.append('file', fileStream);
-  
+
   const fullUrl = buildFluxDriveUrl(FD_SERVER, '/api/v0/put');
   const parsedUrl = new URL(fullUrl);
   const isHttps = parsedUrl.protocol === 'https:';
@@ -150,24 +178,36 @@ async function uploadFile(file) {
       });
 
       res.on('end', () => {
-        const result = JSON.parse(data);
+        let result;
+        try {
+          result = JSON.parse(data);
+        } catch (error) {
+          const reason = `Invalid FluxDrive response: ${error.message}`;
+          logUploadFailure(file, fileName, fileSize, reason, res.statusCode);
+          file.status = { state: 'failed', message: reason, progress: 0 };
+          reject(new Error(reason));
+          return;
+        }
         // console.log(result);
-        if (result.hash) {
+        if (res.statusCode >= 200 && res.statusCode < 300 && result?.hash) {
           console.log(`${fileName} uploaded successfully!`);
           file.uploaded = true;
           file.hash = result.hash;
           // console.log(file);
           resolve(result);
         } else {
-          log.error(result);
-          file.status = { state: 'failed', message: result.message || 'Upload failed', progress: 0 };
-          reject(result);
+          const reason = getUploadFailureReason(result, 'FluxDrive did not return an upload hash');
+          logUploadFailure(file, fileName, fileSize, reason, res.statusCode);
+          file.status = { state: 'failed', message: reason, progress: 0 };
+          reject(new Error(reason));
         }
       });
     });
 
     req.on('error', (error) => {
-      file.status = { state: 'failed', message: 'uploading file to FluxDrive failed', progress: 0 };
+      const reason = error.message || 'FluxDrive request failed';
+      logUploadFailure(file, fileName, fileSize, reason);
+      file.status = { state: 'failed', message: reason, progress: 0 };
       reject(error);
     });
 
