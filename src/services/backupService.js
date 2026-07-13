@@ -15,6 +15,7 @@ const discordNotifier = require('./discordNotifier');
 let dbCli = null;
 
 const taskQueue = new Map();
+const TASK_MAX_FAILURES = 4;
 
 function getQuotaLimitBytes() {
   return config.quotaPerUser * 1024 * 1024 * 1024;
@@ -62,6 +63,13 @@ function getErrorMessage(error) {
     }
   }
   return String(error);
+}
+
+function getFluxDriveRemovalError(removeResult) {
+  if (!removeResult || removeResult.status === 'error' || removeResult.success === false) {
+    return removeResult?.message || 'FluxDrive rejected the file removal';
+  }
+  return null;
 }
 
 function createBackupFailure(reason, stage, taskFailures = []) {
@@ -234,6 +242,7 @@ async function runTask(id) {
     }
     task.fails += 1;
     await dbCli.updateTask(task);
+    taskQueue.delete(id);
     log.error(`task ${id} failed:`, error instanceof Error ? error : message);
   }
 }
@@ -241,7 +250,7 @@ async function runTask(id) {
 /**
  * This function updates the task queue. It first removes any tasks from the queue that have been running for more than an hour.
  * Then, if the queue has space, it fetches the latest remaining tasks from the database and adds them to the queue.
- * It only fetches tasks that have not finished and have failed less than three times.
+ * It only fetches tasks that have not finished and have attempts remaining.
  * It then runs each newly added task.
  *
  * @async
@@ -261,7 +270,7 @@ async function updateQueue() {
   if (taskQueue.size < config.maxConcurrentTasks) {
     // read latest remaining tasks from db
     const emptySlots = config.maxConcurrentTasks - taskQueue.size;
-    const records = await dbCli.execute(`select * from tasks where finishTime=0 and fails<4 order by timestamp limit ${Number(emptySlots)}`);
+    const records = await dbCli.execute(`select * from tasks where finishTime=0 and fails<${TASK_MAX_FAILURES} order by timestamp limit ${Number(emptySlots)}`);
     // if (records.length) log.debug(`${records.length} failed tasks, retrying...`);
     for (let i = 0; i < records.length; i += 1) {
       if (!taskQueue.has(records[i].taskId)) {
@@ -730,6 +739,7 @@ async function waitForTasksToComplete(taskIds, timeoutMinutes = 60) {
 
   while (Date.now() - startTime < timeout) {
     let allCompleted = true;
+    let allSettled = true;
     let failureReason = null;
     let failedTaskId = null;
 
@@ -738,33 +748,36 @@ async function waitForTasksToComplete(taskIds, timeoutMinutes = 60) {
       const task = await dbCli.getTask(taskId);
 
       if (!task) {
-        failureReason = 'Task not found in database';
-        failedTaskId = taskId;
-        break;
+        failureReason = failureReason || 'Task not found in database';
+        failedTaskId = failedTaskId || taskId;
+        // eslint-disable-next-line no-continue
+        continue;
       }
 
-      if (task.fails >= 3) {
-        failureReason = `Task failed ${task.fails} times`;
-        failedTaskId = taskId;
+      if (task.fails >= TASK_MAX_FAILURES) {
+        failureReason = failureReason || `Task failed ${task.fails} times`;
+        failedTaskId = failedTaskId || taskId;
         log.error(`Task ${taskId} failed ${task.fails} times: ${task.status?.message || failureReason}`);
-        break;
+        // eslint-disable-next-line no-continue
+        continue;
       }
 
       if (task.finishTime === 0) {
         allCompleted = false;
-        break;
+        allSettled = false;
+        // eslint-disable-next-line no-continue
+        continue;
       }
 
       if (task.uploaded !== 1) {
-        failureReason = task.status?.message || 'Task did not upload successfully';
-        failedTaskId = taskId;
+        failureReason = failureReason || task.status?.message || 'Task did not upload successfully';
+        failedTaskId = failedTaskId || taskId;
         log.error(`Task ${taskId} did not upload successfully: ${failureReason}`);
-        break;
       }
     }
 
-    if (failureReason) {
-      log.error('Some tasks failed. Aborting cleanup.');
+    if (failureReason && allSettled) {
+      log.error('Some tasks failed after all component tasks settled.');
       const failures = await collectTaskFailures(taskIds, failureReason);
       if (failedTaskId) {
         const failedIndex = failures.findIndex((failure) => failure.taskId === failedTaskId);
@@ -811,11 +824,10 @@ async function removeOldAutomaticBackupFiles(appname, owner, excludeTaskIds = []
   try {
     log.info(`Removing automatic backup files older than 2 weeks for app: ${appname}`);
 
-    const excludeIds = excludeTaskIds.join(',');
+    const excludePlaceholders = excludeTaskIds.map(() => '?').join(',');
 
-    // Calculate timestamp for 2 weeks ago in milliseconds
-    // The tasks table uses milliseconds for the timestamp field
-    const twoWeeksAgoTimestamp = Date.now() - (14 * 24 * 60 * 60 * 1000);
+    // finishTime is written by this service in Unix seconds after the upload succeeds.
+    const twoWeeksAgoFinishTime = Math.floor(Date.now() / 1000) - (14 * 24 * 60 * 60);
 
     // Query for old automatic backups that haven't been removed yet and are older than 2 weeks
     // This will include previously failed removals automatically
@@ -827,12 +839,17 @@ async function removeOldAutomaticBackupFiles(appname, owner, excludeTaskIds = []
       AND backup_type = 'automatic'
       AND uploaded = 1
       AND removedFromFluxdrive = 0
-      AND finishTime <> 0
-      AND timestamp < ?
-      AND taskId NOT IN (${excludeIds})
+      AND finishTime > 0
+      AND finishTime < ?
+      AND taskId NOT IN (${excludePlaceholders})
     `;
 
-    const oldTasks = await dbCli.execute(query, [appname, owner, twoWeeksAgoTimestamp]);
+    const oldTasks = await dbCli.execute(query, [
+      appname,
+      owner,
+      twoWeeksAgoFinishTime,
+      ...excludeTaskIds,
+    ]);
 
     if (!oldTasks || oldTasks.length === 0) {
       log.info(`No automatic backup files older than 2 weeks to remove for ${appname}`);
@@ -848,7 +865,8 @@ async function removeOldAutomaticBackupFiles(appname, owner, excludeTaskIds = []
       const task = oldTasks[i];
 
       if (!task.hash) {
-        log.warn(`Task ${task.taskId} has no hash, skipping`);
+        log.warn(`Task ${task.taskId} has no hash, cleanup will retry later`);
+        failedCount += 1;
         // eslint-disable-next-line no-continue
         continue;
       }
@@ -858,8 +876,9 @@ async function removeOldAutomaticBackupFiles(appname, owner, excludeTaskIds = []
 
         const removeResult = await fluxDrive.removeFile(task.hash);
 
-        if (removeResult === null) {
-          throw new Error('FluxDrive removeFile returned null');
+        const removalError = getFluxDriveRemovalError(removeResult);
+        if (removalError) {
+          throw new Error(removalError);
         }
 
         // Successfully removed, mark as soft deleted
@@ -884,6 +903,90 @@ async function removeOldAutomaticBackupFiles(appname, owner, excludeTaskIds = []
 }
 
 /**
+ * Removes artifacts created by a new automatic-backup batch that did not complete.
+ * Only terminal tasks are touched so an in-flight upload cannot race with cleanup.
+ *
+ * @param {Array<number>} taskIds - Task IDs belonging to the incomplete batch
+ * @returns {Promise<Object>} - Cleanup counts
+ */
+async function cleanupIncompleteAutomaticBackupTasks(taskIds) {
+  let removed = 0;
+  let failed = 0;
+  let inProgress = 0;
+
+  for (let i = 0; i < taskIds.length; i += 1) {
+    const taskId = taskIds[i];
+    const task = await dbCli.getTask(taskId);
+
+    if (!task) {
+      failed += 1;
+      // eslint-disable-next-line no-continue
+      continue;
+    }
+
+    const isTerminal = task.finishTime > 0 || task.fails >= TASK_MAX_FAILURES;
+    if (!isTerminal) {
+      inProgress += 1;
+      // eslint-disable-next-line no-continue
+      continue;
+    }
+
+    await dbCli.execute(
+      'UPDATE tasks SET backup_type = ? WHERE taskId = ?',
+      ['automatic_failed', taskId],
+    );
+
+    let artifactCleanupFailed = false;
+
+    if (task.host && !task.remoteRemoved) {
+      // eslint-disable-next-line no-use-before-define
+      const remoteRemoved = await removeBackupFromRemoteHost(task.host, taskId);
+      if (!remoteRemoved) {
+        artifactCleanupFailed = true;
+        failed += 1;
+      }
+    }
+
+    if (task.fails >= TASK_MAX_FAILURES && fileManager.fileExists(task.filename)) {
+      try {
+        await fileManager.deleteFile(task.filename);
+        await dbCli.execute('UPDATE tasks SET localRemoved = 1 WHERE taskId = ?', [taskId]);
+      } catch (error) {
+        log.error(`Failed to remove local file for incomplete task ${taskId}:`, error.message);
+        artifactCleanupFailed = true;
+        failed += 1;
+      }
+    }
+
+    if (task.uploaded === 1) {
+      if (!task.hash) {
+        log.warn(`Incomplete automatic backup task ${taskId} has no FluxDrive hash`);
+        failed += 1;
+        // eslint-disable-next-line no-continue
+        continue;
+      }
+
+      const removeResult = await fluxDrive.removeFile(task.hash);
+      const removalError = getFluxDriveRemovalError(removeResult);
+      if (removalError) {
+        log.error(`Failed to roll back incomplete automatic backup task ${taskId}: ${removalError}`);
+        failed += 1;
+        // eslint-disable-next-line no-continue
+        continue;
+      }
+
+      await dbCli.softRemoveTask(taskId);
+      removed += 1;
+    } else if (!artifactCleanupFailed) {
+      await dbCli.softRemoveTask(taskId);
+      removed += 1;
+    }
+  }
+
+  return { removed, failed, inProgress };
+}
+
+/**
  * Periodically cleans up old automatic backups that failed removal.
  * Simply queries all old automatic backups with removedFromFluxdrive=0 and retries.
  *
@@ -893,6 +996,21 @@ async function removeOldAutomaticBackupFiles(appname, owner, excludeTaskIds = []
 async function cleanupOldAutomaticBackups() {
   try {
     log.info('Running periodic cleanup for old automatic backups...');
+
+    const incompleteTasks = await dbCli.execute(`
+      SELECT taskId
+      FROM tasks
+      WHERE backup_type = 'automatic_failed'
+      AND (
+        removedFromFluxdrive = 0
+        OR remoteRemoved = 0
+        OR (fails >= ? AND localRemoved = 0)
+      )
+      AND (finishTime > 0 OR fails >= ?)
+    `, [TASK_MAX_FAILURES, TASK_MAX_FAILURES]);
+    const incompleteResult = await cleanupIncompleteAutomaticBackupTasks(
+      incompleteTasks.map((task) => task.taskId),
+    );
 
     // Find all apps with old automatic backups that haven't been removed
     const query = `
@@ -908,13 +1026,17 @@ async function cleanupOldAutomaticBackups() {
 
     if (!appsWithOldBackups || appsWithOldBackups.length === 0) {
       log.info('No old automatic backups to clean up');
-      return { totalRemoved: 0, totalFailed: 0, appsProcessed: 0 };
+      return {
+        totalRemoved: incompleteResult.removed,
+        totalFailed: incompleteResult.failed,
+        appsProcessed: 0,
+      };
     }
 
     log.info(`Found ${appsWithOldBackups.length} apps with old automatic backups to clean up`);
 
-    let totalRemoved = 0;
-    let totalFailed = 0;
+    let totalRemoved = incompleteResult.removed;
+    let totalFailed = incompleteResult.failed;
 
     for (let i = 0; i < appsWithOldBackups.length; i += 1) {
       const { appname, owner } = appsWithOldBackups[i];
@@ -927,6 +1049,9 @@ async function cleanupOldAutomaticBackups() {
         WHERE appname = ?
         AND owner = ?
         AND backup_type = 'automatic'
+        AND uploaded = 1
+        AND removedFromFluxdrive = 0
+        AND finishTime > 0
         AND timestamp = (
           SELECT MAX(timestamp)
           FROM tasks t2
@@ -934,6 +1059,9 @@ async function cleanupOldAutomaticBackups() {
           AND t2.owner = t1.owner
           AND t2.component = t1.component
           AND t2.backup_type = 'automatic'
+          AND t2.uploaded = 1
+          AND t2.removedFromFluxdrive = 0
+          AND t2.finishTime > 0
         )
       `;
 
@@ -1208,6 +1336,17 @@ async function processAutomaticBackup() {
           );
         }
 
+        if (registrationFailures.length > 0) {
+          await waitForTasksToComplete(taskIds, 60);
+          const rollbackResult = await cleanupIncompleteAutomaticBackupTasks(taskIds);
+          log.info(`Incomplete batch rollback: ${rollbackResult.removed} task artifacts removed, ${rollbackResult.failed} cleanup failures`);
+          throw createBackupFailure(
+            summarizeRegistrationFailures(registrationFailures),
+            'task_pipeline',
+            registrationFailures,
+          );
+        }
+
         // Wait for all new backup tasks to complete successfully
         log.info(`Waiting for ${taskIds.length} new automatic backup tasks to complete...`);
         const waitResult = await waitForTasksToComplete(taskIds, 60);
@@ -1253,7 +1392,11 @@ async function processAutomaticBackup() {
         const taskFailureSummary = waitResult.failures
           .map((failure) => `${failure.component}: ${failure.message}`)
           .join('; ');
-        log.error('New backup tasks did not complete successfully. Keeping old backups intact.', taskFailureSummary);
+        const rollbackResult = await cleanupIncompleteAutomaticBackupTasks(taskIds);
+        log.error(
+          `New backup batch failed. Rolled back ${rollbackResult.removed} component artifacts; ${rollbackResult.failed} cleanup operations failed.`,
+          taskFailureSummary,
+        );
         throw createBackupFailure(
           taskFailureSummary || 'New backup tasks failed to complete',
           'task_pipeline',
@@ -1266,6 +1409,11 @@ async function processAutomaticBackup() {
           reason: getErrorMessage(error),
           taskFailures: error.taskFailures || [],
         };
+        if (lastFailure.stage === 'task_pipeline') {
+          log.error(`Automatic backup ${appname} failed after component-level retries:`, lastFailure.reason);
+          break;
+        }
+
         log.error(`Attempt ${retryCount}/${maxRetries} failed for automatic backup ${appname}:`, lastFailure.reason);
 
         if (retryCount < maxRetries) {
