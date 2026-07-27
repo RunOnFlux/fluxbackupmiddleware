@@ -16,6 +16,8 @@ let dbCli = null;
 
 const taskQueue = new Map();
 const TASK_MAX_FAILURES = 4;
+let previousMissingFluxDriveHashes = new Set();
+let fluxDriveReconciliationRunning = false;
 
 function getQuotaLimitBytes() {
   return config.quotaPerUser * 1024 * 1024 * 1024;
@@ -361,7 +363,7 @@ async function checkExpiredApps() {
             await dbCli.updateTask(record);
           } else {
             log.info(`id: ${record.taskId}, appname: ${record.appname} has a new owner. removing file from FluxDrive`);
-            const removeResult = await fluxDrive.removeFile(record.hash);
+            const removeResult = await fluxDrive.removeFileVerified(record.hash);
             const removalError = getFluxDriveRemovalError(removeResult);
             if (removalError) {
               log.error(`Failed to remove expired-app task ${record.taskId}: ${removalError}`);
@@ -372,7 +374,7 @@ async function checkExpiredApps() {
         }
         if (appSpecs && appSpecs === 'Application not found') {
           log.info(`id: ${record.taskId}, appname: ${record.appname}, hash: ${record.hash} removed from FluxDrive.`);
-          const removeResult = await fluxDrive.removeFile(record.hash);
+          const removeResult = await fluxDrive.removeFileVerified(record.hash);
           const removalError = getFluxDriveRemovalError(removeResult);
           if (removalError) {
             log.error(`Failed to remove expired-app task ${record.taskId}: ${removalError}`);
@@ -766,7 +768,7 @@ async function removeCheckpoint(req, res) {
       for (let i = 0; i < checkpoint.length; i += 1) {
         if (checkpoint[i].hash) {
           // eslint-disable-next-line no-await-in-loop
-          const removeResult = await fluxDrive.removeFile(checkpoint[i].hash);
+          const removeResult = await fluxDrive.removeFileVerified(checkpoint[i].hash);
           const removalError = getFluxDriveRemovalError(removeResult);
           if (removalError) {
             log.error(`Failed to remove checkpoint task ${checkpoint[i].taskId}: ${removalError}`);
@@ -950,7 +952,7 @@ async function removeOldAutomaticBackupFiles(appname, owner, excludeTaskIds = []
       try {
         log.info(`Removing: taskId=${task.taskId}, hash=${task.hash}, filename=${task.filename}`);
 
-        const removeResult = await fluxDrive.removeFile(task.hash);
+        const removeResult = await fluxDrive.removeFileVerified(task.hash);
 
         const removalError = getFluxDriveRemovalError(removeResult);
         if (removalError) {
@@ -1042,7 +1044,7 @@ async function cleanupIncompleteAutomaticBackupTasks(taskIds) {
         continue;
       }
 
-      const removeResult = await fluxDrive.removeFile(task.hash);
+      const removeResult = await fluxDrive.removeFileVerified(task.hash);
       const removalError = getFluxDriveRemovalError(removeResult);
       if (removalError) {
         log.error(`Failed to roll back incomplete automatic backup task ${taskId}: ${removalError}`);
@@ -1165,6 +1167,88 @@ async function cleanupOldAutomaticBackups() {
   } catch (error) {
     log.error('Error in cleanupOldAutomaticBackups:', error.message);
     return { totalRemoved: 0, totalFailed: 0, appsProcessed: 0 };
+  }
+}
+
+/**
+ * Reconciles completed, active DB records with FluxDrive's authoritative inventory.
+ * A hash must be absent in two consecutive successful scans before its DB row is
+ * soft-removed. This avoids clearing records because of a transient/incomplete list.
+ *
+ * @async
+ * @returns {Promise<Object>} - Reconciliation summary
+ */
+async function reconcileFluxDriveInventory() {
+  if (fluxDriveReconciliationRunning) {
+    log.warn('FluxDrive inventory reconciliation is already running');
+    return {
+      scanned: 0, missing: 0, reconciled: 0, skipped: true,
+    };
+  }
+
+  fluxDriveReconciliationRunning = true;
+  try {
+    const inventory = await fluxDrive.getFileInventory();
+    if (!inventory.success) {
+      previousMissingFluxDriveHashes = new Set();
+      log.warn(`Skipping FluxDrive reconciliation: ${inventory.message}`);
+      return {
+        scanned: 0, missing: 0, reconciled: 0, skipped: true,
+      };
+    }
+
+    const tasks = await dbCli.execute(`
+      SELECT taskId, hash, appname, component
+      FROM tasks
+      WHERE uploaded = 1
+      AND removedFromFluxdrive = 0
+      AND finishTime > 0
+      AND hash IS NOT NULL
+      AND hash <> ''
+    `);
+    if (!Array.isArray(tasks)) {
+      previousMissingFluxDriveHashes = new Set();
+      throw new Error('Could not load active backup tasks for FluxDrive reconciliation');
+    }
+
+    const currentMissingHashes = new Set();
+    let reconciled = 0;
+
+    for (let i = 0; i < tasks.length; i += 1) {
+      const task = tasks[i];
+      if (inventory.hashes.has(task.hash)) {
+        // eslint-disable-next-line no-continue
+        continue;
+      }
+
+      if (previousMissingFluxDriveHashes.has(task.hash)) {
+        const updateResult = await dbCli.softRemoveTask(task.taskId);
+        if (updateResult?.affectedRows !== 1) {
+          throw new Error(`Could not soft-remove reconciled task ${task.taskId}`);
+        }
+        reconciled += 1;
+        log.info(`Reconciled task ${task.taskId}: hash ${task.hash} was absent from two consecutive FluxDrive inventories`);
+      } else {
+        currentMissingHashes.add(task.hash);
+      }
+    }
+
+    previousMissingFluxDriveHashes = currentMissingHashes;
+    log.info(`FluxDrive reconciliation summary: scanned=${tasks.length}, missing=${currentMissingHashes.size}, reconciled=${reconciled}`);
+    return {
+      scanned: tasks.length,
+      missing: currentMissingHashes.size,
+      reconciled,
+      skipped: false,
+    };
+  } catch (error) {
+    previousMissingFluxDriveHashes = new Set();
+    log.error(`FluxDrive inventory reconciliation failed: ${getErrorMessage(error)}`);
+    return {
+      scanned: 0, missing: 0, reconciled: 0, skipped: true,
+    };
+  } finally {
+    fluxDriveReconciliationRunning = false;
   }
 }
 
@@ -1581,6 +1665,7 @@ async function init() {
   // Periodic cleanup of old automatic backups (catches failed removals)
   setInterval(async () => {
     await cleanupOldAutomaticBackups();
+    await reconcileFluxDriveInventory();
   }, 24 * 60 * 60 * 1000); // Run every 24 hours
 }
 
@@ -1595,4 +1680,5 @@ module.exports = {
   waitForTasksToComplete,
   removeOldAutomaticBackupFiles,
   cleanupOldAutomaticBackups,
+  reconcileFluxDriveInventory,
 };

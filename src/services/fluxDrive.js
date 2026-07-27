@@ -53,6 +53,93 @@ function logUploadFailure(file, fileName, fileSize, reason, statusCode = null) {
   log.error(`FluxDrive upload failed: taskId=${file.taskId}, appname=${file.appname}, file=${fileName}, size=${fileSize} bytes (${sizeMiB} MiB)${status}, reason=${reason}`);
 }
 
+function getInventoryEntries(response) {
+  if (Array.isArray(response)) return response;
+  if (!response || typeof response !== 'object') return null;
+  if (response.status && response.status !== 'success') return null;
+
+  const candidates = [
+    response.files,
+    response.data,
+    response.data?.files,
+    response.result,
+    response.result?.files,
+    response.result?.entries,
+  ];
+  return candidates.find((candidate) => Array.isArray(candidate)) || null;
+}
+
+function getInventoryEntryHash(entry) {
+  if (typeof entry === 'string') return entry;
+  if (!entry || typeof entry !== 'object') return null;
+  return entry.hash || entry.Hash || entry.cid || entry.Cid || entry.CID || null;
+}
+
+function inventoryHasMorePages(response) {
+  if (!response || typeof response !== 'object') return false;
+  const containers = [response, response.data, response.result].filter(
+    (value) => value && typeof value === 'object',
+  );
+  return containers.some((value) => (
+    value.hasMore === true
+    || value.has_more === true
+    || Boolean(value.nextCursor)
+    || Boolean(value.next_cursor)
+    || Boolean(value.nextPage)
+  ));
+}
+
+/**
+ * Parses a successful FluxDrive file-list response into an authoritative hash set.
+ * Unknown response shapes are rejected so they cannot be mistaken for an empty drive.
+ *
+ * @param {Object|Array} response - Raw response from /api/v0/ls
+ * @returns {{success: boolean, hashes: Set<string>, message?: string}}
+ */
+function parseFileInventory(response) {
+  if (inventoryHasMorePages(response)) {
+    return {
+      success: false,
+      hashes: new Set(),
+      message: 'FluxDrive returned a paginated file list with more pages',
+    };
+  }
+
+  const entries = getInventoryEntries(response);
+  if (!entries) {
+    return {
+      success: false,
+      hashes: new Set(),
+      message: 'FluxDrive returned an unrecognized file-list response',
+    };
+  }
+
+  const hashes = new Set();
+  let unrecognizedEntries = 0;
+  entries.forEach((entry) => {
+    const hash = getInventoryEntryHash(entry);
+    if (typeof hash === 'string' && hash.length > 0) {
+      hashes.add(hash);
+    } else {
+      unrecognizedEntries += 1;
+    }
+  });
+  if (unrecognizedEntries > 0) {
+    return {
+      success: false,
+      hashes: new Set(),
+      message: `FluxDrive file list contained ${unrecognizedEntries} unrecognized entries`,
+    };
+  }
+  return { success: true, hashes };
+}
+
+function isRemovalResponseSuccessful(response) {
+  return response?.status === 'success'
+    || response?.success === true
+    || response?.removed === true;
+}
+
 /**
  * Retrieves the status from the FluxDrive server.
  *
@@ -99,7 +186,12 @@ async function removeFile(hash) {
     return result.data;
   } catch (e) {
     log.error(e);
-    return null;
+    return {
+      status: 'error',
+      success: false,
+      httpStatus: e.response?.status || null,
+      message: getUploadFailureReason(e.response?.data, e.message || 'FluxDrive removal request failed'),
+    };
   }
 }
 
@@ -126,6 +218,38 @@ async function getFileList() {
     log.error(e);
     return null;
   }
+}
+
+async function getFileInventory() {
+  const response = await getFileList();
+  return parseFileInventory(response);
+}
+
+/**
+ * Removes a file and verifies whether it is already absent when removal fails.
+ * A failed inventory lookup never counts as successful removal.
+ *
+ * @param {string} hash - FluxDrive file hash
+ * @returns {Promise<Object>} - Successful, already-absent, or retryable failure result
+ */
+async function removeFileVerified(hash) {
+  const removeResult = await removeFile(hash);
+  if (isRemovalResponseSuccessful(removeResult)) return removeResult;
+
+  const inventory = await getFileInventory();
+  if (inventory.success && !inventory.hashes.has(hash)) {
+    log.info(`FluxDrive file ${hash} is already absent; treating removal as successful`);
+    return {
+      status: 'success',
+      success: true,
+      alreadyAbsent: true,
+    };
+  }
+
+  if (!inventory.success) {
+    log.warn(`Could not verify whether FluxDrive file ${hash} is absent: ${inventory.message}`);
+  }
+  return removeResult;
 }
 
 /**
@@ -259,7 +383,10 @@ module.exports = {
   getStatus,
   getUsedStorage,
   getFileList,
+  getFileInventory,
+  parseFileInventory,
   uploadFile,
   getFile,
   removeFile,
+  removeFileVerified,
 };
