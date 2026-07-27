@@ -2,41 +2,43 @@
 const fs = require('fs');
 const http = require('http');
 const https = require('https');
+const { Transform } = require('stream');
+const { pipeline } = require('stream/promises');
 const log = require('../lib/log');
 const config = require('../../config/default');
 const fluxOS = require('./fluxOsService');
 const Vault = require('./Vault');
-
-const path = config.storagePath;
-// const apiPath = config.hostAPIPath;
+const taskFileStorage = require('./utils/taskFileStorage');
 
 // Ensure the storage directory exists on module load
-if (!fs.existsSync(path)) {
-  fs.mkdirSync(path, { recursive: true });
-  log.info(`Created storage directory: ${path}`);
+if (!fs.existsSync(config.storagePath)) {
+  fs.mkdirSync(config.storagePath, { recursive: true });
+  log.info(`Created storage directory: ${config.storagePath}`);
 }
 
 /**
  * checks if a file exists
  *
- * @param {string} fileName - The task object.
+ * @param {Object} task - Backup task.
  */
-function fileExists(filename) {
-  return fs.existsSync(path + filename);
+function fileExists(task) {
+  return fs.existsSync(taskFileStorage.getTaskFilePath(task));
 }
 
 /**
- * Deletes given filename
+ * Deletes local artifacts belonging to one task.
  *
- * @param {string} fileName - The task object.
+ * @param {Object} task - Backup task.
  * @throws Will throw an error if it fails.
  */
-function deleteFile(fileName) {
+function deleteFile(task) {
   try {
-    fs.unlinkSync(path + fileName);
-    log.info(`"${fileName}" has been deleted.`);
+    const result = taskFileStorage.removeTaskArtifacts(task);
+    log.info(`Local backup artifacts deleted for task ${task.taskId}: ${task.filename}`);
+    return result;
   } catch (error) {
-    log.error(`Error deleting file "${fileName}": ${error.message}`);
+    log.error(`Error deleting local artifacts for task ${task.taskId} (${task.filename}): ${error.message}`);
+    throw error;
   }
 }
 
@@ -80,8 +82,8 @@ async function getRemoteFileSize(task) {
       response.resume();
       const contentLength = response.headers['content-length'];
       if (response.statusCode >= 200 && response.statusCode < 300 && contentLength) {
-        const parsedLength = Number(contentLength);
-        resolve(Number.isFinite(parsedLength) ? parsedLength : null);
+        const parsedLength = Number(contentLength);
+        resolve(Number.isFinite(parsedLength) ? parsedLength : null);
         return;
       }
       resolve(null);
@@ -96,6 +98,28 @@ async function getRemoteFileSize(task) {
   });
 }
 
+async function getDownloadResponse(url, headers, redirectsRemaining = 5) {
+  const requestFn = url.protocol.startsWith('https:') ? https.get : http.get;
+  const response = await new Promise((resolve, reject) => {
+    const request = requestFn(url, { headers }, resolve);
+    request.on('error', reject);
+    request.setTimeout(5 * 60 * 1000, () => {
+      request.destroy(new Error('Backup download timed out due to inactivity'));
+    });
+  });
+
+  if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+    response.resume();
+    if (redirectsRemaining === 0) {
+      throw new Error('Backup download exceeded redirect limit');
+    }
+    const redirectUrl = new URL(response.headers.location, url);
+    return getDownloadResponse(redirectUrl, headers, redirectsRemaining - 1);
+  }
+
+  return response;
+}
+
 /**
  * Downloads a file from a host for a given task.
  *
@@ -106,7 +130,6 @@ async function getRemoteFileSize(task) {
  */
 async function downloadFileFromHost(task) {
   const { filename } = task;
-  const { filesize } = task;
   const url = new URL(`${task.host}`);
 
   // Construct node URL from hostname and port
@@ -129,101 +152,67 @@ async function downloadFileFromHost(task) {
   if (!zelidauth) {
     throw new Error('Failed to authenticate with node');
   }
-  log.info(`Downloading ${filename} from ${url.href}`);
-  return new Promise((resolve, reject) => {
-    try {
-      const headers = { zelidauth };
-      const file = fs.createWriteStream(path + filename);
-      let receivedBytes = 0;
-      const get = url.protocol.startsWith('https:') ? https.get : http.get;
-      const options = {
-        hostname: url.hostname,
-        port: url.port,
-        path: url.pathname + url.search,
-        headers,
-      };
-      // console.log(options);
-      get(options, (response) => {
-        // Check if the server responded with a redirect
-        if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
-          response.headers.location = new URL(response.headers.location, url).href;
-          // Start a new download using the redirected URL
-          downloadFileFromHost(task).then(resolve).catch(reject);
-          return;
-        }
-        const totalBytes = response.headers['content-length'];
+  const finalPath = taskFileStorage.getTaskFilePath(task);
+  const partialPath = taskFileStorage.getTaskPartialFilePath(task);
+  const expectedSize = Number(task.filesize);
 
-        response.on('data', (chunk) => {
-          receivedBytes += chunk.length;
-          const percentCompleted = (receivedBytes / totalBytes) * 100;
-          // log.info(`Downloading ${filename}: ${percentCompleted.toFixed(2)}%`);
-          task.status = { state: 'downloading', message: 'Fetching file from node', progress: Number(percentCompleted.toFixed(2)) };
-          // console.log(task.status);
-        });
+  if (!Number.isFinite(expectedSize) || expectedSize < 0) {
+    throw new Error(`Invalid expected backup size for task ${task.taskId}`);
+  }
 
-        response.pipe(file);
+  taskFileStorage.ensureTaskDirectory(task);
+  taskFileStorage.unlinkIfPresent(finalPath);
+  taskFileStorage.unlinkIfPresent(partialPath);
 
-        file.on('finish', () => {
-          // Close the file stream first and wait for it to complete
-          file.close((closeErr) => {
-            if (closeErr) {
-              log.error(`Error closing file ${filename}:`, closeErr);
-              task.status = { state: 'failed', message: 'Error closing file', progress: 0 };
-              reject(closeErr);
-              return;
-            }
-
-            // Now check if the file exists and verify its size
-            try {
-              if (!fs.existsSync(path + filename)) {
-                const errorMessage = `File ${path + filename} does not exist after download.`;
-                log.error(errorMessage);
-                task.status = { state: 'failed', message: 'File does not exist after download', progress: 0 };
-                task.downloaded = false;
-                reject(new Error(errorMessage));
-              }
-              const stats = fs.statSync(path + filename);
-              console.log(`File size: ${stats.size} bytes`);
-
-              if (filesize !== stats.size) {
-                log.error(`File size mismatch ${filesize}<>${stats.size}`);
-                task.status = { state: 'failed', message: 'File size mismatch', progress: 0 };
-                task.downloaded = false;
-                fs.unlink(path + filename, (err) => {
-                  if (err) log.error(`Failed to delete file ${filename}:`, err);
-                });
-                reject(new Error('File size mismatch'));
-              } else {
-                // File downloaded successfully and size matches
-                log.info(`${filename} downloaded successfully from node.`);
-                task.status = { state: 'downloading', message: 'download finished', progress: 100 };
-                task.downloaded = true;
-                resolve(true);
-              }
-            } catch (statError) {
-              log.error(`Error checking file stats for ${filename}:`, statError);
-              task.status = { state: 'failed', message: 'Failed to verify downloaded file', progress: 0 };
-              task.downloaded = false;
-              reject(statError);
-            }
-          });
-        });
-
-        file.on('error', (error) => {
-          log.error(`Downloading ${filename} from host failed.`);
-          task.status = { state: 'failed', message: 'Fetching file from node failed', progress: 0 };
-          fs.unlink(path + filename, (err) => {
-            if (err) log.error(`Failed to delete file ${filename}:`, err);
-          });
-          reject(error.message);
-        });
-      });
-    } catch (err) {
-      log.error('Download failed.');
-      log.error(err);
-      reject(err.message);
+  log.info(`Downloading ${filename} for task ${task.taskId} from ${url.href}`);
+  try {
+    const response = await getDownloadResponse(url, { zelidauth });
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      response.resume();
+      throw new Error(`Backup download returned HTTP ${response.statusCode}`);
     }
-  });
+
+    const contentLength = Number(response.headers['content-length']);
+    let receivedBytes = 0;
+    const progressStream = new Transform({
+      transform(chunk, encoding, callback) {
+        receivedBytes += chunk.length;
+        const progressTotal = Number.isFinite(contentLength) && contentLength > 0
+          ? contentLength : expectedSize;
+        const progress = progressTotal > 0
+          ? Number(((receivedBytes / progressTotal) * 100).toFixed(2)) : 0;
+        task.status = { state: 'downloading', message: 'Fetching file from node', progress };
+        callback(null, chunk);
+      },
+    });
+
+    await pipeline(
+      response,
+      progressStream,
+      fs.createWriteStream(partialPath, { flags: 'w' }),
+    );
+
+    const actualSize = fs.statSync(partialPath).size;
+    if (actualSize !== expectedSize) {
+      throw new Error(`File size mismatch ${expectedSize}<>${actualSize}`);
+    }
+
+    fs.renameSync(partialPath, finalPath);
+    log.info(`${filename} downloaded successfully for task ${task.taskId}.`);
+    task.status = { state: 'downloading', message: 'download finished', progress: 100 };
+    task.downloaded = true;
+    return true;
+  } catch (error) {
+    try {
+      taskFileStorage.removeTaskArtifacts(task);
+    } catch (cleanupError) {
+      log.error(`Failed to clean local artifacts for task ${task.taskId}: ${cleanupError.message}`);
+    }
+    task.status = { state: 'failed', message: error.message, progress: 0 };
+    task.downloaded = false;
+    log.error(`Downloading ${filename} for task ${task.taskId} failed: ${error.message}`);
+    throw error;
+  }
 }
 
 module.exports = {

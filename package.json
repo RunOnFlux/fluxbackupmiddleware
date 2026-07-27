@@ -5,8 +5,10 @@
   "main": "server.js",
   "scripts": {
     "test": "node server.js",
+    "test:concurrent-downloads": "node scripts/test-concurrent-task-downloads.js",
     "test:enterprise-syncthing": "node scripts/test-enterprise-syncthing.js",
     "test:fluxdrive-inventory": "node scripts/test-fluxdrive-inventory.js",
+    "test:task-file-storage": "node scripts/test-task-file-storage.js",
     "start": "node server.js",
     "lint": "eslint ./",
     "lint:fix": "eslint ./ --fix"

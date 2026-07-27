@@ -5,10 +5,9 @@ const https = require('https');
 const FormData = require('form-data');
 const { URL } = require('url');
 const fs = require('fs');
-const path = require('path');
 const log = require('../lib/log');
 const Vault = require('./Vault');
-const config = require('../../config/default');
+const taskFileStorage = require('./utils/taskFileStorage');
 
 /**
  * Builds a full URL for FluxDrive API endpoints.
@@ -262,15 +261,15 @@ async function removeFileVerified(hash) {
  */
 async function uploadFile(file) {
   const { filename } = file;
-  const filePath = config.storagePath + filename;
+  const filePath = taskFileStorage.getTaskFilePath(file);
   const ZELID = await Vault.getKey('zelid');
   const API_KEY = await Vault.getKey('apikey');
   const FD_SERVER = await Vault.getKey('fluxDriveServer');
   const form = new FormData();
-  const fileName = path.basename(filePath);
+  const fileName = filename;
   const fileSize = fs.statSync(filePath).size;
   const fileStream = fs.createReadStream(filePath);
-  form.append('file', fileStream);
+  form.append('file', fileStream, { filename: fileName, knownLength: fileSize });
 
   const fullUrl = buildFluxDriveUrl(FD_SERVER, '/api/v0/put');
   const parsedUrl = new URL(fullUrl);

@@ -244,7 +244,7 @@ async function runTask(id) {
     task.status = { state: 'started', message: 'backup to FluxDrive started', progress: 0 };
     await dbCli.updateTask(task);
     // check if file is downloaded
-    if (!task.downloaded || task.localRemoved) {
+    if (!task.downloaded || task.localRemoved || !fileManager.fileExists(task)) {
       const remoteFilesize = await fileManager.getRemoteFileSize(task);
       const backupFilesize = remoteFilesize ?? Number(task.filesize);
       if (await wouldExceedUserQuota(task.owner, backupFilesize, task.taskId)) {
@@ -270,10 +270,10 @@ async function runTask(id) {
       await dbCli.updateTask(task);
     }
     // check if the file is removed locally
-    if (fileManager.fileExists(task.filename) || !task.localRemoved) {
+    if (fileManager.fileExists(task) || !task.localRemoved) {
       // remove the file locally
       log.info(`removing local file for task ${id}.`);
-      await fileManager.deleteFile(task.filename);
+      await fileManager.deleteFile(task);
       task.localRemoved = true;
       await dbCli.updateTask(task);
     }
@@ -1025,9 +1025,9 @@ async function cleanupIncompleteAutomaticBackupTasks(taskIds) {
       }
     }
 
-    if (task.fails >= TASK_MAX_FAILURES && fileManager.fileExists(task.filename)) {
+    if (task.fails >= TASK_MAX_FAILURES && !task.localRemoved) {
       try {
-        await fileManager.deleteFile(task.filename);
+        await fileManager.deleteFile(task);
         await dbCli.execute('UPDATE tasks SET localRemoved = 1 WHERE taskId = ?', [taskId]);
       } catch (error) {
         log.error(`Failed to remove local file for incomplete task ${taskId}:`, error.message);
