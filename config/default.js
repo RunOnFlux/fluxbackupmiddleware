@@ -6,7 +6,7 @@ module.exports = {
   dbPort: 3306,
   dbhost: '127.0.0.1',
   maxConcurrentTasks: 10,
-  quotaPerUser: 20, // GB
+  quotaPerUser: 50, // GB
   maxFilesPerApp: 20,
   storagePath: './tmp/',
   hostAPIPath: '/',
