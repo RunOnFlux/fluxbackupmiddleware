@@ -1,5 +1,7 @@
 /* eslint-disable no-await-in-loop */
 /* eslint-disable no-undef */
+const fs = require('fs');
+const path = require('path');
 const axios = require('axios');
 const DBClient = require('./utils/DBClient');
 const log = require('../lib/log');
@@ -11,12 +13,15 @@ const fluxDrive = require('./fluxDrive');
 const fluxOS = require('./fluxOsService');
 const Vault = require('./Vault');
 const discordNotifier = require('./discordNotifier');
+const {
+  extractReconciledTasks,
+  isRecoverableTask,
+} = require('./utils/reconciliationRecovery');
 
 let dbCli = null;
 
 const taskQueue = new Map();
 const TASK_MAX_FAILURES = 4;
-let previousMissingFluxDriveHashes = new Set();
 let fluxDriveReconciliationRunning = false;
 
 function getQuotaLimitBytes() {
@@ -1170,82 +1175,130 @@ async function cleanupOldAutomaticBackups() {
   }
 }
 
+function findTasksChangedByLegacyReconciliation() {
+  const reconciledTasks = new Map();
+  const logsDirectory = path.join(__dirname, '../../logs');
+  const filenames = ['debug.log', 'info.log', 'error.log'];
+
+  for (let i = 0; i < filenames.length; i += 1) {
+    const logPath = path.join(logsDirectory, filenames[i]);
+    if (fs.existsSync(logPath)) {
+      const extracted = extractReconciledTasks(fs.readFileSync(logPath, 'utf8'));
+      extracted.forEach((hash, taskId) => reconciledTasks.set(taskId, hash));
+    }
+  }
+
+  return reconciledTasks;
+}
+
+async function isHashRetrievable(hash) {
+  const gateway = config.ipfsGatewayUrl.replace(/\/+$/, '');
+  try {
+    const response = await axios.get(`${gateway}/${encodeURIComponent(hash)}`, {
+      headers: { Range: 'bytes=0-0' },
+      responseType: 'stream',
+      timeout: 30000,
+      validateStatus: () => true,
+    });
+    if (response.data && typeof response.data.destroy === 'function') {
+      response.data.destroy();
+    }
+    return response.status === 200 || response.status === 206;
+  } catch (error) {
+    log.warn(`Could not directly verify reconciled hash ${hash}: ${getErrorMessage(error)}`);
+    return false;
+  }
+}
+
 /**
- * Reconciles completed, active DB records with FluxDrive's authoritative inventory.
- * A hash must be absent in two consecutive successful scans before its DB row is
- * soft-removed. This avoids clearing records because of a transient/incomplete list.
+ * Repairs records changed by the retired inventory reconciliation.
+ *
+ * The FluxDrive /ls endpoint is capped and is never used as proof of absence.
+ * Only task IDs recorded by the old reconciler are considered, their exact hash
+ * must be directly retrievable, and each row can be recovered only once.
  *
  * @async
- * @returns {Promise<Object>} - Reconciliation summary
+ * @returns {Promise<Object>} - Recovery summary
  */
 async function reconcileFluxDriveInventory() {
   if (fluxDriveReconciliationRunning) {
-    log.warn('FluxDrive inventory reconciliation is already running');
+    log.warn('FluxDrive reconciliation recovery is already running');
     return {
-      scanned: 0, missing: 0, reconciled: 0, skipped: true,
+      candidates: 0, recovered: 0, unavailable: 0, skipped: true,
     };
   }
 
   fluxDriveReconciliationRunning = true;
   try {
-    const inventory = await fluxDrive.getFileInventory();
-    if (!inventory.success) {
-      previousMissingFluxDriveHashes = new Set();
-      log.warn(`Skipping FluxDrive reconciliation: ${inventory.message}`);
+    const loggedTasks = findTasksChangedByLegacyReconciliation();
+    if (loggedTasks.size === 0) {
+      log.info('No records from the retired FluxDrive inventory reconciliation require recovery');
       return {
-        scanned: 0, missing: 0, reconciled: 0, skipped: true,
+        candidates: 0, recovered: 0, unavailable: 0, skipped: false,
       };
     }
 
-    const tasks = await dbCli.execute(`
-      SELECT taskId, hash, appname, component
-      FROM tasks
-      WHERE uploaded = 1
-      AND removedFromFluxdrive = 0
-      AND finishTime > 0
-      AND hash IS NOT NULL
-      AND hash <> ''
-    `);
-    if (!Array.isArray(tasks)) {
-      previousMissingFluxDriveHashes = new Set();
-      throw new Error('Could not load active backup tasks for FluxDrive reconciliation');
+    const loggedTaskIds = [...loggedTasks.keys()];
+    const candidates = [];
+    for (let offset = 0; offset < loggedTaskIds.length; offset += 100) {
+      const taskIds = loggedTaskIds.slice(offset, offset + 100);
+      const placeholders = taskIds.map(() => '?').join(',');
+      const rows = await dbCli.execute(`
+        SELECT taskId, hash, appname, component, status, uploaded,
+          removedFromFluxdrive, reconciliationRecovered
+        FROM tasks
+        WHERE taskId IN (${placeholders})
+        AND uploaded = 0
+        AND removedFromFluxdrive = 1
+        AND reconciliationRecovered = 0
+      `, taskIds);
+      if (!Array.isArray(rows)) {
+        throw new Error('Could not load tasks changed by the retired reconciliation');
+      }
+      for (let i = 0; i < rows.length; i += 1) candidates.push(rows[i]);
     }
 
-    const currentMissingHashes = new Set();
-    let reconciled = 0;
-
-    for (let i = 0; i < tasks.length; i += 1) {
-      const task = tasks[i];
-      if (inventory.hashes.has(task.hash)) {
-        // eslint-disable-next-line no-continue
-        continue;
-      }
-
-      if (previousMissingFluxDriveHashes.has(task.hash)) {
-        const updateResult = await dbCli.softRemoveTask(task.taskId);
-        if (updateResult?.affectedRows !== 1) {
-          throw new Error(`Could not soft-remove reconciled task ${task.taskId}`);
+    let recovered = 0;
+    let unavailable = 0;
+    for (let i = 0; i < candidates.length; i += 1) {
+      const task = candidates[i];
+      const expectedHash = loggedTasks.get(Number(task.taskId));
+      if (isRecoverableTask(task, expectedHash)) {
+        if (!await isHashRetrievable(task.hash)) {
+          unavailable += 1;
+          log.warn(`Legacy reconciliation recovery deferred for task ${task.taskId}: hash ${task.hash} is not directly retrievable`);
+        } else {
+          const updateResult = await dbCli.execute(`
+            UPDATE tasks
+            SET uploaded = 1,
+              removedFromFluxdrive = 0,
+              reconciliationRecovered = 1
+            WHERE taskId = ?
+            AND hash = ?
+            AND uploaded = 0
+            AND removedFromFluxdrive = 1
+            AND reconciliationRecovered = 0
+          `, [task.taskId, task.hash]);
+          if (updateResult?.affectedRows !== 1) {
+            throw new Error(`Could not recover wrongly reconciled task ${task.taskId}`);
+          }
+          recovered += 1;
+          log.info(`Recovered task ${task.taskId}: directly verified hash ${task.hash} and restored FluxDrive visibility`);
         }
-        reconciled += 1;
-        log.info(`Reconciled task ${task.taskId}: hash ${task.hash} was absent from two consecutive FluxDrive inventories`);
-      } else {
-        currentMissingHashes.add(task.hash);
       }
     }
 
-    previousMissingFluxDriveHashes = currentMissingHashes;
-    log.info(`FluxDrive reconciliation summary: scanned=${tasks.length}, missing=${currentMissingHashes.size}, reconciled=${reconciled}`);
+    log.info(`FluxDrive reconciliation recovery summary: candidates=${candidates.length}, recovered=${recovered}, unavailable=${unavailable}`);
     return {
-      scanned: tasks.length,
-      missing: currentMissingHashes.size,
-      reconciled,
+      candidates: candidates.length,
+      recovered,
+      unavailable,
       skipped: false,
     };
   } catch (error) {
-    previousMissingFluxDriveHashes = new Set();
-    log.error(`FluxDrive inventory reconciliation failed: ${getErrorMessage(error)}`);
+    log.error(`FluxDrive reconciliation recovery failed: ${getErrorMessage(error)}`);
     return {
-      scanned: 0, missing: 0, reconciled: 0, skipped: true,
+      candidates: 0, recovered: 0, unavailable: 0, skipped: true,
     };
   } finally {
     fluxDriveReconciliationRunning = false;
@@ -1643,6 +1696,9 @@ async function init() {
   dbCli = await DBClient.createClient();
   await dbCli.checkSchema();
   await logFluxDriveStoredSize();
+  setTimeout(async () => {
+    await reconcileFluxDriveInventory();
+  }, 30 * 1000);
   setInterval(async () => {
     await updateQueue();
   }, 20 * 1000);

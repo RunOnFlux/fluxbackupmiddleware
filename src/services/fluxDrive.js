@@ -133,12 +133,6 @@ function parseFileInventory(response) {
   return { success: true, hashes };
 }
 
-function isRemovalResponseSuccessful(response) {
-  return response?.status === 'success'
-    || response?.success === true
-    || response?.removed === true;
-}
-
 /**
  * Retrieves the status from the FluxDrive server.
  *
@@ -225,30 +219,16 @@ async function getFileInventory() {
 }
 
 /**
- * Removes a file and verifies whether it is already absent when removal fails.
- * A failed inventory lookup never counts as successful removal.
+ * Removes a file from FluxDrive.
+ *
+ * The list endpoint is paginated/capped and therefore cannot prove that a hash
+ * is absent. Only an explicit successful removal response is authoritative.
  *
  * @param {string} hash - FluxDrive file hash
- * @returns {Promise<Object>} - Successful, already-absent, or retryable failure result
+ * @returns {Promise<Object>} - FluxDrive removal result
  */
 async function removeFileVerified(hash) {
-  const removeResult = await removeFile(hash);
-  if (isRemovalResponseSuccessful(removeResult)) return removeResult;
-
-  const inventory = await getFileInventory();
-  if (inventory.success && !inventory.hashes.has(hash)) {
-    log.info(`FluxDrive file ${hash} is already absent; treating removal as successful`);
-    return {
-      status: 'success',
-      success: true,
-      alreadyAbsent: true,
-    };
-  }
-
-  if (!inventory.success) {
-    log.warn(`Could not verify whether FluxDrive file ${hash} is absent: ${inventory.message}`);
-  }
-  return removeResult;
+  return removeFile(hash);
 }
 
 /**

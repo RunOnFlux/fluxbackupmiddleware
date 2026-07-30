@@ -18,5 +18,6 @@ module.exports = {
   HCPProjectID: process.env.HCP_PROJECT_ID,
   HCPAppID: process.env.HCP_APP_ID,
   discordWebhookUrl: process.env.DISCORD_WEBHOOK_URL,
+  ipfsGatewayUrl: process.env.IPFS_GATEWAY_URL || 'https://jetpack2_38080.app.runonflux.io/ipfs',
   version: '1.0.0',
 };
