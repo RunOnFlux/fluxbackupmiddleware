@@ -7,6 +7,14 @@ module.exports = {
   dbhost: '127.0.0.1',
   maxConcurrentTasks: 10,
   quotaPerUser: 50, // GB
+  automaticBackupSchedule: {
+    standardIntervalHours: 7 * 24,
+    marketplaceIntervalHours: 24,
+  },
+  marketplaceCatalog: {
+    url: 'https://api.marketplace.runonflux.io/api/v1/marketplace/apps',
+    cacheHours: 24,
+  },
   storagePath: './tmp/',
   hostAPIPath: '/',
   fluxTeamZelId: '1hjy4bCYBJr4mny4zCE85J94RXa8W6q37',

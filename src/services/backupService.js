@@ -11,6 +11,7 @@ const messageHelper = require('./utils/messageHelper');
 const fileManager = require('./fileService');
 const fluxDrive = require('./fluxDrive');
 const fluxOS = require('./fluxOsService');
+const marketplaceService = require('./marketplaceService');
 const Vault = require('./Vault');
 const discordNotifier = require('./discordNotifier');
 const {
@@ -488,14 +489,21 @@ async function syncSyncthingApps() {
       return;
     }
 
+    const marketplaceTemplates = await marketplaceService.getMarketplaceTemplates();
+    const marketplaceClassificationAvailable = Array.isArray(marketplaceTemplates)
+      && marketplaceTemplates.length > 0;
+    if (!marketplaceClassificationAvailable) {
+      log.warn('Marketplace classification unavailable; unchecked apps will be retried during the next sync');
+    }
+
     // Get all apps currently in automatic_backups table
-    const existingApps = await dbCli.execute('SELECT appname, expire_counter FROM automatic_backups');
-    const existingAppNames = new Map(existingApps.map((app) => [app.appname, app.expire_counter]));
+    const existingApps = await dbCli.execute('SELECT appname, expire_counter, is_marketplace FROM automatic_backups');
+    const existingAppsByName = new Map(existingApps.map((app) => [app.appname, app]));
 
     // Check for new apps to add
     const newAppsToAdd = [];
     syncthingApps.forEach((app) => {
-      if (!existingAppNames.has(app.appName)) {
+      if (!existingAppsByName.has(app.appName)) {
         newAppsToAdd.push(app);
       }
     });
@@ -504,16 +512,39 @@ async function syncSyncthingApps() {
     for (let i = 0; i < newAppsToAdd.length; i += 1) {
       const app = newAppsToAdd[i];
       const componentsJson = JSON.stringify(app.componentNames);
-      const query = `INSERT INTO automatic_backups (appname, components, status, expire_counter, last_backup_timestamp)
-                     VALUES (?, ?, 'pending', 0, 0)`;
-      await dbCli.execute(query, [app.appName, componentsJson]);
-      log.info(`Added new app ${app.appName} to automatic_backups`);
+      const isMarketplace = marketplaceClassificationAvailable
+        ? Number(marketplaceService.matchesMarketplaceRepotags(app.repotags, marketplaceTemplates))
+        : null;
+      const query = `INSERT INTO automatic_backups (
+        appname, components, status, expire_counter, last_backup_timestamp, is_marketplace
+      ) VALUES (?, ?, 'pending', 0, 0, ?)`;
+      await dbCli.execute(query, [app.appName, componentsJson, isMarketplace]);
+      log.info(`Added new app ${app.appName} to automatic_backups (marketplace=${isMarketplace === null ? 'unchecked' : Boolean(isMarketplace)})`);
+    }
+
+    let classifiedExistingApps = 0;
+    if (marketplaceClassificationAvailable) {
+      for (let i = 0; i < syncthingApps.length; i += 1) {
+        const app = syncthingApps[i];
+        const existingApp = existingAppsByName.get(app.appName);
+        if (existingApp && existingApp.is_marketplace === null) {
+          const isMarketplace = Number(
+            marketplaceService.matchesMarketplaceRepotags(app.repotags, marketplaceTemplates),
+          );
+          await dbCli.execute(
+            'UPDATE automatic_backups SET is_marketplace = ? WHERE appname = ? AND is_marketplace IS NULL',
+            [isMarketplace, app.appName],
+          );
+          classifiedExistingApps += 1;
+          log.info(`Classified existing app ${app.appName} as marketplace=${Boolean(isMarketplace)}`);
+        }
+      }
     }
 
     // Check for expired apps (in DB but not in current syncthing list)
     const currentAppNames = new Set(syncthingApps.map((app) => app.appName));
     const expiredApps = [];
-    existingAppNames.forEach((expireCounter, appName) => {
+    existingAppsByName.forEach((existingApp, appName) => {
       if (!currentAppNames.has(appName)) {
         expiredApps.push(appName);
       }
@@ -527,7 +558,7 @@ async function syncSyncthingApps() {
       log.info(`Incremented expire_counter for expired app ${appName}`);
     }
 
-    log.info(`Sync complete. Added ${newAppsToAdd.length} new apps, marked ${expiredApps.length} as expired.`);
+    log.info(`Sync complete. Added ${newAppsToAdd.length} new apps, classified ${classifiedExistingApps} existing apps, marked ${expiredApps.length} as expired.`);
   } catch (error) {
     log.error('Error syncing Syncthing apps:', error);
   }
@@ -1289,14 +1320,36 @@ async function processAutomaticBackup() {
   let lastFailure = null;
 
   try {
-    // Calculate timestamp for 7 days ago
-    const sevenDaysAgo = Date.now() - (7 * 24 * 60 * 60 * 1000);
+    const now = Date.now();
+    const standardIntervalMs = config.automaticBackupSchedule.standardIntervalHours
+      * 60 * 60 * 1000;
+    const marketplaceIntervalMs = config.automaticBackupSchedule.marketplaceIntervalHours
+      * 60 * 60 * 1000;
+    const standardCutoff = now - standardIntervalMs;
+    const marketplaceCutoff = now - marketplaceIntervalMs;
 
-    // Fetch first item from automatic_backups table with lowest last_backup_timestamp.
-    // Only include records where last_backup_timestamp is older than 7 days (failing apps are retried after this window).
+    // Marketplace apps and standard apps use independent config-driven schedules.
+    // Unchecked apps use the standard interval until classification succeeds.
     const backups = await dbCli.execute(
-      'SELECT * FROM automatic_backups WHERE status != ? AND last_backup_timestamp < ? ORDER BY last_backup_timestamp ASC LIMIT 1',
-      ['cancelled', sevenDaysAgo],
+      `SELECT *
+       FROM automatic_backups
+       WHERE status != ?
+       AND (
+         (is_marketplace = 1 AND last_backup_timestamp < ?)
+         OR ((is_marketplace = 0 OR is_marketplace IS NULL) AND last_backup_timestamp < ?)
+       )
+       ORDER BY CASE
+         WHEN is_marketplace = 1 THEN last_backup_timestamp + ?
+         ELSE last_backup_timestamp + ?
+       END ASC
+       LIMIT 1`,
+      [
+        'cancelled',
+        marketplaceCutoff,
+        standardCutoff,
+        marketplaceIntervalMs,
+        standardIntervalMs,
+      ],
     );
 
     if (backups.length === 0) {
@@ -1306,7 +1359,12 @@ async function processAutomaticBackup() {
 
     // eslint-disable-next-line prefer-destructuring
     automaticBackup = backups[0];
-    const { id, appname, components } = automaticBackup;
+    const {
+      id, appname, components, is_marketplace: isMarketplace,
+    } = automaticBackup;
+    const scheduleHours = Number(isMarketplace) === 1
+      ? config.automaticBackupSchedule.marketplaceIntervalHours
+      : config.automaticBackupSchedule.standardIntervalHours;
 
     const isExpired = await fluxOS.isAppExpiredInGlobalSpecs(appname);
     if (isExpired === true) {
@@ -1358,10 +1416,10 @@ async function processAutomaticBackup() {
     );
 
     if (automaticBackup.status === 'failing') {
-      log.info(`Retrying automatic backup for ${appname} after previous failure (7-day window elapsed)`);
+      log.info(`Retrying automatic backup for ${appname} after previous failure (${scheduleHours}-hour window elapsed)`);
     }
 
-    log.info(`Processing automatic backup for app: ${appname}`);
+    log.info(`Processing automatic backup for app: ${appname} (marketplace=${Number(isMarketplace) === 1}, intervalHours=${scheduleHours})`);
 
     // Retry loop for node operations
     while (retryCount < maxRetries) {

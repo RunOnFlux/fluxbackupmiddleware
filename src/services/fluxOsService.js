@@ -399,7 +399,8 @@ async function isAppExpiredInGlobalSpecs(appname) {
  *
  * @async
  * @returns {Promise<Array|false>} - A promise that resolves to an array of apps with Syncthing components,
- * or false if the request fails. Each app object contains appName and componentNames.
+ * or false if the request fails. Each app object contains appName, componentNames,
+ * and ordered repotags for Marketplace classification.
  */
 async function getAppsWithSyncthing() {
   try {

@@ -40,6 +40,11 @@ function getComponentNamesFromSpec(spec) {
   return [];
 }
 
+function getRepotagsFromSpec(spec) {
+  if (!spec || !Array.isArray(spec.compose)) return [];
+  return spec.compose.map((component) => component?.repotag || '');
+}
+
 function hasSyncthingInSpec(spec) {
   if (!spec) return false;
 
@@ -190,6 +195,7 @@ function buildSyncthingAppEntry(spec) {
   return {
     appName: spec.name,
     componentNames: syncthingInfo.componentNames,
+    repotags: getRepotagsFromSpec(spec),
   };
 }
 
@@ -288,6 +294,7 @@ module.exports = {
   isEnterpriseApp,
   isSyncthingContainerData,
   getComponentNamesFromSpec,
+  getRepotagsFromSpec,
   hasSyncthingInSpec,
   getSyncthingAppInfo,
   buildSyncthingAppEntry,

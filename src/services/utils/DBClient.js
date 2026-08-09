@@ -323,10 +323,30 @@ class DBClient {
         status varchar(64),
         expire_counter int DEFAULT '0',
         last_backup_timestamp bigint unsigned DEFAULT '0',
+        is_marketplace tinyint DEFAULT NULL,
         PRIMARY KEY (\`id\`),
         UNIQUE KEY \`appname_unique\` (\`appname\`))ENGINE=InnoDB;`);
     } else {
       log.info('automatic_backups table already exists, moving on...');
+    }
+
+    const marketplaceColumnCheck = await this.query(`
+      SELECT COLUMN_NAME
+      FROM INFORMATION_SCHEMA.COLUMNS
+      WHERE TABLE_SCHEMA = '${this.InitDB}'
+      AND TABLE_NAME = 'automatic_backups'
+      AND COLUMN_NAME = 'is_marketplace'
+    `);
+
+    if (marketplaceColumnCheck.length === 0) {
+      log.info('Adding is_marketplace column to automatic_backups table...');
+      await this.query(`
+        ALTER TABLE automatic_backups
+        ADD COLUMN is_marketplace TINYINT DEFAULT NULL AFTER last_backup_timestamp
+      `);
+      log.info('is_marketplace column added successfully');
+    } else {
+      log.info('is_marketplace column already exists, moving on...');
     }
 
     // Check if backup_type column exists in tasks table, if not add it
