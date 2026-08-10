@@ -6,8 +6,15 @@ module.exports = {
   dbPort: 3306,
   dbhost: '127.0.0.1',
   maxConcurrentTasks: 10,
-  quotaPerUser: 20, // GB
-  maxFilesPerApp: 20,
+  quotaPerUser: 50, // GB
+  automaticBackupSchedule: {
+    standardIntervalHours: 7 * 24,
+    marketplaceIntervalHours: 24,
+  },
+  marketplaceCatalog: {
+    url: 'https://api.marketplace.runonflux.io/api/v1/marketplace/apps',
+    cacheHours: 24,
+  },
   storagePath: './tmp/',
   hostAPIPath: '/',
   fluxTeamZelId: '1hjy4bCYBJr4mny4zCE85J94RXa8W6q37',
@@ -18,5 +25,6 @@ module.exports = {
   HCPProjectID: process.env.HCP_PROJECT_ID,
   HCPAppID: process.env.HCP_APP_ID,
   discordWebhookUrl: process.env.DISCORD_WEBHOOK_URL,
+  ipfsGatewayUrl: process.env.IPFS_GATEWAY_URL || 'https://jetpack2_38080.app.runonflux.io/ipfs',
   version: '1.0.0',
 };

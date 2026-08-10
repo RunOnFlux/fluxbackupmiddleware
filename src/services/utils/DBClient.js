@@ -172,7 +172,7 @@ class DBClient {
   */
   async softRemoveTask(id) {
     if (!this.connected) await this.init();
-    const result = await this.execute('UPDATE tasks set removedFromFluxdrive = 1, uploaded = 0 where taskId = ?', [id]);
+    const result = await this.execute('UPDATE tasks set removedFromFluxdrive = 1, uploaded = 0, reconciliationRecovered = 1 where taskId = ?', [id]);
     return result;
   }
 
@@ -191,13 +191,13 @@ class DBClient {
       fields += `${key},`;
       values += '?,';
       if (key === 'status') {
-        const statusValue = task[key];
-        if (typeof statusValue === 'string') {
-          params.push(statusValue);
-        } else {
-          const sanitizedStatus = sanitizeStatus(statusValue);
-          params.push(JSON.stringify(sanitizedStatus));
-        }
+        const statusValue = task[key];
+        if (typeof statusValue === 'string') {
+          params.push(statusValue);
+        } else {
+          const sanitizedStatus = sanitizeStatus(statusValue);
+          params.push(JSON.stringify(sanitizedStatus));
+        }
       } else {
         params.push(task[key]);
       }
@@ -296,6 +296,7 @@ class DBClient {
         localRemoved tinyint DEFAULT '0',
         remoteRemoved tinyint DEFAULT '0',
         removedFromFluxdrive tinyint DEFAULT '0',
+        reconciliationRecovered tinyint DEFAULT '0',
         fails tinyint DEFAULT '0',
         host varchar(256),
         hash varchar(256),
@@ -322,10 +323,30 @@ class DBClient {
         status varchar(64),
         expire_counter int DEFAULT '0',
         last_backup_timestamp bigint unsigned DEFAULT '0',
+        is_marketplace tinyint DEFAULT NULL,
         PRIMARY KEY (\`id\`),
         UNIQUE KEY \`appname_unique\` (\`appname\`))ENGINE=InnoDB;`);
     } else {
       log.info('automatic_backups table already exists, moving on...');
+    }
+
+    const marketplaceColumnCheck = await this.query(`
+      SELECT COLUMN_NAME
+      FROM INFORMATION_SCHEMA.COLUMNS
+      WHERE TABLE_SCHEMA = '${this.InitDB}'
+      AND TABLE_NAME = 'automatic_backups'
+      AND COLUMN_NAME = 'is_marketplace'
+    `);
+
+    if (marketplaceColumnCheck.length === 0) {
+      log.info('Adding is_marketplace column to automatic_backups table...');
+      await this.query(`
+        ALTER TABLE automatic_backups
+        ADD COLUMN is_marketplace TINYINT DEFAULT NULL AFTER last_backup_timestamp
+      `);
+      log.info('is_marketplace column added successfully');
+    } else {
+      log.info('is_marketplace column already exists, moving on...');
     }
 
     // Check if backup_type column exists in tasks table, if not add it
@@ -346,6 +367,25 @@ class DBClient {
       log.info('backup_type column added successfully');
     } else {
       log.info('backup_type column already exists, moving on...');
+    }
+
+    const reconciliationRecoveredColumnCheck = await this.query(`
+      SELECT COLUMN_NAME
+      FROM INFORMATION_SCHEMA.COLUMNS
+      WHERE TABLE_SCHEMA = '${this.InitDB}'
+      AND TABLE_NAME = 'tasks'
+      AND COLUMN_NAME = 'reconciliationRecovered'
+    `);
+
+    if (reconciliationRecoveredColumnCheck.length === 0) {
+      log.info('Adding reconciliationRecovered column to tasks table...');
+      await this.query(`
+        ALTER TABLE tasks
+        ADD COLUMN reconciliationRecovered TINYINT DEFAULT '0' AFTER removedFromFluxdrive
+      `);
+      log.info('reconciliationRecovered column added successfully');
+    } else {
+      log.info('reconciliationRecovered column already exists, moving on...');
     }
 
     // Add index on backup_type for faster queries
