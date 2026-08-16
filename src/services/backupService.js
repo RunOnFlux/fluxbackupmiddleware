@@ -1677,10 +1677,10 @@ async function init() {
   // Run initial sync
   await syncSyncthingApps();
 
-  // Process automatic backups every 15 minutes
+  // Start the next due automatic backup at the configured dispatcher interval.
   setInterval(async () => {
     await processAutomaticBackup();
-  }, 15 * 60 * 1000); // Run every 15 minutes
+  }, config.automaticBackupSchedule.dispatcherIntervalMinutes * 60 * 1000);
 
   // Periodic cleanup of incomplete automatic-backup artifacts
   setInterval(async () => {

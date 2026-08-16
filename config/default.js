@@ -10,6 +10,7 @@ module.exports = {
   automaticBackupSchedule: {
     standardIntervalHours: 7 * 24,
     marketplaceIntervalHours: 24,
+    dispatcherIntervalMinutes: 2,
   },
   marketplaceCatalog: {
     url: 'https://api.marketplace.runonflux.io/api/v1/marketplace/apps',
