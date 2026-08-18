@@ -1,9 +1,37 @@
 /* eslint-disable no-unused-vars */
 const mySql = require('mysql2/promise');
-const net = require('net');
 const config = require('../../../config/default');
 const log = require('../../lib/log');
 const Vault = require('../Vault');
+
+const RETRYABLE_READ_ERROR_CODES = new Set([
+  'ECONNRESET',
+  'EPIPE',
+  'ETIMEDOUT',
+  'PROTOCOL_CONNECTION_LOST',
+  'PROTOCOL_ENQUEUE_AFTER_FATAL_ERROR',
+]);
+
+function summarizeSql(sql) {
+  return String(sql).replace(/\s+/g, ' ').trim().slice(0, 180);
+}
+
+function isReadOnlySql(sql) {
+  return /^(SELECT|SHOW|DESCRIBE|DESC|EXPLAIN|WITH)\b/i.test(String(sql).trim());
+}
+
+function withTimeout(operation, timeoutMs, sqlSummary) {
+  let timeoutId;
+  const timeout = new Promise((resolve, reject) => {
+    timeoutId = setTimeout(() => {
+      const error = new Error(`Database operation timed out after ${timeoutMs}ms`);
+      error.code = 'DB_OPERATION_TIMEOUT';
+      error.sqlSummary = sqlSummary;
+      reject(error);
+    }, timeoutMs);
+  });
+  return Promise.race([operation, timeout]).finally(() => clearTimeout(timeoutId));
+}
 
 /**
  * Sanitizes status object to ensure it doesn't exceed database column limit.
@@ -27,52 +55,129 @@ function sanitizeStatus(status) {
 
 class DBClient {
   constructor() {
-    this.connection = {};
+    this.connection = null;
     this.connected = false;
     this.InitDB = 'backup';
-    this.stream = null;
     this.dbPass = null;
+    this.initPromise = null;
   }
 
   /**
   * [init]
   */
-  async createStream() {
-    this.stream = net.connect({
-      host: config.dbHost,
+  async createPool() {
+    this.dbPass = await Vault.getKey('dbpass');
+    const host = config.dbHost || config.dbhost || '127.0.0.1';
+    const baseOptions = {
+      host,
       port: config.dbPort,
+      user: config.dbUser,
+      password: this.dbPass,
+      connectTimeout: config.dbConnectTimeoutMs,
+      enableKeepAlive: true,
+      keepAliveInitialDelay: 0,
+    };
+
+    // Ensure a clean installation can create the database before the pool selects it.
+    const bootstrapConnection = await mySql.createConnection(baseOptions);
+    try {
+      await withTimeout(
+        bootstrapConnection.query({
+          sql: `CREATE DATABASE IF NOT EXISTS \`${this.InitDB}\``,
+          timeout: config.dbQueryTimeoutMs,
+        }),
+        config.dbOperationTimeoutMs,
+        `CREATE DATABASE IF NOT EXISTS ${this.InitDB}`,
+      );
+    } finally {
+      await bootstrapConnection.end();
+    }
+
+    const pool = mySql.createPool({
+      ...baseOptions,
+      database: this.InitDB,
+      waitForConnections: true,
+      connectionLimit: config.dbConnectionLimit,
+      maxIdle: config.dbConnectionLimit,
+      idleTimeout: 60000,
+      queueLimit: 100,
     });
-    const { stream } = this;
-    return new Promise((resolve, reject) => {
-      stream.once('connect', () => {
-        stream.removeListener('error', reject);
-        resolve(stream);
-      });
-      stream.once('error', (err) => {
-        stream.removeListener('connection', resolve);
-        stream.removeListener('data', resolve);
-        console.log('error creating stream.');
-        reject(err);
+
+    pool.on('connection', (connection) => {
+      log.info(`[DB] pooled connection established: threadId=${connection.threadId || 'unknown'}`);
+      connection.on('error', (error) => {
+        log.warn(`[DB] pooled connection error: code=${error.code || 'unknown'}, message=${error.message}`);
       });
     });
+    pool.on('enqueue', () => {
+      log.warn('[DB] connection pool is saturated; database operation queued');
+    });
+
+    try {
+      await withTimeout(
+        pool.query({ sql: 'SELECT 1', timeout: config.dbQueryTimeoutMs }),
+        config.dbOperationTimeoutMs,
+        'SELECT 1',
+      );
+    } catch (error) {
+      await pool.end();
+      throw error;
+    }
+    this.connection = pool;
+    this.connected = true;
+    log.info(`[DB] connection pool ready: host=${host}, database=${this.InitDB}, limit=${config.dbConnectionLimit}`);
   }
 
   /**
   * [init]
   */
   async init() {
-    this.dbPass = await Vault.getKey('dbpass');
-    await this.createStream();
-    this.connection = await mySql.createConnection({
-      password: this.dbPass,
-      user: config.dbUser,
-      stream: this.stream,
-    });
-    this.connection.once('error', () => {
-      this.connected = false;
-      log.info(`Connecten to ${this.InitDB} DB was lost`);
-    });
-    this.connected = true;
+    if (this.connected && this.connection) return;
+    if (!this.initPromise) {
+      this.initPromise = this.createPool().finally(() => {
+        this.initPromise = null;
+      });
+    }
+    await this.initPromise;
+  }
+
+  async runStatement(method, sql, params = []) {
+    await this.init();
+    const sqlSummary = summarizeSql(sql);
+    const readOnly = isReadOnlySql(sql);
+    const maxAttempts = readOnly ? 2 : 1;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      const startedAt = Date.now();
+      try {
+        const options = { sql, timeout: config.dbQueryTimeoutMs };
+        const operation = method === 'execute'
+          ? this.connection.execute(options, params)
+          : this.connection.query(options);
+        // Retries are intentionally sequential so a stale read is attempted only once more.
+        // eslint-disable-next-line no-await-in-loop
+        const [rows] = await withTimeout(
+          operation,
+          config.dbOperationTimeoutMs,
+          sqlSummary,
+        );
+        const durationMs = Date.now() - startedAt;
+        if (durationMs >= config.dbSlowQueryMs) {
+          log.warn(`[DB] slow ${method}: durationMs=${durationMs}, attempt=${attempt}, sql="${sqlSummary}"`);
+        }
+        return rows;
+      } catch (error) {
+        const durationMs = Date.now() - startedAt;
+        const code = error.code || 'unknown';
+        const willRetry = readOnly
+          && attempt < maxAttempts
+          && RETRYABLE_READ_ERROR_CODES.has(code);
+        log.error(`[DB] ${method} failed: durationMs=${durationMs}, attempt=${attempt}/${maxAttempts}, code=${code}, retry=${willRetry}, sql="${sqlSummary}", message=${error.message}`);
+        if (!willRetry) throw error;
+      }
+    }
+
+    throw new Error(`Database ${method} failed without a result`);
   }
 
   /**
@@ -80,19 +185,7 @@ class DBClient {
   * @param {string} query [description]
   */
   async query(query) {
-    try {
-      if (!this.connected) {
-        log.info(`Connecten to ${this.InitDB} DB was lost, reconnecting...`);
-        await this.init();
-        this.setDB(this.InitDB);
-      }
-      const [rows, err] = await this.connection.query(query);
-      if (err && err.toString().includes('Error')) log.error(`Error running query: ${err.toString()}, ${query}`);
-      return rows;
-    } catch (err) {
-      if (err && err.toString().includes('Error')) log.error(`Error running query: ${err.toString()}, ${query}`);
-      return [null, null, err];
-    }
+    return this.runStatement('query', query);
   }
 
   /**
@@ -101,18 +194,7 @@ class DBClient {
   * @param {array} params [description]
   */
   async execute(query, params) {
-    try {
-      if (!this.connected) {
-        await this.init();
-        this.setDB(this.InitDB);
-      }
-      const [rows, fields, err] = await this.connection.execute(query, params);
-      if (err && err.toString().includes('Error')) log.error(`Error executing query: ${err.toString()}`);
-      return rows;
-    } catch (err) {
-      if (err && err.toString().includes('Error')) log.error(`Error executing query: ${err.toString()}`);
-      return [null, null, err];
-    }
+    return this.runStatement('execute', query, params);
   }
 
   /**
@@ -120,11 +202,7 @@ class DBClient {
   * @param {string} dbName [description]
   */
   async createDB(dbName) {
-    try {
-      await this.query(`CREATE DATABASE IF NOT EXISTS ${dbName}`);
-    } catch (err) {
-      log.info(`DB ${dbName} exists`);
-    }
+    return this.query(`CREATE DATABASE IF NOT EXISTS ${dbName}`);
   }
 
   /**
@@ -132,13 +210,10 @@ class DBClient {
   * @param {string} dbName [description]
   */
   async setDB(dbName) {
-    this.connection.changeUser({
-      database: dbName,
-    }, (err) => {
-      if (err) {
-        console.log('Error changing database');
-      }
-    });
+    if (dbName !== this.InitDB) {
+      throw new Error(`Database pool is configured for ${this.InitDB}, not ${dbName}`);
+    }
+    await this.init();
   }
 
   /**
@@ -417,7 +492,9 @@ exports.createClient = async function () {
     await cl.init();
     return cl;
   } catch (err) {
-    log.info(JSON.stringify(err));
-    return null;
+    log.error(`[DB] client initialization failed: code=${err.code || 'unknown'}, message=${err.message}`);
+    throw err;
   }
 };
+
+exports.DBClient = DBClient;

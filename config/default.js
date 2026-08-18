@@ -5,6 +5,11 @@ module.exports = {
   dbUser: 'root',
   dbPort: 3306,
   dbhost: '127.0.0.1',
+  dbConnectionLimit: 10,
+  dbConnectTimeoutMs: 10000,
+  dbQueryTimeoutMs: 15000,
+  dbOperationTimeoutMs: 20000,
+  dbSlowQueryMs: 2000,
   maxConcurrentTasks: 10,
   quotaPerUser: 50, // GB
   automaticBackupSchedule: {
