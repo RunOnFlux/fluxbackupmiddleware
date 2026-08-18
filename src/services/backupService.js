@@ -741,6 +741,14 @@ async function registerBackupTask(req, res, taskObj = null) {
 async function getBackupList(req, res) {
   let { appname } = req.body;
   appname = appname || req.query.appname;
+  const requestStartedAt = Date.now();
+  const suppliedRequestId = String(req.headers['x-request-id'] || '');
+  const requestId = /^[A-Za-z0-9._-]{1,80}$/.test(suppliedRequestId)
+    ? suppliedRequestId
+    : `backup-list-${requestStartedAt}-${Math.random().toString(36).slice(2, 10)}`;
+  let stage = 'session_validation';
+  res.setHeader('X-Request-ID', requestId);
+  log.info(`[getbackuplist:${requestId}] request started: app=${appname || 'missing'}`);
 
   try {
     // validate session
@@ -755,6 +763,7 @@ async function getBackupList(req, res) {
     if (!await fluxOS.verifyAppOwner(owner, appname)) {
       throw new Error('Unauthorized. Access denied.');
     }
+    stage = 'owner_resolution';
 
     // If owner is fluxteam, get the real app owner for backup retrieval
     let backupOwner = owner;
@@ -767,7 +776,14 @@ async function getBackupList(req, res) {
       }
     }
 
+    stage = 'database_query';
+    const queryStartedAt = Date.now();
+    log.info(`[getbackuplist:${requestId}] database query started: app=${appname}`);
     const result = await dbCli.getUserBackups(backupOwner, appname);
+    const queryDurationMs = Date.now() - queryStartedAt;
+    const resultCount = Array.isArray(result) ? result.length : 0;
+    log.info(`[getbackuplist:${requestId}] database query completed: app=${appname}, rows=${resultCount}, durationMs=${queryDurationMs}`);
+    stage = 'response_build';
     const checkpoints = [];
     if (Array.isArray(result)) {
       const temp = {};
@@ -784,11 +800,15 @@ async function getBackupList(req, res) {
       }
       checkpoints.push({ timestamp: result[i - 1].timestamp, components: temp[result[i - 1].timestamp].components });
     }
+    stage = 'response_send';
     res.json({ status: 'success', checkpoints });
+    log.info(`[getbackuplist:${requestId}] response sent: app=${appname}, checkpoints=${checkpoints.length}, durationMs=${Date.now() - requestStartedAt}`);
   } catch (error) {
-    log.error(error);
+    log.error(`[getbackuplist:${requestId}] request failed: app=${appname || 'missing'}, stage=${stage}, durationMs=${Date.now() - requestStartedAt}, code=${error.code || 'unknown'}, message=${error.message}`);
     const errMessage = messageHelper.createErrorMessage(error.message, error.name, error.code);
-    res.json(errMessage);
+    if (!res.headersSent) {
+      res.json(errMessage);
+    }
   }
 }
 
@@ -1677,10 +1697,10 @@ async function init() {
   // Run initial sync
   await syncSyncthingApps();
 
-  // Process automatic backups every 15 minutes
+  // Start the next due automatic backup at the configured dispatcher interval.
   setInterval(async () => {
     await processAutomaticBackup();
-  }, 15 * 60 * 1000); // Run every 15 minutes
+  }, config.automaticBackupSchedule.dispatcherIntervalMinutes * 60 * 1000);
 
   // Periodic cleanup of incomplete automatic-backup artifacts
   setInterval(async () => {
