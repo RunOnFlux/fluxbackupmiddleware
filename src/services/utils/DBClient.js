@@ -424,6 +424,17 @@ class DBClient {
       log.info('is_marketplace column already exists, moving on...');
     }
 
+    await this.query(`CREATE TABLE IF NOT EXISTS enterprise_app_discovery (
+      appname varchar(128) NOT NULL,
+      spec_hash varchar(128) NOT NULL,
+      has_syncthing tinyint NOT NULL DEFAULT '0',
+      components JSON,
+      repotags JSON,
+      checked_at bigint unsigned NOT NULL,
+      PRIMARY KEY (\`appname\`),
+      KEY \`spec_hash_idx\` (\`spec_hash\`)
+    )ENGINE=InnoDB;`);
+
     // Check if backup_type column exists in tasks table, if not add it
     const backupTypeColumnCheck = await this.query(`
       SELECT COLUMN_NAME

@@ -12,6 +12,7 @@ const fileManager = require('./fileService');
 const fluxDrive = require('./fluxDrive');
 const fluxOS = require('./fluxOsService');
 const marketplaceService = require('./marketplaceService');
+const enterpriseDiscoveryCache = require('./utils/enterpriseDiscoveryCache');
 const Vault = require('./Vault');
 const discordNotifier = require('./discordNotifier');
 const {
@@ -481,12 +482,54 @@ async function syncSyncthingApps() {
   try {
     log.info('Syncing Syncthing apps with automatic_backups table...');
 
-    // Get all apps with Syncthing
-    const syncthingApps = await fluxOS.getAppsWithSyncthing();
+    const existingApps = await dbCli.execute(
+      'SELECT appname, components, expire_counter, is_marketplace FROM automatic_backups',
+    );
+    const existingAppsByName = new Map(existingApps.map((app) => [app.appname, app]));
+    const cacheRows = await dbCli.execute(`
+      SELECT appname, spec_hash, has_syncthing, components, repotags
+      FROM enterprise_app_discovery
+    `);
+    const cacheByName = enterpriseDiscoveryCache.normalizeCacheRows(cacheRows);
+    const discovery = await fluxOS.discoverAppsWithSyncthing(cacheByName, existingAppsByName);
 
-    if (!syncthingApps) {
+    if (!discovery) {
       log.error('Failed to fetch apps with Syncthing');
       return;
+    }
+    const syncthingApps = discovery.apps;
+
+    for (let i = 0; i < discovery.cacheUpdates.length; i += 1) {
+      const update = discovery.cacheUpdates[i];
+      await dbCli.execute(`
+        INSERT INTO enterprise_app_discovery (
+          appname, spec_hash, has_syncthing, components, repotags, checked_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        ON DUPLICATE KEY UPDATE
+          spec_hash = VALUES(spec_hash),
+          has_syncthing = VALUES(has_syncthing),
+          components = VALUES(components),
+          repotags = VALUES(repotags),
+          checked_at = VALUES(checked_at)
+      `, [
+        update.appname,
+        update.specHash,
+        Number(update.hasSyncthing),
+        JSON.stringify(update.componentNames),
+        JSON.stringify(update.repotags),
+        Date.now(),
+      ]);
+    }
+
+    const currentEnterpriseNames = discovery.currentEnterpriseAppNames.filter(Boolean);
+    if (currentEnterpriseNames.length === 0) {
+      await dbCli.execute('DELETE FROM enterprise_app_discovery');
+    } else {
+      const placeholders = currentEnterpriseNames.map(() => '?').join(', ');
+      await dbCli.execute(
+        `DELETE FROM enterprise_app_discovery WHERE appname NOT IN (${placeholders})`,
+        currentEnterpriseNames,
+      );
     }
 
     const marketplaceTemplates = await marketplaceService.getMarketplaceTemplates();
@@ -495,10 +538,6 @@ async function syncSyncthingApps() {
     if (!marketplaceClassificationAvailable) {
       log.warn('Marketplace classification unavailable; unchecked apps will be retried during the next sync');
     }
-
-    // Get all apps currently in automatic_backups table
-    const existingApps = await dbCli.execute('SELECT appname, expire_counter, is_marketplace FROM automatic_backups');
-    const existingAppsByName = new Map(existingApps.map((app) => [app.appname, app]));
 
     // Check for new apps to add
     const newAppsToAdd = [];
@@ -545,7 +584,8 @@ async function syncSyncthingApps() {
     const currentAppNames = new Set(syncthingApps.map((app) => app.appName));
     const expiredApps = [];
     existingAppsByName.forEach((existingApp, appName) => {
-      if (!currentAppNames.has(appName)) {
+      if (!currentAppNames.has(appName)
+        && !discovery.unresolvedEnterpriseAppNames.has(appName)) {
         expiredApps.push(appName);
       }
     });
@@ -1694,8 +1734,7 @@ async function init() {
   setInterval(async () => {
     await syncSyncthingApps();
   }, 24 * 60 * 60 * 1000); // Run every 24 hours
-  // Run initial sync
-  await syncSyncthingApps();
+  log.info('Syncthing app sync scheduled every 24 hours; startup sync skipped');
 
   // Start the next due automatic backup at the configured dispatcher interval.
   setInterval(async () => {

@@ -8,6 +8,7 @@
     "test:concurrent-downloads": "node scripts/test-concurrent-task-downloads.js",
     "test:db-client-resilience": "node scripts/test-db-client-resilience.js",
     "test:enterprise-syncthing": "node scripts/test-enterprise-syncthing.js",
+    "test:enterprise-discovery-cache": "node scripts/test-enterprise-discovery-cache.js",
     "test:fluxdrive-inventory": "node scripts/test-fluxdrive-inventory.js",
     "test:marketplace-classification": "node scripts/test-marketplace-classification.js",
     "test:quota-retention": "node scripts/test-quota-retention.js",

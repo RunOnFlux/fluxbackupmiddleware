@@ -9,6 +9,7 @@ const bitcoinMessage = require('bitcoinjs-message');
 const log = require('../lib/log');
 const Vault = require('./Vault');
 const enterpriseCrypto = require('./enterpriseCrypto');
+const enterpriseDiscoveryCache = require('./utils/enterpriseDiscoveryCache');
 
 // Create HTTPS agent that accepts insecure connections
 const httpsAgent = new https.Agent({
@@ -398,11 +399,12 @@ async function isAppExpiredInGlobalSpecs(appname) {
  * on ArcaneOS nodes before checking containerData prefixes s:, r:, or g:.
  *
  * @async
- * @returns {Promise<Array|false>} - A promise that resolves to an array of apps with Syncthing components,
- * or false if the request fails. Each app object contains appName, componentNames,
- * and ordered repotags for Marketplace classification.
+ * @returns {Promise<Object|false>} Discovery results and cache changes, or false on fetch failure.
  */
-async function getAppsWithSyncthing() {
+async function discoverAppsWithSyncthing(
+  cacheByName = new Map(),
+  knownAppsByName = new Map(),
+) {
   try {
     const result = await axios({
       method: 'get',
@@ -418,9 +420,16 @@ async function getAppsWithSyncthing() {
 
     const allApps = result.data.data;
     const appsWithSyncthing = [];
+    const cacheUpdates = [];
+    const unresolvedEnterpriseAppNames = new Set();
 
     const plainApps = allApps.filter((app) => !enterpriseCrypto.isEnterpriseApp(app));
     const enterpriseApps = allApps.filter((app) => enterpriseCrypto.isEnterpriseApp(app));
+    const currentEnterpriseAppNames = enterpriseApps.map((app) => app.name);
+    const enterpriseAppsToDecrypt = [];
+    let cacheHits = 0;
+    let bootstrapHits = 0;
+    let decryptFailures = 0;
 
     plainApps.forEach((app) => {
       const entry = enterpriseCrypto.buildSyncthingAppEntry(app);
@@ -429,59 +438,101 @@ async function getAppsWithSyncthing() {
       }
     });
 
-    if (enterpriseApps.length > 0) {
+    enterpriseApps.forEach((app) => {
+      const reusable = enterpriseDiscoveryCache.getReusableDiscovery(
+        app,
+        cacheByName,
+        knownAppsByName,
+      );
+      if (!reusable) {
+        enterpriseAppsToDecrypt.push(app);
+        return;
+      }
+      if (reusable.source === 'cache') cacheHits += 1;
+      if (reusable.source === 'bootstrap') bootstrapHits += 1;
+      if (reusable.entry) appsWithSyncthing.push(reusable.entry);
+      if (reusable.cacheUpdate) cacheUpdates.push(reusable.cacheUpdate);
+    });
+
+    if (enterpriseAppsToDecrypt.length > 0) {
       const teamFluxID = await Vault.getKey('teamFluxID');
       const teamPK = await Vault.getKey('teamPK');
 
       if (!teamFluxID || !teamPK) {
         log.error('teamFluxID and teamPK are required to decrypt enterprise apps');
-        return appsWithSyncthing;
-      }
-
-      let arcaneSessions = [];
-      try {
-        arcaneSessions = await enterpriseCrypto.createArcaneNodeSessions(
-          teamFluxID,
-          teamPK,
-          enterpriseCrypto.ARCANE_NODE_RETRY_COUNT,
-        );
-        log.info(
-          `Decrypting ${enterpriseApps.length} enterprise apps using ArcaneOS nodes: ${arcaneSessions.map((s) => s.nodeBase).join(', ')}`,
-        );
-      } catch (error) {
-        log.error('Failed to prepare ArcaneOS node sessions for enterprise decryption:', error.message);
-        return appsWithSyncthing;
-      }
-
-      for (let i = 0; i < enterpriseApps.length; i += 1) {
-        const app = enterpriseApps[i];
+        enterpriseAppsToDecrypt.forEach((app) => unresolvedEnterpriseAppNames.add(app.name));
+        decryptFailures = enterpriseAppsToDecrypt.length;
+      } else {
+        let arcaneSessions = [];
         try {
-          const decryptedFields = await enterpriseCrypto.decryptEnterpriseSpecWithRetry(
-            app,
-            arcaneSessions,
+          arcaneSessions = await enterpriseCrypto.createArcaneNodeSessions(
+            teamFluxID,
+            teamPK,
+            enterpriseCrypto.ARCANE_NODE_RETRY_COUNT,
           );
-          const decryptedSpec = {
-            ...app,
-            compose: decryptedFields.compose || [],
-            contacts: decryptedFields.contacts || [],
-          };
-          const entry = enterpriseCrypto.buildSyncthingAppEntry(decryptedSpec);
-          if (entry) {
-            appsWithSyncthing.push(entry);
-            log.info(`Enterprise Syncthing app discovered: ${entry.appName}`);
-          }
+          log.info(`Decrypting ${enterpriseAppsToDecrypt.length} new or changed enterprise apps`);
         } catch (error) {
-          log.warn(`Failed to decrypt enterprise app ${app.name} after ArcaneOS retries: ${error.message}`);
+          log.error('Failed to prepare ArcaneOS node sessions for enterprise decryption:', error.message);
+          enterpriseAppsToDecrypt.forEach((app) => unresolvedEnterpriseAppNames.add(app.name));
+          decryptFailures = enterpriseAppsToDecrypt.length;
+        }
+
+        if (arcaneSessions.length === 0 && decryptFailures === 0) {
+          log.error('ArcaneOS session discovery returned no usable sessions');
+          enterpriseAppsToDecrypt.forEach((app) => unresolvedEnterpriseAppNames.add(app.name));
+          decryptFailures = enterpriseAppsToDecrypt.length;
+        } else if (arcaneSessions.length > 0) {
+          for (let i = 0; i < enterpriseAppsToDecrypt.length; i += 1) {
+            const app = enterpriseAppsToDecrypt[i];
+            try {
+              const decryptedFields = await enterpriseCrypto.decryptEnterpriseSpecWithRetry(
+                app,
+                arcaneSessions,
+              );
+              const decryptedSpec = {
+                ...app,
+                compose: decryptedFields.compose || [],
+                contacts: decryptedFields.contacts || [],
+              };
+              const entry = enterpriseCrypto.buildSyncthingAppEntry(decryptedSpec);
+              if (entry) appsWithSyncthing.push(entry);
+              const cacheUpdate = enterpriseDiscoveryCache.buildCacheUpdate(app, entry);
+              if (cacheUpdate) cacheUpdates.push(cacheUpdate);
+            } catch (error) {
+              decryptFailures += 1;
+              unresolvedEnterpriseAppNames.add(app.name);
+              log.warn(`Failed to decrypt enterprise app ${app.name} after ArcaneOS retries: ${error.message}`);
+            }
+          }
         }
       }
     }
 
-    log.info(`Found ${appsWithSyncthing.length} apps with Syncthing (${plainApps.length} plain, ${enterpriseApps.length} enterprise checked)`);
-    return appsWithSyncthing;
+    const discoverySummary = [
+      `found=${appsWithSyncthing.length}`,
+      `plainSpecs=${plainApps.length}`,
+      `enterpriseSpecs=${enterpriseApps.length}`,
+      `cacheHits=${cacheHits}`,
+      `bootstrapped=${bootstrapHits}`,
+      `decrypted=${enterpriseAppsToDecrypt.length - decryptFailures}`,
+      `decryptFailures=${decryptFailures}`,
+    ].join(', ');
+    log.info(`Syncthing discovery complete: ${discoverySummary}`);
+    return {
+      apps: appsWithSyncthing,
+      cacheUpdates,
+      currentEnterpriseAppNames,
+      unresolvedEnterpriseAppNames,
+    };
   } catch (e) {
     log.error('Failed to fetch global app specifications', e);
     return false;
   }
+}
+
+async function getAppsWithSyncthing() {
+  const discovery = await discoverAppsWithSyncthing();
+  return discovery ? discovery.apps : false;
 }
 
 /**
@@ -722,6 +773,7 @@ module.exports = {
   getAppOwner,
   getAppExpireHeight,
   verifyLogin,
+  discoverAppsWithSyncthing,
   getAppsWithSyncthing,
   isAppExpiredInGlobalSpecs,
   getSecondaryNodeFromHAProxy,
