@@ -17,6 +17,11 @@ module.exports = {
     marketplaceIntervalHours: 24,
     dispatcherIntervalMinutes: 2,
   },
+  dailyBackupReport: {
+    hourUtc: 0,
+    minuteUtc: 5,
+    startupDelaySeconds: 60,
+  },
   marketplaceCatalog: {
     url: 'https://api.marketplace.runonflux.io/api/v1/marketplace/apps',
     cacheHours: 24,

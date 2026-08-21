@@ -16,6 +16,22 @@ function truncate(content, max = DISCORD_CONTENT_LIMIT) {
   return `${content.slice(0, max - 3)}...`;
 }
 
+async function sendDiscordContent(content, description) {
+  const webhookUrl = await getWebhookUrl();
+  if (!webhookUrl) {
+    log.warn(`Discord webhook URL not configured; skipping ${description}`);
+    return false;
+  }
+  try {
+    await axios.post(webhookUrl, { content: truncate(content) }, { timeout: 10000 });
+    log.info(`Discord ${description} sent`);
+    return true;
+  } catch (error) {
+    log.error(`Failed to send Discord ${description}:`, error);
+    return false;
+  }
+}
+
 function sanitizeDiagnosticText(value, max = 300) {
   if (value === null || typeof value === 'undefined') return '';
   const sanitized = String(value)
@@ -138,12 +154,6 @@ async function notifyAutomaticBackupFailure({
   retryCount,
   maxRetries,
 }) {
-  const webhookUrl = await getWebhookUrl();
-  if (!webhookUrl) {
-    log.warn('Discord webhook URL not configured; skipping automatic backup failure notification');
-    return false;
-  }
-
   const lines = [
     '**Automatic backup failed**',
     `**App:** ${sanitizeDiagnosticText(appname, 128)}`,
@@ -167,18 +177,19 @@ async function notifyAutomaticBackupFailure({
     lines.push(taskFailureLines);
   }
 
-  try {
-    await axios.post(webhookUrl, { content: truncate(lines.join('\n')) }, { timeout: 10000 });
-    log.info(`Discord notification sent for automatic backup failure (${appname})`);
-    return true;
-  } catch (error) {
-    log.error('Failed to send Discord notification:', error);
-    return false;
-  }
+  return sendDiscordContent(
+    lines.join('\n'),
+    `automatic backup failure notification (${appname})`,
+  );
+}
+
+async function sendDailyBackupReport(content, reportDate) {
+  return sendDiscordContent(content, `daily backup report (${reportDate})`);
 }
 
 module.exports = {
   formatDiagnostic,
   formatFailureAttempts,
   notifyAutomaticBackupFailure,
+  sendDailyBackupReport,
 };

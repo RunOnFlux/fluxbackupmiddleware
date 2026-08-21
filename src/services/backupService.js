@@ -15,6 +15,7 @@ const marketplaceService = require('./marketplaceService');
 const enterpriseDiscoveryCache = require('./utils/enterpriseDiscoveryCache');
 const Vault = require('./Vault');
 const discordNotifier = require('./discordNotifier');
+const dailyBackupReport = require('./utils/dailyBackupReport');
 const {
   extractReconciledTasks,
   isRecoverableTask,
@@ -30,6 +31,258 @@ const taskQueue = new Map();
 const userQuotaOperations = new Map();
 const TASK_MAX_FAILURES = 4;
 let fluxDriveReconciliationRunning = false;
+
+function getErrorMessage(error) {
+  if (error instanceof Error) return error.message;
+  if (typeof error === 'string') return error;
+  if (error === null || error === undefined) return String(error);
+  if (typeof error === 'object') {
+    if (typeof error.message === 'string' && error.message.length > 0) {
+      return error.message;
+    }
+    try {
+      return JSON.stringify(error);
+    } catch {
+      return String(error);
+    }
+  }
+  return String(error);
+}
+
+async function recordBackupActivity(event) {
+  try {
+    await dbCli.execute(`
+      INSERT IGNORE INTO backup_activity_events (
+        event_key, event_kind, backup_type, appname, batch_key, task_id,
+        outcome, file_count, filesize, stage, reason, occurred_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `, [
+      event.eventKey,
+      event.eventKind,
+      event.backupType,
+      event.appname,
+      event.batchKey,
+      event.taskId || null,
+      event.outcome,
+      event.fileCount || 0,
+      event.filesize || 0,
+      event.stage || null,
+      event.reason ? String(event.reason).slice(0, 512) : null,
+      event.occurredAt || Date.now(),
+    ]);
+  } catch (error) {
+    log.error(`Failed to record backup activity ${event.eventKey}: ${getErrorMessage(error)}`);
+  }
+}
+
+async function recordTaskActivity(task, outcome, stage, reason) {
+  await recordBackupActivity({
+    eventKey: `task:${task.taskId}`,
+    eventKind: 'file',
+    backupType: task.backup_type || 'manual',
+    appname: task.appname,
+    batchKey: `${task.backup_type || 'manual'}:${task.appname}:${task.timestamp}`,
+    taskId: task.taskId,
+    outcome,
+    fileCount: outcome === 'success' ? 1 : 0,
+    filesize: outcome === 'success' ? Number(task.filesize) || 0 : 0,
+    stage,
+    reason,
+  });
+}
+
+async function recordAutomaticRunActivity({
+  automaticBackup,
+  runStartedAt,
+  batchKey,
+  outcome,
+  fileCount = 0,
+  filesize = 0,
+  stage,
+  reason,
+}) {
+  if (!automaticBackup || !runStartedAt) return;
+  await recordBackupActivity({
+    eventKey: `automatic-run:${automaticBackup.id}:${runStartedAt}`,
+    eventKind: 'run',
+    backupType: 'automatic',
+    appname: automaticBackup.appname,
+    batchKey: batchKey || `automatic:${automaticBackup.appname}:${runStartedAt}`,
+    outcome,
+    fileCount,
+    filesize,
+    stage,
+    reason,
+  });
+}
+
+function emptyReportMetric() {
+  return {
+    total: 0, successful: 0, failed: 0, successBytes: 0,
+  };
+}
+
+async function backfillTerminalTaskActivity(period) {
+  await dbCli.execute(`
+    INSERT IGNORE INTO backup_activity_events (
+      event_key, event_kind, backup_type, appname, batch_key, task_id,
+      outcome, file_count, filesize, stage, reason, occurred_at
+    )
+    SELECT
+      CONCAT('task:', taskId),
+      'file',
+      COALESCE(backup_type, 'manual'),
+      appname,
+      CONCAT(COALESCE(backup_type, 'manual'), ':', appname, ':', timestamp),
+      taskId,
+      CASE WHEN status LIKE '%"state":"finished"%' THEN 'success' ELSE 'failed' END,
+      CASE WHEN status LIKE '%"state":"finished"%' THEN 1 ELSE 0 END,
+      CASE WHEN status LIKE '%"state":"finished"%' THEN COALESCE(filesize, 0) ELSE 0 END,
+      CASE WHEN status LIKE '%"state":"finished"%' THEN 'completed' ELSE 'task_pipeline' END,
+      LEFT(status, 512),
+      CASE WHEN finishTime > 0 THEN finishTime * 1000 ELSE startTime * 1000 END
+    FROM tasks
+    WHERE (
+      (finishTime > 0 AND finishTime * 1000 >= ? AND finishTime * 1000 < ?)
+      OR (finishTime = 0 AND fails >= ? AND startTime * 1000 >= ? AND startTime * 1000 < ?)
+    )
+  `, [period.start, period.end, TASK_MAX_FAILURES, period.start, period.end]);
+}
+
+async function collectDailyBackupMetrics(period) {
+  await backfillTerminalTaskActivity(period);
+  const aggregateRows = await dbCli.execute(`
+    SELECT backup_type, event_kind, outcome, COUNT(*) AS event_count,
+      COALESCE(SUM(filesize), 0) AS total_size
+    FROM backup_activity_events
+    WHERE occurred_at >= ? AND occurred_at < ?
+    GROUP BY backup_type, event_kind, outcome
+  `, [period.start, period.end]);
+
+  const automaticRuns = emptyReportMetric();
+  const automaticFiles = emptyReportMetric();
+  const manualFiles = emptyReportMetric();
+  aggregateRows.forEach((row) => {
+    const count = Number(row.event_count) || 0;
+    const bytes = Number(row.total_size) || 0;
+    let target = null;
+    if (row.backup_type === 'automatic' && row.event_kind === 'file') {
+      target = automaticFiles;
+    } else if (row.backup_type === 'manual' && row.event_kind === 'file') {
+      target = manualFiles;
+    }
+    if (!target) return;
+    target.total += count;
+    if (row.outcome === 'success') {
+      target.successful += count;
+      target.successBytes += bytes;
+    } else if (row.outcome === 'failed') {
+      target.failed += count;
+    }
+  });
+
+  const batchRows = await dbCli.execute(`
+    SELECT backup_type, batch_key,
+      SUM(event_kind = 'run' AND outcome = 'success') AS successful_runs,
+      SUM(event_kind = 'run' AND outcome = 'failed') AS failed_runs,
+      SUM(event_kind = 'file' AND outcome = 'success') AS successful_files,
+      SUM(event_kind = 'file' AND outcome = 'failed') AS failed_files
+    FROM backup_activity_events
+    WHERE occurred_at >= ? AND occurred_at < ?
+    GROUP BY backup_type, batch_key
+  `, [period.start, period.end]);
+  const manualRuns = emptyReportMetric();
+  batchRows.forEach((row) => {
+    const target = row.backup_type === 'automatic' ? automaticRuns : manualRuns;
+    const failed = Number(row.failed_runs) > 0 || Number(row.failed_files) > 0;
+    const successful = Number(row.successful_runs) > 0 || Number(row.successful_files) > 0;
+    if (!failed && !successful) return;
+    target.total += 1;
+    if (failed) target.failed += 1;
+    else target.successful += 1;
+  });
+
+  return {
+    automaticRuns,
+    automaticFiles,
+    manualRuns,
+    manualFiles,
+  };
+}
+
+async function claimDailyBackupReport(reportDate) {
+  const now = Date.now();
+  const insertResult = await dbCli.execute(`
+    INSERT IGNORE INTO daily_backup_reports (report_date, status, reserved_at)
+    VALUES (?, 'sending', ?)
+  `, [reportDate, now]);
+  if (insertResult.affectedRows === 1) return true;
+
+  const reclaimResult = await dbCli.execute(`
+    UPDATE daily_backup_reports
+    SET reserved_at = ?
+    WHERE report_date = ? AND status = 'sending' AND reserved_at < ?
+  `, [now, reportDate, now - (60 * 60 * 1000)]);
+  return reclaimResult.affectedRows === 1;
+}
+
+async function sendDailyBackupReport(period = dailyBackupReport.getPreviousUtcPeriod()) {
+  let claimed = false;
+  try {
+    claimed = await claimDailyBackupReport(period.reportDate);
+    if (!claimed) return null;
+
+    const metrics = await collectDailyBackupMetrics(period);
+    const content = dailyBackupReport.buildDailyReportContent({
+      reportDate: period.reportDate,
+      ...metrics,
+    });
+    const sent = await discordNotifier.sendDailyBackupReport(content, period.reportDate);
+    if (!sent) {
+      await dbCli.execute(
+        "DELETE FROM daily_backup_reports WHERE report_date = ? AND status = 'sending'",
+        [period.reportDate],
+      );
+      return false;
+    }
+    await dbCli.execute(`
+      UPDATE daily_backup_reports SET status = 'sent', sent_at = ? WHERE report_date = ?
+    `, [Date.now(), period.reportDate]);
+    return true;
+  } catch (error) {
+    log.error(`Daily backup report failed for ${period.reportDate}: ${getErrorMessage(error)}`);
+    if (claimed) {
+      try {
+        await dbCli.execute(
+          "DELETE FROM daily_backup_reports WHERE report_date = ? AND status = 'sending'",
+          [period.reportDate],
+        );
+      } catch (releaseError) {
+        log.error(`Failed to release daily report claim: ${getErrorMessage(releaseError)}`);
+      }
+    }
+    return false;
+  }
+}
+
+function scheduleNextDailyBackupReport() {
+  const reportConfig = config.dailyBackupReport;
+  const delay = dailyBackupReport.getMillisecondsUntilNextReport(
+    new Date(),
+    reportConfig.hourUtc,
+    reportConfig.minuteUtc,
+  );
+  setTimeout(async () => {
+    const period = dailyBackupReport.getPreviousUtcPeriod();
+    const sent = await sendDailyBackupReport(period);
+    if (sent === false) {
+      setTimeout(async () => {
+        await sendDailyBackupReport(period);
+      }, 60 * 60 * 1000);
+    }
+    scheduleNextDailyBackupReport();
+  }, delay);
+}
 
 function getQuotaLimitBytes() {
   return config.quotaPerUser * 1024 * 1024 * 1024;
@@ -49,23 +302,6 @@ async function getUserStorageUsed(owner) {
     return Number(totalUsed[0].totalUsed);
   }
   return 0;
-}
-
-function getErrorMessage(error) {
-  if (error instanceof Error) return error.message;
-  if (typeof error === 'string') return error;
-  if (error === null || error === undefined) return String(error);
-  if (typeof error === 'object') {
-    if (typeof error.message === 'string' && error.message.length > 0) {
-      return error.message;
-    }
-    try {
-      return JSON.stringify(error);
-    } catch {
-      return String(error);
-    }
-  }
-  return String(error);
 }
 
 async function logFluxDriveStoredSize() {
@@ -234,6 +470,12 @@ async function cancelTaskDueToQuota(task, taskId, filesize) {
     }
   }
   await dbCli.updateTask(cancelledTask);
+  await recordTaskActivity(
+    cancelledTask,
+    'failed',
+    'quota',
+    cancelledTask.status.message,
+  );
   taskQueue.delete(Number(taskId));
 }
 
@@ -395,6 +637,7 @@ async function runTask(id) {
     task.finishTime = Math.floor(Date.now() / 1000);
     task.extra = '';
     await dbCli.updateTask(task);
+    await recordTaskActivity(task, 'success', 'completed', 'finished');
     taskQueue.delete(id);
   } catch (error) {
     const message = getErrorMessage(error);
@@ -406,6 +649,9 @@ async function runTask(id) {
     }
     task.fails += 1;
     await dbCli.updateTask(task);
+    if (task.fails >= TASK_MAX_FAILURES) {
+      await recordTaskActivity(task, 'failed', task.status?.state || 'task_pipeline', message);
+    }
     taskQueue.delete(id);
     log.error(`task ${id} failed:`, error instanceof Error ? error : message);
   }
@@ -1410,6 +1656,8 @@ async function processAutomaticBackup() {
   let automaticBackup = null;
   let lastFailure = null;
   const failureAttempts = [];
+  let automaticRunStartedAt = null;
+  let automaticRunBatchKey = null;
 
   try {
     const now = Date.now();
@@ -1454,6 +1702,7 @@ async function processAutomaticBackup() {
     const {
       id, appname, components, is_marketplace: isMarketplace,
     } = automaticBackup;
+    automaticRunStartedAt = Date.now();
     const scheduleHours = Number(isMarketplace) === 1
       ? config.automaticBackupSchedule.marketplaceIntervalHours
       : config.automaticBackupSchedule.standardIntervalHours;
@@ -1636,6 +1885,10 @@ async function processAutomaticBackup() {
           }
         }
 
+        if (backupTimestamp) {
+          automaticRunBatchKey = `automatic:${appname}:${backupTimestamp}`;
+        }
+
         registrationFailures.forEach((failure) => {
           attemptDiagnostics.push({
             check: `Backup registration (${failure.component})`,
@@ -1699,6 +1952,22 @@ async function processAutomaticBackup() {
             [backupTasksJson, 'done', id],
           );
 
+          const [completedStats] = await dbCli.execute(
+            `SELECT COUNT(*) AS file_count, COALESCE(SUM(filesize), 0) AS total_size
+             FROM tasks WHERE taskId IN (${taskIds.map(() => '?').join(', ')})`,
+            taskIds,
+          );
+          await recordAutomaticRunActivity({
+            automaticBackup,
+            runStartedAt: automaticRunStartedAt,
+            batchKey: automaticRunBatchKey,
+            outcome: 'success',
+            fileCount: Number(completedStats?.file_count) || taskIds.length,
+            filesize: Number(completedStats?.total_size) || 0,
+            stage: 'completed',
+            reason: 'All component tasks completed successfully',
+          });
+
           log.info(`Successfully processed automatic backup for ${appname}. Created ${taskIds.length} tasks.`);
           return true;
         }
@@ -1761,6 +2030,14 @@ async function processAutomaticBackup() {
     );
 
     log.error(`All retries failed for automatic backup ${appname}. Status set to failing.`, lastFailure?.reason);
+    await recordAutomaticRunActivity({
+      automaticBackup,
+      runStartedAt: automaticRunStartedAt,
+      batchKey: automaticRunBatchKey,
+      outcome: 'failed',
+      stage: lastFailure?.stage || 'automatic_backup',
+      reason: lastFailure?.reason || 'All retries exhausted',
+    });
     await discordNotifier.notifyAutomaticBackupFailure({
       appname,
       stage: lastFailure?.stage || 'automatic_backup',
@@ -1784,6 +2061,15 @@ async function processAutomaticBackup() {
       } catch (updateError) {
         log.error('Failed to update status to failing:', updateError.message);
       }
+
+      await recordAutomaticRunActivity({
+        automaticBackup,
+        runStartedAt: automaticRunStartedAt || Date.now(),
+        batchKey: automaticRunBatchKey,
+        outcome: 'failed',
+        stage: inferFailureStage(error),
+        reason: getErrorMessage(error),
+      });
 
       await discordNotifier.notifyAutomaticBackupFailure({
         appname: automaticBackup.appname,
@@ -1831,6 +2117,18 @@ async function init() {
   }, 24 * 60 * 60 * 1000); // Run every 24 hours
   log.info('Syncthing app sync scheduled every 24 hours; startup sync skipped');
 
+  setTimeout(async () => {
+    const period = dailyBackupReport.getPreviousUtcPeriod();
+    const sent = await sendDailyBackupReport(period);
+    if (sent === false) {
+      setTimeout(async () => {
+        await sendDailyBackupReport(period);
+      }, 60 * 60 * 1000);
+    }
+  }, config.dailyBackupReport.startupDelaySeconds * 1000);
+  scheduleNextDailyBackupReport();
+  log.info(`Daily Discord backup report scheduled for ${String(config.dailyBackupReport.hourUtc).padStart(2, '0')}:${String(config.dailyBackupReport.minuteUtc).padStart(2, '0')} UTC`);
+
   // Start the next due automatic backup at the configured dispatcher interval.
   setInterval(async () => {
     await processAutomaticBackup();
@@ -1854,4 +2152,5 @@ module.exports = {
   waitForTasksToComplete,
   cleanupOldAutomaticBackups,
   reconcileFluxDriveInventory,
+  sendDailyBackupReport,
 };

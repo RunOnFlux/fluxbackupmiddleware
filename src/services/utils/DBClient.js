@@ -435,6 +435,32 @@ class DBClient {
       KEY \`spec_hash_idx\` (\`spec_hash\`)
     )ENGINE=InnoDB;`);
 
+    await this.query(`CREATE TABLE IF NOT EXISTS backup_activity_events (
+      event_key varchar(191) NOT NULL,
+      event_kind varchar(16) NOT NULL,
+      backup_type varchar(32) NOT NULL,
+      appname varchar(128) NOT NULL,
+      batch_key varchar(191) NOT NULL,
+      task_id bigint unsigned DEFAULT NULL,
+      outcome varchar(16) NOT NULL,
+      file_count int unsigned NOT NULL DEFAULT '0',
+      filesize bigint unsigned NOT NULL DEFAULT '0',
+      stage varchar(64) DEFAULT NULL,
+      reason varchar(512) DEFAULT NULL,
+      occurred_at bigint unsigned NOT NULL,
+      PRIMARY KEY (\`event_key\`),
+      KEY \`activity_period_idx\` (\`occurred_at\`,\`backup_type\`,\`event_kind\`),
+      KEY \`activity_batch_idx\` (\`batch_key\`)
+    )ENGINE=InnoDB;`);
+
+    await this.query(`CREATE TABLE IF NOT EXISTS daily_backup_reports (
+      report_date date NOT NULL,
+      status varchar(16) NOT NULL DEFAULT 'sending',
+      reserved_at bigint unsigned NOT NULL,
+      sent_at bigint unsigned DEFAULT NULL,
+      PRIMARY KEY (\`report_date\`)
+    )ENGINE=InnoDB;`);
+
     // Check if backup_type column exists in tasks table, if not add it
     const backupTypeColumnCheck = await this.query(`
       SELECT COLUMN_NAME

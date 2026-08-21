@@ -7,6 +7,7 @@
     "test": "node server.js",
     "test:concurrent-downloads": "node scripts/test-concurrent-task-downloads.js",
     "test:db-client-resilience": "node scripts/test-db-client-resilience.js",
+    "test:daily-backup-report": "node scripts/test-daily-backup-report.js",
     "test:discord-failure-diagnostics": "node scripts/test-discord-failure-diagnostics.js",
     "test:enterprise-syncthing": "node scripts/test-enterprise-syncthing.js",
     "test:enterprise-discovery-cache": "node scripts/test-enterprise-discovery-cache.js",
