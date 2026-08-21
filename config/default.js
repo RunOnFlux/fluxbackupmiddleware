@@ -16,6 +16,7 @@ module.exports = {
     standardIntervalHours: 7 * 24,
     marketplaceIntervalHours: 24,
     dispatcherIntervalMinutes: 2,
+    maxConcurrentAutomaticBackups: 3,
     dispatcherLeaseMinutes: 6 * 60,
     discordFailureCooldownMinutes: 60,
   },

@@ -107,12 +107,12 @@ async function main() {
     dispatcherRuns += 1;
     await new Promise((resolve) => { releaseDispatcher = resolve; });
     return true;
-  });
+  }, 1);
   assert.strictEqual(
     await testHooks.runAutomaticBackupDispatcher(async () => {
       dispatcherRuns += 1;
       return true;
-    }),
+    }, 1),
     false,
   );
   assert.strictEqual(dispatcherRuns, 1);
@@ -122,10 +122,24 @@ async function main() {
     await testHooks.runAutomaticBackupDispatcher(async () => {
       dispatcherRuns += 1;
       return true;
-    }),
+    }, 1),
     true,
   );
   assert.strictEqual(dispatcherRuns, 2);
+
+  const concurrentReleases = [];
+  const concurrentRuns = [1, 2, 3].map(() => testHooks.runAutomaticBackupDispatcher(
+    async () => new Promise((resolve) => { concurrentReleases.push(resolve); }),
+    3,
+  ));
+  await new Promise((resolve) => { setImmediate(resolve); });
+  assert.strictEqual(concurrentReleases.length, 3);
+  assert.strictEqual(
+    await testHooks.runAutomaticBackupDispatcher(async () => true, 3),
+    false,
+  );
+  concurrentReleases.forEach((release) => { release(true); });
+  assert.deepStrictEqual(await Promise.all(concurrentRuns), [true, true, true]);
 
   assert.strictEqual(testHooks.inferFailureStage(timeout), 'database');
   assert.strictEqual(

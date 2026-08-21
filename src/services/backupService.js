@@ -32,7 +32,7 @@ const taskQueue = new Map();
 const userQuotaOperations = new Map();
 const TASK_MAX_FAILURES = 4;
 let fluxDriveReconciliationRunning = false;
-let automaticBackupDispatcherRunning = false;
+let activeAutomaticBackupDispatchers = 0;
 const automaticFailureNotifications = new Map();
 
 function getErrorMessage(error) {
@@ -2371,16 +2371,20 @@ async function processAutomaticBackupInternal() {
   }
 }
 
-async function runAutomaticBackupDispatcher(operation) {
-  if (automaticBackupDispatcherRunning) {
-    log.warn('Skipping automatic backup dispatcher tick because the previous run is still active');
+async function runAutomaticBackupDispatcher(
+  operation,
+  maxConcurrent = config.automaticBackupSchedule.maxConcurrentAutomaticBackups,
+) {
+  const concurrencyLimit = Math.max(1, Number(maxConcurrent) || 1);
+  if (activeAutomaticBackupDispatchers >= concurrencyLimit) {
+    log.warn(`Skipping automatic backup dispatcher tick because all ${concurrencyLimit} slots are active`);
     return false;
   }
-  automaticBackupDispatcherRunning = true;
+  activeAutomaticBackupDispatchers += 1;
   try {
     return await operation();
   } finally {
-    automaticBackupDispatcherRunning = false;
+    activeAutomaticBackupDispatchers -= 1;
   }
 }
 
