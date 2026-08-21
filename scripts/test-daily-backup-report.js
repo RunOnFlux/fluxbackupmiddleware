@@ -68,10 +68,11 @@ const content = dailyBackupReport.buildDailyReportContent({
 });
 
 assert(content.includes('**Period:** 2026-08-20 00:00–24:00 UTC'));
-assert(content.includes('Backups: 3 total — 2 successful, 1 failed'));
-assert(content.includes('Backups: 2 total — 1 successful, 1 failed'));
+assert(content.includes('Backup batches: 3 total — 2 successful, 1 failed'));
+assert(content.includes('Backup batches: 2 total — 1 successful, 1 failed'));
+assert(content.includes('Component files: 5 total — 4 successful, 1 failed'));
 assert(content.includes('Successful size: 5.00 MiB'));
-assert(content.includes('- 5 successful, 2 failed'));
+assert(content.includes('- 7 total — 5 successful, 2 failed'));
 assert(content.includes('Successful size: 5.00 MiB'));
 
 console.log('daily backup report tests passed');

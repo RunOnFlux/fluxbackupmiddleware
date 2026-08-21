@@ -59,8 +59,8 @@ function formatBytes(bytes) {
 function formatCategory(label, runs, files) {
   return [
     `**${label}**`,
-    `- Backups: ${runs.total} total — ${runs.successful} successful, ${runs.failed} failed`,
-    `- Files: ${files.successful} successful, ${files.failed} failed`,
+    `- Backup batches: ${runs.total} total — ${runs.successful} successful, ${runs.failed} failed`,
+    `- Component files: ${files.total} total — ${files.successful} successful, ${files.failed} failed`,
     `- Successful size: ${formatBytes(files.successBytes)}`,
   ];
 }
@@ -75,6 +75,7 @@ function buildDailyReportContent({
 }) {
   const totalSuccessfulFiles = automaticFiles.successful + manualFiles.successful;
   const totalFailedFiles = automaticFiles.failed + manualFiles.failed;
+  const totalFiles = automaticFiles.total + manualFiles.total;
   const totalBytes = automaticFiles.successBytes + manualFiles.successBytes;
   return [
     '**Daily backup report**',
@@ -85,7 +86,7 @@ function buildDailyReportContent({
     ...formatCategory('Manual', manualRuns, manualFiles),
     '',
     '**Combined files**',
-    `- ${totalSuccessfulFiles} successful, ${totalFailedFiles} failed`,
+    `- ${totalFiles} total — ${totalSuccessfulFiles} successful, ${totalFailedFiles} failed`,
     `- Successful size: ${formatBytes(totalBytes)}`,
   ].join('\n');
 }

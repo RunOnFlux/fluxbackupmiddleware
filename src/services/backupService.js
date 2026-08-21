@@ -2,6 +2,7 @@
 /* eslint-disable no-undef */
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const axios = require('axios');
 const DBClient = require('./utils/DBClient');
 const log = require('../lib/log');
@@ -31,6 +32,8 @@ const taskQueue = new Map();
 const userQuotaOperations = new Map();
 const TASK_MAX_FAILURES = 4;
 let fluxDriveReconciliationRunning = false;
+let automaticBackupDispatcherRunning = false;
+const automaticFailureNotifications = new Map();
 
 function getErrorMessage(error) {
   if (error instanceof Error) return error.message;
@@ -131,9 +134,12 @@ async function backfillTerminalTaskActivity(period) {
     SELECT
       CONCAT('task:', taskId),
       'file',
-      COALESCE(backup_type, 'manual'),
+      CASE WHEN backup_type LIKE 'automatic%' THEN 'automatic' ELSE 'manual' END,
       appname,
-      CONCAT(COALESCE(backup_type, 'manual'), ':', appname, ':', timestamp),
+      CONCAT(
+        CASE WHEN backup_type LIKE 'automatic%' THEN 'automatic' ELSE 'manual' END,
+        ':', appname, ':', timestamp
+      ),
       taskId,
       CASE WHEN status LIKE '%"state":"finished"%' THEN 'success' ELSE 'failed' END,
       CASE WHEN status LIKE '%"state":"finished"%' THEN 1 ELSE 0 END,
@@ -152,11 +158,13 @@ async function backfillTerminalTaskActivity(period) {
 async function collectDailyBackupMetrics(period) {
   await backfillTerminalTaskActivity(period);
   const aggregateRows = await dbCli.execute(`
-    SELECT backup_type, event_kind, outcome, COUNT(*) AS event_count,
+    SELECT
+      CASE WHEN backup_type LIKE 'automatic%' THEN 'automatic' ELSE 'manual' END AS report_type,
+      event_kind, outcome, COUNT(*) AS event_count,
       COALESCE(SUM(filesize), 0) AS total_size
     FROM backup_activity_events
     WHERE occurred_at >= ? AND occurred_at < ?
-    GROUP BY backup_type, event_kind, outcome
+    GROUP BY report_type, event_kind, outcome
   `, [period.start, period.end]);
 
   const automaticRuns = emptyReportMetric();
@@ -166,9 +174,9 @@ async function collectDailyBackupMetrics(period) {
     const count = Number(row.event_count) || 0;
     const bytes = Number(row.total_size) || 0;
     let target = null;
-    if (row.backup_type === 'automatic' && row.event_kind === 'file') {
+    if (row.report_type === 'automatic' && row.event_kind === 'file') {
       target = automaticFiles;
-    } else if (row.backup_type === 'manual' && row.event_kind === 'file') {
+    } else if (row.report_type === 'manual' && row.event_kind === 'file') {
       target = manualFiles;
     }
     if (!target) return;
@@ -182,18 +190,20 @@ async function collectDailyBackupMetrics(period) {
   });
 
   const batchRows = await dbCli.execute(`
-    SELECT backup_type, batch_key,
+    SELECT
+      CASE WHEN backup_type LIKE 'automatic%' THEN 'automatic' ELSE 'manual' END AS report_type,
+      CONCAT(appname, ':', SUBSTRING_INDEX(batch_key, ':', -1)) AS report_batch,
       SUM(event_kind = 'run' AND outcome = 'success') AS successful_runs,
       SUM(event_kind = 'run' AND outcome = 'failed') AS failed_runs,
       SUM(event_kind = 'file' AND outcome = 'success') AS successful_files,
       SUM(event_kind = 'file' AND outcome = 'failed') AS failed_files
     FROM backup_activity_events
     WHERE occurred_at >= ? AND occurred_at < ?
-    GROUP BY backup_type, batch_key
+    GROUP BY report_type, report_batch
   `, [period.start, period.end]);
   const manualRuns = emptyReportMetric();
   batchRows.forEach((row) => {
-    const target = row.backup_type === 'automatic' ? automaticRuns : manualRuns;
+    const target = row.report_type === 'automatic' ? automaticRuns : manualRuns;
     const failed = Number(row.failed_runs) > 0 || Number(row.failed_files) > 0;
     const successful = Number(row.successful_runs) > 0 || Number(row.successful_files) > 0;
     if (!failed && !successful) return;
@@ -412,6 +422,11 @@ function inferFailureStage(error) {
   if (error.stage) return error.stage;
 
   const message = getErrorMessage(error);
+  if (
+    message.includes('Query inactivity timeout')
+    || message.includes('Database operation timed out')
+    || String(error.code || '').startsWith('ER_')
+  ) return 'database';
   if (message.includes('secondary node')) return 'node_selection';
   if (message.includes('authenticate')) return 'node_auth';
   if (message.includes('app owner')) return 'app_owner';
@@ -419,6 +434,81 @@ function inferFailureStage(error) {
   if (message.includes('Could not queue backup')) return 'create_backup';
   if (message.includes('Timeout waiting for tasks')) return 'task_timeout';
   return 'automatic_backup';
+}
+
+function buildAutomaticFailureFingerprint(payload) {
+  const stableFailure = {
+    stage: payload.stage,
+    reason: payload.reason,
+    taskFailures: (payload.taskFailures || []).map((failure) => ({
+      component: failure.component,
+      message: failure.message,
+      node: failure.node,
+      errorCode: failure.errorCode,
+      httpStatus: failure.httpStatus,
+    })),
+    attempts: (payload.failureAttempts || []).map((attempt) => ({
+      stage: attempt.stage,
+      reason: attempt.reason,
+    })),
+  };
+  return crypto.createHash('sha256').update(JSON.stringify(stableFailure)).digest('hex');
+}
+
+async function notifyAutomaticBackupFailureOnce(
+  automaticBackup,
+  payload,
+  database = dbCli,
+  notifier = discordNotifier,
+  notificationCache = automaticFailureNotifications,
+) {
+  const fingerprint = buildAutomaticFailureFingerprint(payload);
+  const now = Date.now();
+  const cooldownMs = config.automaticBackupSchedule.discordFailureCooldownMinutes
+    * 60 * 1000;
+  const cached = notificationCache.get(automaticBackup.id);
+  if (cached && cached.fingerprint === fingerprint && cached.notifiedAt >= now - cooldownMs) {
+    log.warn(`Suppressed duplicate Discord failure notification for ${automaticBackup.appname} (memory cooldown)`);
+    return false;
+  }
+
+  let databaseReservation = false;
+  try {
+    const reservation = await database.execute(`
+      UPDATE automatic_backups
+      SET last_failure_fingerprint = ?, last_failure_notified_at = ?
+      WHERE id = ? AND (
+        last_failure_fingerprint IS NULL
+        OR last_failure_fingerprint != ?
+        OR last_failure_notified_at < ?
+      )
+    `, [fingerprint, now, automaticBackup.id, fingerprint, now - cooldownMs]);
+    if (reservation.affectedRows !== 1) {
+      log.warn(`Suppressed duplicate Discord failure notification for ${automaticBackup.appname} (database cooldown)`);
+      notificationCache.set(automaticBackup.id, { fingerprint, notifiedAt: now });
+      return false;
+    }
+    databaseReservation = true;
+  } catch (error) {
+    log.error(`Could not reserve Discord failure notification for ${automaticBackup.appname}; using memory cooldown: ${getErrorMessage(error)}`);
+  }
+
+  notificationCache.set(automaticBackup.id, { fingerprint, notifiedAt: now });
+  const sent = await notifier.notifyAutomaticBackupFailure(payload);
+  if (!sent) {
+    notificationCache.delete(automaticBackup.id);
+    if (databaseReservation) {
+      try {
+        await database.execute(`
+          UPDATE automatic_backups SET last_failure_notified_at = 0
+          WHERE id = ? AND last_failure_fingerprint = ? AND last_failure_notified_at = ?
+        `, [automaticBackup.id, fingerprint, now]);
+      } catch (error) {
+        log.error(`Failed to release Discord notification reservation for ${automaticBackup.appname}: ${getErrorMessage(error)}`);
+      }
+    }
+  }
+  return sent;
 }
 
 function buildTaskFailure(task, taskId, reason) {
@@ -1714,7 +1804,140 @@ async function removeBackupFromRemoteHost(host, taskId) {
  * @async
  * @returns {Promise<boolean>} - Returns true if successful, false if failed
  */
-async function processAutomaticBackup() {
+async function claimNextAutomaticBackup(database, now, requestedToken = null) {
+  const standardIntervalMs = config.automaticBackupSchedule.standardIntervalHours
+    * 60 * 60 * 1000;
+  const marketplaceIntervalMs = config.automaticBackupSchedule.marketplaceIntervalHours
+    * 60 * 60 * 1000;
+  const standardCutoff = now - standardIntervalMs;
+  const marketplaceCutoff = now - marketplaceIntervalMs;
+  const candidates = await database.execute(
+    `SELECT *
+     FROM automatic_backups
+     WHERE status != ?
+     AND (dispatch_lease_until = 0 OR dispatch_lease_until < ?)
+     AND (
+       (is_marketplace = 1 AND last_backup_timestamp < ?)
+       OR ((is_marketplace = 0 OR is_marketplace IS NULL) AND last_backup_timestamp < ?)
+     )
+     ORDER BY CASE
+       WHEN is_marketplace = 1 THEN last_backup_timestamp + ?
+       ELSE last_backup_timestamp + ?
+     END ASC
+     LIMIT 1`,
+    [
+      'cancelled',
+      now,
+      marketplaceCutoff,
+      standardCutoff,
+      marketplaceIntervalMs,
+      standardIntervalMs,
+    ],
+  );
+  if (candidates.length === 0) return null;
+
+  const candidate = candidates[0];
+  const dispatchToken = requestedToken || crypto.randomBytes(16).toString('hex');
+  const leaseUntil = now + (
+    config.automaticBackupSchedule.dispatcherLeaseMinutes * 60 * 1000
+  );
+  try {
+    const claim = await database.execute(`
+      UPDATE automatic_backups
+      SET dispatch_token = ?, dispatch_lease_until = ?,
+        last_backup_timestamp = ?, status = 'pending'
+      WHERE id = ? AND last_backup_timestamp = ? AND status != 'cancelled'
+      AND (dispatch_lease_until = 0 OR dispatch_lease_until < ?)
+    `, [
+      dispatchToken,
+      leaseUntil,
+      now,
+      candidate.id,
+      candidate.last_backup_timestamp,
+      now,
+    ]);
+    if (claim.affectedRows !== 1) {
+      log.info(`Automatic backup claim lost for ${candidate.appname}; another dispatcher claimed it`);
+      return null;
+    }
+  } catch (error) {
+    log.error(`Automatic backup claim update failed for ${candidate.appname}: ${getErrorMessage(error)}`);
+    try {
+      const confirmation = await database.execute(
+        'SELECT id FROM automatic_backups WHERE id = ? AND dispatch_token = ?',
+        [candidate.id, dispatchToken],
+      );
+      if (confirmation.length === 0) throw error;
+      log.warn(`Automatic backup claim for ${candidate.appname} succeeded despite a timed-out acknowledgement`);
+    } catch (confirmationError) {
+      log.error(`Could not confirm automatic backup claim for ${candidate.appname}; skipping without Discord notification: ${getErrorMessage(confirmationError)}`);
+      return null;
+    }
+  }
+
+  return {
+    ...candidate,
+    dispatch_token: dispatchToken,
+    dispatch_lease_until: leaseUntil,
+    last_backup_timestamp: now,
+    status: candidate.status,
+  };
+}
+
+function backupTaskIdsMatch(storedTaskIds, expectedTaskIds) {
+  let parsed = storedTaskIds;
+  if (typeof parsed === 'string') {
+    try {
+      parsed = JSON.parse(parsed);
+    } catch (error) {
+      return false;
+    }
+  }
+  if (!Array.isArray(parsed) || parsed.length !== expectedTaskIds.length) return false;
+  return parsed.every((taskId, index) => Number(taskId) === Number(expectedTaskIds[index]));
+}
+
+async function persistAutomaticBackupCompletion(database, automaticBackup, taskIds) {
+  const backupTasksJson = JSON.stringify(taskIds);
+  let updateError = null;
+  try {
+    const result = await database.execute(
+      `UPDATE automatic_backups SET backup_tasks = ?, status = ?,
+        dispatch_token = NULL, dispatch_lease_until = 0,
+        last_failure_fingerprint = NULL, last_failure_notified_at = 0
+       WHERE id = ? AND dispatch_token = ?`,
+      [backupTasksJson, 'done', automaticBackup.id, automaticBackup.dispatch_token],
+    );
+    if (result.affectedRows === 1) return true;
+    updateError = createBackupFailure(
+      `Lost dispatch lease while marking ${automaticBackup.appname} as completed`,
+      'database',
+    );
+  } catch (error) {
+    updateError = error;
+  }
+
+  try {
+    const rows = await database.execute(
+      'SELECT status, backup_tasks, dispatch_token FROM automatic_backups WHERE id = ?',
+      [automaticBackup.id],
+    );
+    const stored = rows[0];
+    if (
+      stored?.status === 'done'
+      && !stored.dispatch_token
+      && backupTaskIdsMatch(stored.backup_tasks, taskIds)
+    ) {
+      log.warn(`Automatic backup completion for ${automaticBackup.appname} was confirmed after an ambiguous database response`);
+      return true;
+    }
+  } catch (confirmationError) {
+    log.error(`Could not confirm automatic backup completion for ${automaticBackup.appname}: ${getErrorMessage(confirmationError)}`);
+  }
+  throw updateError;
+}
+
+async function processAutomaticBackupInternal() {
   const maxRetries = 3;
   let retryCount = 0;
   let automaticBackup = null;
@@ -1725,44 +1948,12 @@ async function processAutomaticBackup() {
 
   try {
     const now = Date.now();
-    const standardIntervalMs = config.automaticBackupSchedule.standardIntervalHours
-      * 60 * 60 * 1000;
-    const marketplaceIntervalMs = config.automaticBackupSchedule.marketplaceIntervalHours
-      * 60 * 60 * 1000;
-    const standardCutoff = now - standardIntervalMs;
-    const marketplaceCutoff = now - marketplaceIntervalMs;
-
-    // Marketplace apps and standard apps use independent config-driven schedules.
-    // Unchecked apps use the standard interval until classification succeeds.
-    const backups = await dbCli.execute(
-      `SELECT *
-       FROM automatic_backups
-       WHERE status != ?
-       AND (
-         (is_marketplace = 1 AND last_backup_timestamp < ?)
-         OR ((is_marketplace = 0 OR is_marketplace IS NULL) AND last_backup_timestamp < ?)
-       )
-       ORDER BY CASE
-         WHEN is_marketplace = 1 THEN last_backup_timestamp + ?
-         ELSE last_backup_timestamp + ?
-       END ASC
-       LIMIT 1`,
-      [
-        'cancelled',
-        marketplaceCutoff,
-        standardCutoff,
-        marketplaceIntervalMs,
-        standardIntervalMs,
-      ],
-    );
-
-    if (backups.length === 0) {
+    automaticBackup = await claimNextAutomaticBackup(dbCli, now);
+    if (!automaticBackup) {
       log.info('No automatic backups to process');
       return false;
     }
 
-    // eslint-disable-next-line prefer-destructuring
-    automaticBackup = backups[0];
     const {
       id, appname, components, is_marketplace: isMarketplace,
     } = automaticBackup;
@@ -1775,8 +1966,10 @@ async function processAutomaticBackup() {
     if (isExpired === true) {
       log.info(`Automatic backup cancelled for ${appname}: app is expired`);
       await dbCli.execute(
-        'UPDATE automatic_backups SET status = ?, last_backup_timestamp = ?, expire_counter = expire_counter + 1 WHERE id = ?',
-        ['cancelled', Date.now(), id],
+        `UPDATE automatic_backups SET status = ?, last_backup_timestamp = ?,
+          expire_counter = expire_counter + 1, dispatch_token = NULL,
+          dispatch_lease_until = 0 WHERE id = ? AND dispatch_token = ?`,
+        ['cancelled', Date.now(), id, automaticBackup.dispatch_token],
       );
       return false;
     }
@@ -1812,13 +2005,6 @@ async function processAutomaticBackup() {
     if (!Array.isArray(componentList)) {
       componentList = [];
     }
-
-    // Set last_backup_timestamp to current time and reset failing status for retry
-    const currentTime = Date.now();
-    await dbCli.execute(
-      'UPDATE automatic_backups SET last_backup_timestamp = ?, status = ? WHERE id = ?',
-      [currentTime, 'pending', id],
-    );
 
     if (automaticBackup.status === 'failing') {
       log.info(`Retrying automatic backup for ${appname} after previous failure (${scheduleHours}-hour window elapsed)`);
@@ -2010,11 +2196,7 @@ async function processAutomaticBackup() {
           log.info(`Remote file removal complete: ${remoteRemovalCount}/${taskIds.length} files removed from nodes`);
 
           // Update automatic_backups record with new task IDs and set status to 'done'
-          const backupTasksJson = JSON.stringify(taskIds);
-          await dbCli.execute(
-            'UPDATE automatic_backups SET backup_tasks = ?, status = ? WHERE id = ?',
-            [backupTasksJson, 'done', id],
-          );
+          await persistAutomaticBackupCompletion(dbCli, automaticBackup, taskIds);
 
           const [completedStats] = await dbCli.execute(
             `SELECT COUNT(*) AS file_count, COALESCE(SUM(filesize), 0) AS total_size
@@ -2087,13 +2269,35 @@ async function processAutomaticBackup() {
       }
     }
 
-    // If all retries failed, update status to 'failing'
-    await dbCli.execute(
-      'UPDATE automatic_backups SET status = ? WHERE id = ?',
-      ['failing', id],
-    );
+    let failureStatusPersisted = true;
+    // Preserve the actual backup failure if persisting the final status also times out.
+    try {
+      await dbCli.execute(
+        `UPDATE automatic_backups SET status = ?, dispatch_token = NULL,
+          dispatch_lease_until = 0 WHERE id = ? AND dispatch_token = ?`,
+        ['failing', id, automaticBackup.dispatch_token],
+      );
+    } catch (statusError) {
+      failureStatusPersisted = false;
+      log.error(`Failed to persist automatic backup failure status for ${appname}: ${getErrorMessage(statusError)}`);
+      lastFailure.diagnostics = [
+        ...(lastFailure.diagnostics || []),
+        {
+          check: 'Persist automatic backup failure status',
+          outcome: 'failed',
+          errorCode: statusError.code || null,
+          detail: getErrorMessage(statusError),
+        },
+      ];
+      if (failureAttempts.length > 0) {
+        failureAttempts[failureAttempts.length - 1].diagnostics = lastFailure.diagnostics;
+      }
+    }
 
-    log.error(`All retries failed for automatic backup ${appname}. Status set to failing.`, lastFailure?.reason);
+    log.error(
+      `All retries failed for automatic backup ${appname}. Status ${failureStatusPersisted ? 'set to failing' : 'update failed and remains protected by its dispatch lease'}.`,
+      lastFailure?.reason,
+    );
     await recordAutomaticRunActivity({
       automaticBackup,
       runStartedAt: automaticRunStartedAt,
@@ -2102,7 +2306,7 @@ async function processAutomaticBackup() {
       stage: lastFailure?.stage || 'automatic_backup',
       reason: lastFailure?.reason || 'All retries exhausted',
     });
-    await discordNotifier.notifyAutomaticBackupFailure({
+    await notifyAutomaticBackupFailureOnce(automaticBackup, {
       appname,
       stage: lastFailure?.stage || 'automatic_backup',
       reason: lastFailure?.reason || 'All retries exhausted',
@@ -2119,8 +2323,9 @@ async function processAutomaticBackup() {
     if (automaticBackup) {
       try {
         await dbCli.execute(
-          'UPDATE automatic_backups SET status = ? WHERE id = ?',
-          ['failing', automaticBackup.id],
+          `UPDATE automatic_backups SET status = ?, dispatch_token = NULL,
+            dispatch_lease_until = 0 WHERE id = ? AND dispatch_token = ?`,
+          ['failing', automaticBackup.id, automaticBackup.dispatch_token],
         );
       } catch (updateError) {
         log.error('Failed to update status to failing:', updateError.message);
@@ -2135,7 +2340,7 @@ async function processAutomaticBackup() {
         reason: getErrorMessage(error),
       });
 
-      await discordNotifier.notifyAutomaticBackupFailure({
+      await notifyAutomaticBackupFailureOnce(automaticBackup, {
         appname: automaticBackup.appname,
         stage: inferFailureStage(error),
         reason: getErrorMessage(error),
@@ -2153,6 +2358,23 @@ async function processAutomaticBackup() {
 
     return false;
   }
+}
+
+async function runAutomaticBackupDispatcher(operation) {
+  if (automaticBackupDispatcherRunning) {
+    log.warn('Skipping automatic backup dispatcher tick because the previous run is still active');
+    return false;
+  }
+  automaticBackupDispatcherRunning = true;
+  try {
+    return await operation();
+  } finally {
+    automaticBackupDispatcherRunning = false;
+  }
+}
+
+async function processAutomaticBackup() {
+  return runAutomaticBackupDispatcher(processAutomaticBackupInternal);
 }
 
 /**
@@ -2219,4 +2441,12 @@ module.exports = {
   sendDailyBackupReport,
   getDailyBackupReport,
   forceSendDailyBackupReport,
+  testHooks: {
+    claimNextAutomaticBackup,
+    persistAutomaticBackupCompletion,
+    runAutomaticBackupDispatcher,
+    inferFailureStage,
+    buildAutomaticFailureFingerprint,
+    notifyAutomaticBackupFailureOnce,
+  },
 };

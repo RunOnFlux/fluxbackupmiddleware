@@ -5,6 +5,7 @@
   "main": "server.js",
   "scripts": {
     "test": "node server.js",
+    "test:automatic-backup-dispatch": "node scripts/test-automatic-backup-dispatch.js",
     "test:concurrent-downloads": "node scripts/test-concurrent-task-downloads.js",
     "test:db-client-resilience": "node scripts/test-db-client-resilience.js",
     "test:daily-backup-report": "node scripts/test-daily-backup-report.js",

@@ -16,6 +16,8 @@ module.exports = {
     standardIntervalHours: 7 * 24,
     marketplaceIntervalHours: 24,
     dispatcherIntervalMinutes: 2,
+    dispatcherLeaseMinutes: 6 * 60,
+    discordFailureCooldownMinutes: 60,
   },
   dailyBackupReport: {
     hourUtc: 0,

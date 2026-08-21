@@ -399,6 +399,10 @@ class DBClient {
         expire_counter int DEFAULT '0',
         last_backup_timestamp bigint unsigned DEFAULT '0',
         is_marketplace tinyint DEFAULT NULL,
+        dispatch_token varchar(64) DEFAULT NULL,
+        dispatch_lease_until bigint unsigned NOT NULL DEFAULT '0',
+        last_failure_fingerprint varchar(64) DEFAULT NULL,
+        last_failure_notified_at bigint unsigned NOT NULL DEFAULT '0',
         PRIMARY KEY (\`id\`),
         UNIQUE KEY \`appname_unique\` (\`appname\`))ENGINE=InnoDB;`);
     } else {
@@ -422,6 +426,37 @@ class DBClient {
       log.info('is_marketplace column added successfully');
     } else {
       log.info('is_marketplace column already exists, moving on...');
+    }
+
+    const dispatchColumnRows = await this.query(`
+      SELECT COLUMN_NAME
+      FROM INFORMATION_SCHEMA.COLUMNS
+      WHERE TABLE_SCHEMA = '${this.InitDB}'
+      AND TABLE_NAME = 'automatic_backups'
+      AND COLUMN_NAME IN (
+        'dispatch_token',
+        'dispatch_lease_until',
+        'last_failure_fingerprint',
+        'last_failure_notified_at'
+      )
+    `);
+    const dispatchColumns = new Set(dispatchColumnRows.map((row) => row.COLUMN_NAME));
+    const missingDispatchColumns = [];
+    if (!dispatchColumns.has('dispatch_token')) {
+      missingDispatchColumns.push('ADD COLUMN dispatch_token VARCHAR(64) DEFAULT NULL');
+    }
+    if (!dispatchColumns.has('dispatch_lease_until')) {
+      missingDispatchColumns.push("ADD COLUMN dispatch_lease_until BIGINT UNSIGNED NOT NULL DEFAULT '0'");
+    }
+    if (!dispatchColumns.has('last_failure_fingerprint')) {
+      missingDispatchColumns.push('ADD COLUMN last_failure_fingerprint VARCHAR(64) DEFAULT NULL');
+    }
+    if (!dispatchColumns.has('last_failure_notified_at')) {
+      missingDispatchColumns.push("ADD COLUMN last_failure_notified_at BIGINT UNSIGNED NOT NULL DEFAULT '0'");
+    }
+    if (missingDispatchColumns.length > 0) {
+      log.info(`Adding automatic backup dispatch columns: ${missingDispatchColumns.length}`);
+      await this.query(`ALTER TABLE automatic_backups ${missingDispatchColumns.join(', ')}`);
     }
 
     await this.query(`CREATE TABLE IF NOT EXISTS enterprise_app_discovery (
