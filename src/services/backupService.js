@@ -157,6 +157,13 @@ async function backfillTerminalTaskActivity(period) {
 
 async function collectDailyBackupMetrics(period) {
   await backfillTerminalTaskActivity(period);
+  const [appInventoryRow] = await dbCli.execute(`
+    SELECT
+      COALESCE(SUM(status IS NULL OR status != 'cancelled'), 0) AS active_apps,
+      COALESCE(SUM((status IS NULL OR status != 'cancelled') AND is_marketplace = 1), 0)
+        AS marketplace_apps
+    FROM automatic_backups
+  `);
   const aggregateRows = await dbCli.execute(`
     SELECT
       CASE WHEN backup_type LIKE 'automatic%' THEN 'automatic' ELSE 'manual' END AS report_type,
@@ -213,6 +220,10 @@ async function collectDailyBackupMetrics(period) {
   });
 
   return {
+    appInventory: {
+      active: Number(appInventoryRow?.active_apps) || 0,
+      marketplace: Number(appInventoryRow?.marketplace_apps) || 0,
+    },
     automaticRuns,
     automaticFiles,
     manualRuns,

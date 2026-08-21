@@ -68,6 +68,7 @@ function formatCategory(label, runs, files) {
 function buildDailyReportContent({
   reportDate,
   periodLabel,
+  appInventory = { active: 0, marketplace: 0 },
   automaticRuns,
   automaticFiles,
   manualRuns,
@@ -80,6 +81,10 @@ function buildDailyReportContent({
   return [
     '**Daily backup report**',
     `**Period:** ${periodLabel || `${reportDate} 00:00–24:00 UTC`}`,
+    '',
+    '**Automatic backup coverage**',
+    `- Active apps: ${appInventory.active}`,
+    `- Marketplace apps: ${appInventory.marketplace}`,
     '',
     ...formatCategory('Automatic', automaticRuns, automaticFiles),
     '',
