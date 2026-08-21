@@ -24,4 +24,10 @@ module.exports = (app) => {
   app.get('/getfile', (req, res) => {
     fluxDrive.getFile(req, res);
   });
+  app.get('/dailybackupreport', (req, res) => {
+    backupService.getDailyBackupReport(req, res);
+  });
+  app.post('/dailybackupreport/send', (req, res) => {
+    backupService.forceSendDailyBackupReport(req, res);
+  });
 };

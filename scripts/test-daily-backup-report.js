@@ -7,9 +7,26 @@ const period = dailyBackupReport.getPreviousUtcPeriod(
 );
 assert.deepStrictEqual(period, {
   reportDate: '2026-08-20',
+  periodLabel: '2026-08-20 00:00–24:00 UTC',
   start: Date.parse('2026-08-20T00:00:00.000Z'),
   end: Date.parse('2026-08-21T00:00:00.000Z'),
 });
+
+assert.deepStrictEqual(dailyBackupReport.getUtcDatePeriod('2026-08-20'), period);
+assert.throws(
+  () => dailyBackupReport.getUtcDatePeriod('2026-02-30'),
+  /valid UTC calendar date/,
+);
+
+const rolling = dailyBackupReport.getRolling24HourPeriod(
+  new Date('2026-08-21T13:45:00.000Z'),
+);
+assert.strictEqual(rolling.start, Date.parse('2026-08-20T13:45:00.000Z'));
+assert.strictEqual(rolling.end, Date.parse('2026-08-21T13:45:00.000Z'));
+assert.strictEqual(
+  rolling.periodLabel,
+  '2026-08-20T13:45:00.000Z to 2026-08-21T13:45:00.000Z',
+);
 
 assert.strictEqual(
   dailyBackupReport.getMillisecondsUntilNextReport(

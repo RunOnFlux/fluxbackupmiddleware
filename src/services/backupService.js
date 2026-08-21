@@ -210,6 +210,16 @@ async function collectDailyBackupMetrics(period) {
   };
 }
 
+async function generateDailyBackupReport(period) {
+  const metrics = await collectDailyBackupMetrics(period);
+  const content = dailyBackupReport.buildDailyReportContent({
+    reportDate: period.reportDate,
+    periodLabel: period.periodLabel,
+    ...metrics,
+  });
+  return { period, metrics, content };
+}
+
 async function claimDailyBackupReport(reportDate) {
   const now = Date.now();
   const insertResult = await dbCli.execute(`
@@ -232,11 +242,7 @@ async function sendDailyBackupReport(period = dailyBackupReport.getPreviousUtcPe
     claimed = await claimDailyBackupReport(period.reportDate);
     if (!claimed) return null;
 
-    const metrics = await collectDailyBackupMetrics(period);
-    const content = dailyBackupReport.buildDailyReportContent({
-      reportDate: period.reportDate,
-      ...metrics,
-    });
+    const { content } = await generateDailyBackupReport(period);
     const sent = await discordNotifier.sendDailyBackupReport(content, period.reportDate);
     if (!sent) {
       await dbCli.execute(
@@ -262,6 +268,64 @@ async function sendDailyBackupReport(period = dailyBackupReport.getPreviousUtcPe
       }
     }
     return false;
+  }
+}
+
+function isLocalReportRequest(req) {
+  const remoteAddress = req.socket?.remoteAddress || req.connection?.remoteAddress || '';
+  const loopbackAddresses = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
+  const host = String(req.headers?.host || '').toLowerCase();
+  const hostname = host.startsWith('[') && host.includes(']')
+    ? host.slice(1, host.indexOf(']'))
+    : host.split(':')[0];
+  const localHosts = new Set(['localhost', '127.0.0.1', '::1']);
+  const forwarded = req.headers?.['x-forwarded-for'] || req.headers?.forwarded;
+  return loopbackAddresses.has(remoteAddress) && localHosts.has(hostname) && !forwarded;
+}
+
+function getRequestedReportPeriod(req) {
+  const date = typeof req.query?.date === 'string' ? req.query.date.trim() : '';
+  return date
+    ? dailyBackupReport.getUtcDatePeriod(date)
+    : dailyBackupReport.getRolling24HourPeriod();
+}
+
+async function getDailyBackupReport(req, res) {
+  if (!isLocalReportRequest(req)) {
+    res.status(403).json({ error: 'This endpoint is available only through localhost' });
+    return;
+  }
+  try {
+    const report = await generateDailyBackupReport(getRequestedReportPeriod(req));
+    res.json(report);
+  } catch (error) {
+    const invalidDate = getErrorMessage(error).startsWith('date ');
+    log.error(`Local daily backup report preview failed: ${getErrorMessage(error)}`);
+    res.status(invalidDate ? 400 : 500).json({ error: getErrorMessage(error) });
+  }
+}
+
+async function forceSendDailyBackupReport(req, res) {
+  if (!isLocalReportRequest(req)) {
+    res.status(403).json({ error: 'This endpoint is available only through localhost' });
+    return;
+  }
+  try {
+    const report = await generateDailyBackupReport(getRequestedReportPeriod(req));
+    const sent = await discordNotifier.sendDailyBackupReport(
+      report.content,
+      report.period.reportDate,
+    );
+    if (!sent) {
+      res.status(502).json({ error: 'Discord report delivery failed', ...report });
+      return;
+    }
+    log.info(`Forced daily backup report sent for ${report.period.periodLabel}`);
+    res.json({ sent: true, ...report });
+  } catch (error) {
+    const invalidDate = getErrorMessage(error).startsWith('date ');
+    log.error(`Forced daily backup report failed: ${getErrorMessage(error)}`);
+    res.status(invalidDate ? 400 : 500).json({ error: getErrorMessage(error) });
   }
 }
 
@@ -2153,4 +2217,6 @@ module.exports = {
   cleanupOldAutomaticBackups,
   reconcileFluxDriveInventory,
   sendDailyBackupReport,
+  getDailyBackupReport,
+  forceSendDailyBackupReport,
 };

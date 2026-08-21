@@ -3,6 +3,34 @@ function getPreviousUtcPeriod(now = new Date()) {
   const start = end - (24 * 60 * 60 * 1000);
   return {
     reportDate: new Date(start).toISOString().slice(0, 10),
+    periodLabel: `${new Date(start).toISOString().slice(0, 10)} 00:00–24:00 UTC`,
+    start,
+    end,
+  };
+}
+
+function getUtcDatePeriod(date) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    throw new Error('date must use YYYY-MM-DD format');
+  }
+  const start = Date.parse(`${date}T00:00:00.000Z`);
+  if (!Number.isFinite(start) || new Date(start).toISOString().slice(0, 10) !== date) {
+    throw new Error('date is not a valid UTC calendar date');
+  }
+  return {
+    reportDate: date,
+    periodLabel: `${date} 00:00–24:00 UTC`,
+    start,
+    end: start + (24 * 60 * 60 * 1000),
+  };
+}
+
+function getRolling24HourPeriod(now = new Date()) {
+  const end = now.getTime();
+  const start = end - (24 * 60 * 60 * 1000);
+  return {
+    reportDate: `rolling-${new Date(end).toISOString()}`,
+    periodLabel: `${new Date(start).toISOString()} to ${new Date(end).toISOString()}`,
     start,
     end,
   };
@@ -39,6 +67,7 @@ function formatCategory(label, runs, files) {
 
 function buildDailyReportContent({
   reportDate,
+  periodLabel,
   automaticRuns,
   automaticFiles,
   manualRuns,
@@ -49,7 +78,7 @@ function buildDailyReportContent({
   const totalBytes = automaticFiles.successBytes + manualFiles.successBytes;
   return [
     '**Daily backup report**',
-    `**Period:** ${reportDate} 00:00–24:00 UTC`,
+    `**Period:** ${periodLabel || `${reportDate} 00:00–24:00 UTC`}`,
     '',
     ...formatCategory('Automatic', automaticRuns, automaticFiles),
     '',
@@ -63,6 +92,8 @@ function buildDailyReportContent({
 
 module.exports = {
   getPreviousUtcPeriod,
+  getUtcDatePeriod,
+  getRolling24HourPeriod,
   getMillisecondsUntilNextReport,
   formatBytes,
   buildDailyReportContent,
