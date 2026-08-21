@@ -52,6 +52,20 @@ function logUploadFailure(file, fileName, fileSize, reason, statusCode = null) {
   log.error(`FluxDrive upload failed: taskId=${file.taskId}, appname=${file.appname}, file=${fileName}, size=${fileSize} bytes (${sizeMiB} MiB)${status}, reason=${reason}`);
 }
 
+function createUploadError(reason, endpoint, httpStatus = null, errorCode = null) {
+  const error = new Error(reason);
+  error.diagnostic = {
+    check: 'FluxDrive upload',
+    outcome: 'failed',
+    endpoint,
+    node: new URL(endpoint).origin,
+    httpStatus,
+    errorCode,
+    detail: reason,
+  };
+  return error;
+}
+
 function getInventoryEntries(response) {
   if (Array.isArray(response)) return response;
   if (!response || typeof response !== 'object') return null;
@@ -288,7 +302,7 @@ async function uploadFile(file) {
           const reason = `Invalid FluxDrive response: ${error.message}`;
           logUploadFailure(file, fileName, fileSize, reason, res.statusCode);
           file.status = { state: 'failed', message: reason, progress: 0 };
-          reject(new Error(reason));
+          reject(createUploadError(reason, fullUrl, res.statusCode));
           return;
         }
         // console.log(result);
@@ -302,7 +316,7 @@ async function uploadFile(file) {
           const reason = getUploadFailureReason(result, 'FluxDrive did not return an upload hash');
           logUploadFailure(file, fileName, fileSize, reason, res.statusCode);
           file.status = { state: 'failed', message: reason, progress: 0 };
-          reject(new Error(reason));
+          reject(createUploadError(reason, fullUrl, res.statusCode));
         }
       });
     });
@@ -311,7 +325,7 @@ async function uploadFile(file) {
       const reason = error.message || 'FluxDrive request failed';
       logUploadFailure(file, fileName, fileSize, reason);
       file.status = { state: 'failed', message: reason, progress: 0 };
-      reject(error);
+      reject(createUploadError(reason, fullUrl, null, error.code || null));
     });
 
     form.pipe(req);

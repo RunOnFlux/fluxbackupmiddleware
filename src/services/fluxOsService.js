@@ -17,6 +17,21 @@ const httpsAgent = new https.Agent({
 });
 
 const sessionExpireTime = 1 * 60 * 60 * 1000;
+
+function getSafeApiMessage(data) {
+  const message = data?.data?.message || data?.message
+    || (typeof data?.data === 'string' ? data.data : null);
+  return message ? String(message).slice(0, 240) : null;
+}
+
+function getRequestFailure(error) {
+  return {
+    errorCode: error.code || null,
+    httpStatus: error.response?.status || null,
+    detail: getSafeApiMessage(error.response?.data) || error.message,
+  };
+}
+
 /**
  * Retrieves FluxOS app specifications for given appname.
  *
@@ -113,17 +128,64 @@ async function getAppExpireHeight(appname) {
 /**
 * [getAppOwner]
 */
-async function getAppOwner(appname) {
+async function getAppOwnerDetailed(appname) {
   let value = appOwners.get(appname);
-  if (!value) {
-    const appSpecs = await getAppSpecs(appname);
-    if (appSpecs) {
+  if (value) {
+    return {
+      owner: value.owner,
+      diagnostics: [{
+        check: 'Flux app owner',
+        outcome: 'success',
+        detail: 'App owner loaded from middleware cache',
+      }],
+    };
+  }
+
+  const endpoint = `https://api.runonflux.io/apps/appspecifications/${appname}`;
+  try {
+    const response = await axios.get(endpoint, { httpsAgent, timeout: 30000 });
+    if (response.data?.status === 'success' && response.data.data?.owner) {
+      const appSpecs = response.data.data;
       value = { owner: appSpecs.owner, expireHeight: appSpecs.expire + appSpecs.height };
       appOwners.put(appname, value, sessionExpireTime);
+      return {
+        owner: value.owner,
+        diagnostics: [{
+          check: 'Flux app owner',
+          outcome: 'success',
+          endpoint,
+          httpStatus: response.status,
+          detail: 'App owner returned by specifications API',
+        }],
+      };
     }
+    return {
+      owner: null,
+      diagnostics: [{
+        check: 'Flux app owner',
+        outcome: 'failed',
+        endpoint,
+        httpStatus: response.status,
+        detail: getSafeApiMessage(response.data) || 'Specifications API returned no app owner',
+      }],
+    };
+  } catch (error) {
+    log.error(`Failed to get app owner for ${appname}:`, error.message);
+    return {
+      owner: null,
+      diagnostics: [{
+        check: 'Flux app owner',
+        outcome: 'failed',
+        endpoint,
+        ...getRequestFailure(error),
+      }],
+    };
   }
-  if (value) return value.owner;
-  return false;
+}
+
+async function getAppOwner(appname) {
+  const result = await getAppOwnerDetailed(appname);
+  return result.owner || false;
 }
 
 const DEFAULT_FLUX_API_PORT = 16127;
@@ -205,37 +267,71 @@ function parseSecondaryNodeFromHAProxyStats(htmlContent, appname) {
   return secondaryNode;
 }
 
-async function getPrimaryNodeIp(appname) {
+async function getPrimaryNodeIp(appname, diagnostics) {
+  const appIpsUrl = `${getFdmBaseUrl(appname)}/api/appips/${appname}`;
   try {
-    const appIpsUrl = `${getFdmBaseUrl(appname)}/api/appips/${appname}`;
-    const response = await axios.get(appIpsUrl, { httpsAgent });
+    const response = await axios.get(appIpsUrl, { httpsAgent, timeout: 30000 });
 
     if (response.data?.status === 'success' && response.data?.data?.ips?.length > 0) {
       const [primaryIp] = response.data.data.ips;
+      diagnostics.push({
+        check: 'FDM appips',
+        outcome: 'success',
+        endpoint: appIpsUrl,
+        node: primaryIp,
+        detail: `Primary IP found; FDM returned ${response.data.data.ips.length} IP(s)`,
+      });
       log.info(`Primary node IP for ${appname} from appips: ${primaryIp}`);
       return primaryIp;
     }
 
+    diagnostics.push({
+      check: 'FDM appips',
+      outcome: 'failed',
+      endpoint: appIpsUrl,
+      httpStatus: response.status,
+      detail: getSafeApiMessage(response.data) || 'FDM response contained no primary IP',
+    });
     log.error(`No primary IP found in appips response for ${appname}`);
     return null;
   } catch (error) {
+    diagnostics.push({
+      check: 'FDM appips',
+      outcome: 'failed',
+      endpoint: appIpsUrl,
+      ...getRequestFailure(error),
+    });
     log.error(`Failed to get primary node IP for ${appname}:`, error.message);
     return null;
   }
 }
 
-async function getSecondaryNodeFromLocationApi(appname, primaryIp = null) {
+async function getSecondaryNodeFromLocationApi(appname, primaryIp, diagnostics) {
+  const locationUrl = `https://api.runonflux.io/apps/location/${appname}`;
   try {
-    const locationUrl = `https://api.runonflux.io/apps/location/${appname}`;
-    const locationResponse = await axios.get(locationUrl, { httpsAgent });
+    const locationResponse = await axios.get(locationUrl, { httpsAgent, timeout: 30000 });
 
     if (!locationResponse.data || locationResponse.data.status !== 'success' || !locationResponse.data.data) {
+      diagnostics.push({
+        check: 'Flux location API',
+        outcome: 'failed',
+        endpoint: locationUrl,
+        httpStatus: locationResponse.status,
+        detail: getSafeApiMessage(locationResponse.data) || 'Invalid location API response',
+      });
       log.error(`Invalid response from location API for ${appname}`);
       return null;
     }
 
     const locations = locationResponse.data.data;
     if (locations.length === 0) {
+      diagnostics.push({
+        check: 'Flux location API',
+        outcome: 'failed',
+        endpoint: locationUrl,
+        httpStatus: locationResponse.status,
+        detail: 'No running app locations were returned',
+      });
       log.error(`No locations found for ${appname} in location API`);
       return null;
     }
@@ -247,17 +343,44 @@ async function getSecondaryNodeFromLocationApi(appname, primaryIp = null) {
 
       if (alternativeLocation) {
         const secondaryNode = formatLocationNode(alternativeLocation.ip);
+        diagnostics.push({
+          check: 'Flux location API',
+          outcome: 'success',
+          endpoint: locationUrl,
+          node: secondaryNode,
+          detail: `Selected a location different from primary ${primaryIp}`,
+        });
         log.info(`Found secondary node from location API (primary ${primaryIp}): ${secondaryNode}`);
         return secondaryNode;
       }
 
+      diagnostics.push({
+        check: 'Flux location API',
+        outcome: 'failed',
+        endpoint: locationUrl,
+        httpStatus: locationResponse.status,
+        node: primaryIp,
+        detail: `Only the primary IP was available (${locations.length} location record(s))`,
+      });
       log.warn(`All location nodes match primary IP ${primaryIp} for ${appname}`);
       return null;
     }
 
+    diagnostics.push({
+      check: 'Flux location API',
+      outcome: 'failed',
+      endpoint: locationUrl,
+      detail: 'Primary IP was unavailable, so a safe secondary could not be identified',
+    });
     log.error(`Cannot select secondary node for ${appname}: primary IP is required`);
     return null;
   } catch (error) {
+    diagnostics.push({
+      check: 'Flux location API',
+      outcome: 'failed',
+      endpoint: locationUrl,
+      ...getRequestFailure(error),
+    });
     log.error(`Failed to get location data for ${appname}:`, error.message);
     return null;
   }
@@ -269,50 +392,147 @@ async function getSecondaryNodeFromLocationApi(appname, primaryIp = null) {
  *
  * @async
  * @param {string} appname - The name of the application
- * @returns {Promise<string|null>} - The IP:port of the first secondary node, or null if not found
+ * @returns {Promise<Object>} Selected node and the diagnostic trail used to select it.
  */
-async function getSecondaryNodeFromHAProxy(appname) {
+async function getSecondaryNodeSelection(appname) {
+  const diagnostics = [];
+  const statsUrl = `${getFdmBaseUrl(appname)}/fluxstatistics?scope=${appname}_`;
   try {
-    const statsUrl = `${getFdmBaseUrl(appname)}/fluxstatistics?scope=${appname}_`;
-    const response = await axios.get(statsUrl, { httpsAgent });
+    const response = await axios.get(statsUrl, { httpsAgent, timeout: 30000 });
 
     if (!response.data) {
+      diagnostics.push({
+        check: 'FDM HAProxy statistics',
+        outcome: 'failed',
+        endpoint: statsUrl,
+        httpStatus: response.status,
+        detail: 'FDM returned an empty statistics response',
+      });
       log.error(`No data received from HAProxy statistics for ${appname}`);
     } else {
       const secondaryNode = parseSecondaryNodeFromHAProxyStats(response.data, appname);
       if (secondaryNode) {
+        diagnostics.push({
+          check: 'FDM HAProxy statistics',
+          outcome: 'success',
+          endpoint: statsUrl,
+          node: secondaryNode,
+          detail: 'Selected an UP backup node or second UP active node',
+        });
         log.info(`Secondary/backup node for ${appname}: ${secondaryNode}`);
-        return secondaryNode;
+        return {
+          node: secondaryNode,
+          primaryIp: null,
+          reason: null,
+          diagnostics,
+        };
       }
 
+      diagnostics.push({
+        check: 'FDM HAProxy statistics',
+        outcome: 'failed',
+        endpoint: statsUrl,
+        httpStatus: response.status,
+        detail: 'No UP backup node or second UP active node was present',
+      });
       log.info(`HAProxy statistics for ${appname} did not yield a secondary node`);
     }
   } catch (error) {
+    diagnostics.push({
+      check: 'FDM HAProxy statistics',
+      outcome: 'failed',
+      endpoint: statsUrl,
+      ...getRequestFailure(error),
+    });
     log.error(`Failed to get HAProxy statistics for ${appname}`, { error: error.message });
   }
 
   log.info(`Using appips/location fallback for secondary node selection (${appname})`);
-  const primaryIp = await getPrimaryNodeIp(appname);
+  const primaryIp = await getPrimaryNodeIp(appname, diagnostics);
   if (!primaryIp) {
     log.error(
       `Failed to select secondary node for ${appname}: appips did not return a primary IP; location API fallback requires primary node identification`,
     );
-    return null;
+    return {
+      node: null,
+      primaryIp: null,
+      reason: 'FDM appips did not return a primary IP',
+      diagnostics,
+    };
   }
-  return getSecondaryNodeFromLocationApi(appname, primaryIp);
+  const secondaryNode = await getSecondaryNodeFromLocationApi(
+    appname,
+    primaryIp,
+    diagnostics,
+  );
+  return {
+    node: secondaryNode,
+    primaryIp,
+    reason: secondaryNode ? null : diagnostics[diagnostics.length - 1]?.detail,
+    diagnostics,
+  };
 }
 
-async function getLoginPhrase(node) {
+async function getSecondaryNodeFromHAProxy(appname) {
+  const selection = await getSecondaryNodeSelection(appname);
+  return selection.node;
+}
+
+async function getLoginPhraseDetailed(node) {
+  const endpoint = `${node}/id/loginphrase`;
   try {
-    const api = `${node}/id/loginphrase`;
-    const response = await axios.get(api, { httpsAgent });
+    const response = await axios.get(endpoint, { httpsAgent, timeout: 30000 });
     if (response.data.status === 'error') {
-      throw new Error(response.data.data);
+      const detail = getSafeApiMessage(response.data) || 'Node rejected login phrase request';
+      log.error(`Failed to get login phrase from Flux API: ${detail}`);
+      return {
+        phrase: null,
+        diagnostic: {
+          check: 'Flux node login phrase',
+          outcome: 'failed',
+          endpoint,
+          node,
+          httpStatus: response.status,
+          detail,
+        },
+      };
     }
-    return response.data.data;
+    if (!response.data.data) {
+      return {
+        phrase: null,
+        diagnostic: {
+          check: 'Flux node login phrase',
+          outcome: 'failed',
+          endpoint,
+          node,
+          httpStatus: response.status,
+          detail: 'Node returned no login phrase',
+        },
+      };
+    }
+    return {
+      phrase: response.data.data,
+      diagnostic: {
+        check: 'Flux node login phrase',
+        outcome: 'success',
+        endpoint,
+        node,
+        httpStatus: response.status,
+        detail: 'Login phrase received',
+      },
+    };
   } catch (error) {
     log.error(`Failed to get login phrase from Flux API: ${error.message}`, { stack: error.stack });
-    return null;
+    return {
+      phrase: null,
+      diagnostic: {
+        check: 'Flux node login phrase',
+        outcome: 'failed',
+        endpoint,
+        node,
+        ...getRequestFailure(error),
+      },
+    };
   }
 }
 
@@ -334,35 +554,86 @@ function signMessage(message, pk, strMessageMagic) {
   }
 }
 
-async function verifyLogin(zelid, privateKeySign, node) {
+async function verifyLoginDetailed(zelid, privateKeySign, node) {
+  const diagnostics = [];
+  const verifyEndpoint = `${node}/id/verifylogin`;
   try {
-    const loginPhrase = await getLoginPhrase(node);
-    if (!loginPhrase) {
+    const loginPhraseResult = await getLoginPhraseDetailed(node);
+    diagnostics.push(loginPhraseResult.diagnostic);
+    if (!loginPhraseResult.phrase) {
       log.error('Failed to get login phrase');
-      return false;
+      return {
+        zelidAuth: null,
+        reason: loginPhraseResult.diagnostic.detail,
+        diagnostics,
+      };
     }
 
-    const signature = signMessage(loginPhrase, privateKeySign);
+    let signature;
+    try {
+      signature = signMessage(loginPhraseResult.phrase, privateKeySign);
+    } catch (error) {
+      diagnostics.push({
+        check: 'Middleware login signing',
+        outcome: 'failed',
+        node,
+        detail: error.message,
+      });
+      return { zelidAuth: null, reason: error.message, diagnostics };
+    }
     const loginInfo = {
       zelid,
       signature,
-      loginPhrase,
+      loginPhrase: loginPhraseResult.phrase,
     };
 
-    const response = await axios.post(`${node}/id/verifylogin`, qs.stringify(loginInfo), { httpsAgent });
+    const response = await axios.post(
+      verifyEndpoint,
+      qs.stringify(loginInfo),
+      { httpsAgent, timeout: 30000 },
+    );
 
     if (response.data.status === 'success') {
       const zelidAuth = qs.stringify(loginInfo);
+      diagnostics.push({
+        check: 'Flux node login verification',
+        outcome: 'success',
+        endpoint: verifyEndpoint,
+        node,
+        httpStatus: response.status,
+        detail: 'Authentication successful',
+      });
       log.info('Authentication successful');
-      return zelidAuth;
+      return { zelidAuth, reason: null, diagnostics };
     }
 
-    log.warn(`Login verification failed: ${response.data.message || 'Unknown error'}`);
-    return false;
+    const detail = getSafeApiMessage(response.data) || 'Node rejected login verification';
+    diagnostics.push({
+      check: 'Flux node login verification',
+      outcome: 'failed',
+      endpoint: verifyEndpoint,
+      node,
+      httpStatus: response.status,
+      detail,
+    });
+    log.warn(`Login verification failed: ${detail}`);
+    return { zelidAuth: null, reason: detail, diagnostics };
   } catch (error) {
+    diagnostics.push({
+      check: 'Flux node login verification',
+      outcome: 'failed',
+      endpoint: verifyEndpoint,
+      node,
+      ...getRequestFailure(error),
+    });
     log.error(`Error in verifyLogin: ${error.message}`, { stack: error.stack });
-    return false;
+    return { zelidAuth: null, reason: error.message, diagnostics };
   }
+}
+
+async function verifyLogin(zelid, privateKeySign, node) {
+  const result = await verifyLoginDetailed(zelid, privateKeySign, node);
+  return result.zelidAuth || false;
 }
 
 /**
@@ -546,6 +817,8 @@ async function getAppsWithSyncthing() {
  * @returns {Promise<Object|null>} - Combined backup data for all components, or null if failed
  */
 async function createBackupTaskOnNode(node, zelidAuth, appname, componentList) {
+  const diagnostics = [];
+  const createEndpoint = `${node}/apps/appendbackuptask`;
   try {
     log.info(`Creating backup task for ${appname} with components: ${JSON.stringify(componentList)}`);
 
@@ -561,7 +834,7 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList) {
     // Make the backup request
     const backupResponse = await axios({
       method: 'post',
-      url: `${node}/apps/appendbackuptask`,
+      url: createEndpoint,
       headers: {
         'Content-Type': 'application/json',
         zelidauth: zelidAuth,
@@ -574,6 +847,20 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList) {
     if (!backupResponse.data) {
       throw new Error('No response data from backup task creation');
     }
+    if (backupResponse.data.status === 'error') {
+      throw new Error(
+        getSafeApiMessage(backupResponse.data) || 'Flux node rejected the backup task',
+      );
+    }
+
+    diagnostics.push({
+      check: 'Flux node backup creation',
+      outcome: 'success',
+      endpoint: createEndpoint,
+      node,
+      httpStatus: backupResponse.status,
+      detail: 'Node accepted the backup task',
+    });
 
     log.info(`Backup task created successfully for ${appname}`);
 
@@ -586,9 +873,10 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList) {
     for (let i = 0; i < componentList.length; i += 1) {
       const component = componentList[i];
       try {
+        const volumeEndpoint = `${node}/backup/getvolumedataofcomponent/${appname}/${component}/B/0/mount`;
         const volumeResponse = await axios({
           method: 'get',
-          url: `${node}/backup/getvolumedataofcomponent/${appname}/${component}/B/0/mount`,
+          url: volumeEndpoint,
           headers: {
             zelidauth: zelidAuth,
           },
@@ -600,9 +888,24 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList) {
           componentMounts[component] = volumeResponse.data.data.mount;
           log.info(`Got mount path for component ${component}: ${componentMounts[component]}`);
         } else {
+          diagnostics.push({
+            check: `Flux volume lookup (${component})`,
+            outcome: 'failed',
+            endpoint: volumeEndpoint,
+            node,
+            httpStatus: volumeResponse.status,
+            detail: getSafeApiMessage(volumeResponse.data) || 'Mount path was not returned',
+          });
           log.error(`Failed to get mount path for component ${component}`);
         }
       } catch (error) {
+        diagnostics.push({
+          check: `Flux volume lookup (${component})`,
+          outcome: 'failed',
+          endpoint: `${node}/backup/getvolumedataofcomponent/${appname}/${component}/B/0/mount`,
+          node,
+          ...getRequestFailure(error),
+        });
         log.error(`Error fetching volume data for component ${component}: ${error.message}`);
       }
     }
@@ -610,6 +913,8 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList) {
     // Verify backup creation completed by checking task status
     let backupReady = false;
     let statusCheckCount = 0;
+    let lastReadinessFailure = null;
+    let readinessEndpoint = null;
     const maxStatusChecks = 20; // Maximum 20 checks * 5 seconds = 100 seconds total
 
     while (!backupReady && statusCheckCount < maxStatusChecks) {
@@ -624,6 +929,7 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList) {
 
         const testPath = encodeURIComponent(`${firstMount}/backup/local`);
         const testUrl = `${node}/backup/getlocalbackuplist/${testPath}/B/0/true/${appname}`;
+        readinessEndpoint = testUrl;
 
         const testResponse = await axios({
           method: 'get',
@@ -640,6 +946,14 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList) {
           backupReady = true;
           log.info(`Backup files detected for ${appname}, proceeding to retrieve all components`);
         } else {
+          lastReadinessFailure = {
+            check: 'Flux backup readiness',
+            outcome: 'failed',
+            endpoint: testUrl,
+            node,
+            httpStatus: testResponse.status,
+            detail: getSafeApiMessage(testResponse.data) || 'Backup file list was empty',
+          };
           statusCheckCount += 1;
           if (statusCheckCount < maxStatusChecks) {
             log.info(`Waiting for backup creation to complete (check ${statusCheckCount}/${maxStatusChecks})...`);
@@ -647,6 +961,13 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList) {
           }
         }
       } catch (error) {
+        lastReadinessFailure = {
+          check: 'Flux backup readiness',
+          outcome: 'failed',
+          endpoint: readinessEndpoint,
+          node,
+          ...getRequestFailure(error),
+        };
         statusCheckCount += 1;
         if (statusCheckCount < maxStatusChecks) {
           log.info(`Backup not ready yet (check ${statusCheckCount}/${maxStatusChecks}): ${error.message}`);
@@ -656,6 +977,12 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList) {
     }
 
     if (!backupReady) {
+      diagnostics.push(lastReadinessFailure || {
+        check: 'Flux backup readiness',
+        outcome: 'failed',
+        node,
+        detail: `Backup files were not detected after ${maxStatusChecks} checks`,
+      });
       log.warn(`Backup creation may not have completed for ${appname} after ${maxStatusChecks} checks, proceeding anyway`);
     }
 
@@ -667,6 +994,8 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList) {
       const component = componentList[i];
       let componentBackupData = null;
       let retryCount = 0;
+      let lastComponentFailure = null;
+      let backupListEndpoint = null;
 
       while (retryCount < maxRetries && !componentBackupData) {
         try {
@@ -678,6 +1007,7 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList) {
 
           const backupPath = encodeURIComponent(`${mount}/backup/local`);
           const backupListUrl = `${node}/backup/getlocalbackuplist/${backupPath}/B/0/true/${appname}`;
+          backupListEndpoint = backupListUrl;
 
           log.info(`Fetching backup list for component ${component}, attempt ${retryCount + 1}, mount: ${mount}`);
 
@@ -724,9 +1054,24 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList) {
               log.warn(`No backups matching pattern "${expectedPattern}" for component ${component}, attempt ${retryCount + 1}`);
             }
           } else {
+            lastComponentFailure = {
+              check: `Flux backup list (${component})`,
+              outcome: 'failed',
+              endpoint: backupListUrl,
+              node,
+              httpStatus: backupListResponse.status,
+              detail: getSafeApiMessage(backupListResponse.data) || 'Node rejected backup list request',
+            };
             log.warn(`Backup list request failed for component ${component}, attempt ${retryCount + 1}. Status: ${backupListResponse.data?.status}, Message: ${backupListResponse.data?.data || 'unknown'}`);
           }
         } catch (error) {
+          lastComponentFailure = {
+            check: `Flux backup list (${component})`,
+            outcome: 'failed',
+            endpoint: backupListEndpoint,
+            node,
+            ...getRequestFailure(error),
+          };
           log.error(`Error fetching backup list for component ${component}, attempt ${retryCount + 1}: ${error.message}`);
         }
 
@@ -741,11 +1086,18 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList) {
       if (componentBackupData) {
         backupResults.push(componentBackupData);
       } else {
+        const componentFailure = lastComponentFailure || {
+          check: `Flux backup list (${component})`,
+          outcome: 'failed',
+          node,
+          detail: `No matching backup file after ${maxRetries} attempts`,
+        };
+        diagnostics.push(componentFailure);
         log.error(`Failed to get backup data for component ${component} after ${maxRetries} attempts`);
         backupResults.push({
           component,
           backups: [],
-          error: `Failed to retrieve backup after ${maxRetries} attempts`,
+          error: `${componentFailure.detail}; node=${node}${componentFailure.endpoint ? `; endpoint=${componentFailure.endpoint}` : ''}`,
         });
       }
     }
@@ -756,13 +1108,27 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList) {
       components: backupResults,
       totalComponents: componentList.length,
       successfulComponents: backupResults.filter((r) => r.backups && r.backups.length > 0).length,
+      diagnostics,
     };
 
     log.info(`Backup task completed for ${appname}. ${result.successfulComponents}/${result.totalComponents} components successful`);
     return result;
   } catch (error) {
+    diagnostics.push({
+      check: 'Flux node backup creation',
+      outcome: 'failed',
+      endpoint: createEndpoint,
+      node,
+      ...getRequestFailure(error),
+    });
     log.error(`Error creating backup task for ${appname}: ${error.message}`, { stack: error.stack });
-    return null;
+    return {
+      appname,
+      status: 'failed',
+      components: [],
+      error: error.message,
+      diagnostics,
+    };
   }
 }
 
@@ -770,12 +1136,15 @@ module.exports = {
   getAppSpecs,
   getBlockHeight,
   verifyAppOwner,
+  getAppOwnerDetailed,
   getAppOwner,
   getAppExpireHeight,
+  verifyLoginDetailed,
   verifyLogin,
   discoverAppsWithSyncthing,
   getAppsWithSyncthing,
   isAppExpiredInGlobalSpecs,
+  getSecondaryNodeSelection,
   getSecondaryNodeFromHAProxy,
   createBackupTaskOnNode,
 };

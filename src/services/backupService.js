@@ -100,10 +100,11 @@ function getFluxDriveRemovalError(removeResult) {
   return null;
 }
 
-function createBackupFailure(reason, stage, taskFailures = []) {
+function createBackupFailure(reason, stage, taskFailures = [], diagnostics = []) {
   const error = new Error(reason);
   error.stage = stage;
   error.taskFailures = taskFailures;
+  error.diagnostics = diagnostics;
   return error;
 }
 
@@ -121,11 +122,31 @@ function inferFailureStage(error) {
 }
 
 function buildTaskFailure(task, taskId, reason) {
+  let node = null;
+  let storedDiagnostic = null;
+  if (task?.extra) {
+    try {
+      storedDiagnostic = JSON.parse(task.extra).failureDiagnostic || null;
+    } catch (error) {
+      storedDiagnostic = null;
+    }
+  }
+  if (task?.host) {
+    try {
+      node = new URL(task.host).origin;
+    } catch (error) {
+      [node] = String(task.host).split('/backup/');
+    }
+  }
   return {
     taskId,
     component: task?.component || 'unknown',
     message: task?.status?.message || reason,
     fails: task?.fails || 0,
+    node: storedDiagnostic?.node || node,
+    endpoint: storedDiagnostic?.endpoint || task?.host || null,
+    httpStatus: storedDiagnostic?.httpStatus || null,
+    errorCode: storedDiagnostic?.errorCode || null,
   };
 }
 
@@ -324,6 +345,13 @@ async function runTask(id) {
   log.info(`ruuning task ${id}`);
   const task = taskQueue.get(id);
   try {
+    if (task.extra) {
+      try {
+        if (JSON.parse(task.extra).failureDiagnostic) task.extra = '';
+      } catch (error) {
+        // Preserve non-diagnostic legacy task metadata.
+      }
+    }
     task.startTime = Math.floor(Date.now() / 1000);
     task.status = { state: 'started', message: 'backup to FluxDrive started', progress: 0 };
     await dbCli.updateTask(task);
@@ -372,6 +400,9 @@ async function runTask(id) {
     const message = getErrorMessage(error);
     if (!task.status || task.status.state !== 'failed') {
       task.status = { state: 'failed', message, progress: 0 };
+    }
+    if (error.diagnostic) {
+      task.extra = JSON.stringify({ failureDiagnostic: error.diagnostic });
     }
     task.fails += 1;
     await dbCli.updateTask(task);
@@ -1378,6 +1409,7 @@ async function processAutomaticBackup() {
   let retryCount = 0;
   let automaticBackup = null;
   let lastFailure = null;
+  const failureAttempts = [];
 
   try {
     const now = Date.now();
@@ -1483,37 +1515,65 @@ async function processAutomaticBackup() {
 
     // Retry loop for node operations
     while (retryCount < maxRetries) {
+      const attemptDiagnostics = [];
       try {
         // Get secondary node from HAProxy
-        const nodeAddress = await fluxOS.getSecondaryNodeFromHAProxy(appname);
+        const nodeSelection = await fluxOS.getSecondaryNodeSelection(appname);
+        attemptDiagnostics.push(...nodeSelection.diagnostics);
+        const nodeAddress = nodeSelection.node;
         if (!nodeAddress) {
-          throw new Error(`Failed to get secondary node for ${appname}`);
+          throw createBackupFailure(
+            nodeSelection.reason || `Failed to get secondary node for ${appname}`,
+            'node_selection',
+            [],
+            attemptDiagnostics,
+          );
         }
 
         const node = `http://${nodeAddress}`;
         log.info(`Using node: ${node}`);
 
         // Get zelidAuth from node
-        const zelidAuth = await fluxOS.verifyLogin(
+        const loginResult = await fluxOS.verifyLoginDetailed(
           await Vault.getKey('teamFluxID'),
           await Vault.getKey('teamPK'),
           node,
         );
+        attemptDiagnostics.push(...loginResult.diagnostics);
 
-        if (!zelidAuth) {
-          throw new Error('Failed to authenticate with node');
+        if (!loginResult.zelidAuth) {
+          throw createBackupFailure(
+            loginResult.reason || `Failed to authenticate with ${node}`,
+            'node_auth',
+            [],
+            attemptDiagnostics,
+          );
         }
+        const { zelidAuth } = loginResult;
 
         // Get app owner
-        const owner = await fluxOS.getAppOwner(appname);
-        if (!owner) {
-          throw new Error(`Failed to get app owner for ${appname}`);
+        const ownerResult = await fluxOS.getAppOwnerDetailed(appname);
+        attemptDiagnostics.push(...ownerResult.diagnostics);
+        if (!ownerResult.owner) {
+          throw createBackupFailure(
+            `Failed to get app owner for ${appname}`,
+            'app_owner',
+            [],
+            attemptDiagnostics,
+          );
         }
+        const { owner } = ownerResult;
 
         // Create backup task on node
         const backupResult = await fluxOS.createBackupTaskOnNode(node, zelidAuth, appname, componentList);
-        if (!backupResult || !backupResult.components) {
-          throw new Error('Failed to create backup tasks on node');
+        attemptDiagnostics.push(...(backupResult?.diagnostics || []));
+        if (!backupResult || backupResult.status === 'failed' || !backupResult.components) {
+          throw createBackupFailure(
+            backupResult?.error || `Failed to create backup tasks on ${node}`,
+            'create_backup',
+            [],
+            attemptDiagnostics,
+          );
         }
 
         log.info(`Created backup tasks for ${backupResult.totalComponents} components`);
@@ -1576,11 +1636,21 @@ async function processAutomaticBackup() {
           }
         }
 
+        registrationFailures.forEach((failure) => {
+          attemptDiagnostics.push({
+            check: `Backup registration (${failure.component})`,
+            outcome: 'failed',
+            node,
+            detail: failure.message,
+          });
+        });
+
         if (taskIds.length === 0) {
           throw createBackupFailure(
             summarizeRegistrationFailures(registrationFailures),
             'create_backup',
             registrationFailures,
+            attemptDiagnostics,
           );
         }
 
@@ -1592,6 +1662,7 @@ async function processAutomaticBackup() {
             summarizeRegistrationFailures(registrationFailures),
             'task_pipeline',
             registrationFailures,
+            attemptDiagnostics,
           );
         }
 
@@ -1636,6 +1707,17 @@ async function processAutomaticBackup() {
           .map((failure) => `${failure.component}: ${failure.message}`)
           .join('; ');
         const rollbackResult = await cleanupIncompleteAutomaticBackupTasks(taskIds);
+        waitResult.failures.forEach((failure) => {
+          attemptDiagnostics.push({
+            check: `Component pipeline (${failure.component})`,
+            outcome: 'failed',
+            node: failure.node || node,
+            endpoint: failure.endpoint || null,
+            httpStatus: failure.httpStatus || null,
+            errorCode: failure.errorCode || null,
+            detail: failure.message,
+          });
+        });
         log.error(
           `New backup batch failed. Rolled back ${rollbackResult.removed} component artifacts; ${rollbackResult.failed} cleanup operations failed.`,
           taskFailureSummary,
@@ -1644,6 +1726,7 @@ async function processAutomaticBackup() {
           taskFailureSummary || 'New backup tasks failed to complete',
           'task_pipeline',
           waitResult.failures,
+          attemptDiagnostics,
         );
       } catch (error) {
         retryCount += 1;
@@ -1651,7 +1734,12 @@ async function processAutomaticBackup() {
           stage: inferFailureStage(error),
           reason: getErrorMessage(error),
           taskFailures: error.taskFailures || [],
+          diagnostics: error.diagnostics || attemptDiagnostics,
         };
+        failureAttempts.push({
+          attempt: retryCount,
+          ...lastFailure,
+        });
         if (lastFailure.stage === 'task_pipeline') {
           log.error(`Automatic backup ${appname} failed after component-level retries:`, lastFailure.reason);
           break;
@@ -1678,6 +1766,7 @@ async function processAutomaticBackup() {
       stage: lastFailure?.stage || 'automatic_backup',
       reason: lastFailure?.reason || 'All retries exhausted',
       taskFailures: lastFailure?.taskFailures || [],
+      failureAttempts,
       retryCount,
       maxRetries,
     });
@@ -1701,6 +1790,12 @@ async function processAutomaticBackup() {
         stage: inferFailureStage(error),
         reason: getErrorMessage(error),
         taskFailures: error.taskFailures || lastFailure?.taskFailures || [],
+        failureAttempts: failureAttempts.length > 0 ? failureAttempts : [{
+          attempt: retryCount || 1,
+          stage: inferFailureStage(error),
+          reason: getErrorMessage(error),
+          diagnostics: error.diagnostics || [],
+        }],
         retryCount,
         maxRetries,
       });
