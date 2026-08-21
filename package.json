@@ -13,6 +13,7 @@
     "test:enterprise-syncthing": "node scripts/test-enterprise-syncthing.js",
     "test:enterprise-discovery-cache": "node scripts/test-enterprise-discovery-cache.js",
     "test:fluxdrive-inventory": "node scripts/test-fluxdrive-inventory.js",
+    "test:flux-node-auth-diagnostics": "node scripts/test-flux-node-auth-diagnostics.js",
     "test:marketplace-classification": "node scripts/test-marketplace-classification.js",
     "test:quota-retention": "node scripts/test-quota-retention.js",
     "test:reconciliation-recovery": "node scripts/test-reconciliation-recovery.js",

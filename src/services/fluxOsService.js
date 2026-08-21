@@ -483,35 +483,40 @@ async function getLoginPhraseDetailed(node) {
   try {
     const response = await axios.get(endpoint, { httpsAgent, timeout: 30000 });
     if (response.data.status === 'error') {
-      const detail = getSafeApiMessage(response.data) || 'Node rejected login phrase request';
-      log.error(`Failed to get login phrase from Flux API: ${detail}`);
+      const apiMessage = getSafeApiMessage(response.data) || 'unspecified node API error';
+      const reason = 'Selected Flux node API is unavailable for backup authentication: login phrase endpoint returned an error response';
+      log.error(`Failed to get login phrase from Flux API: ${reason}; nodeMessage=${apiMessage}`);
       return {
         phrase: null,
+        reason,
         diagnostic: {
           check: 'Flux node login phrase',
           outcome: 'failed',
           endpoint,
           node,
           httpStatus: response.status,
-          detail,
+          detail: 'Node API responded but did not provide a login phrase',
         },
       };
     }
     if (!response.data.data) {
+      const reason = 'Selected Flux node API is unavailable for backup authentication: login phrase response was empty';
       return {
         phrase: null,
+        reason,
         diagnostic: {
           check: 'Flux node login phrase',
           outcome: 'failed',
           endpoint,
           node,
           httpStatus: response.status,
-          detail: 'Node returned no login phrase',
+          detail: 'Node API responded but did not provide a login phrase',
         },
       };
     }
     return {
       phrase: response.data.data,
+      reason: null,
       diagnostic: {
         check: 'Flux node login phrase',
         outcome: 'success',
@@ -523,14 +528,20 @@ async function getLoginPhraseDetailed(node) {
     };
   } catch (error) {
     log.error(`Failed to get login phrase from Flux API: ${error.message}`, { stack: error.stack });
+    const requestFailure = getRequestFailure(error);
+    const reason = error.response
+      ? `Selected Flux node API is unavailable for backup authentication: HTTP ${error.response.status}`
+      : `Selected Flux node API is unreachable: ${requestFailure.detail}`;
     return {
       phrase: null,
+      reason,
       diagnostic: {
         check: 'Flux node login phrase',
         outcome: 'failed',
         endpoint,
         node,
-        ...getRequestFailure(error),
+        ...requestFailure,
+        detail: reason,
       },
     };
   }
@@ -564,7 +575,7 @@ async function verifyLoginDetailed(zelid, privateKeySign, node) {
       log.error('Failed to get login phrase');
       return {
         zelidAuth: null,
-        reason: loginPhraseResult.diagnostic.detail,
+        reason: loginPhraseResult.reason || loginPhraseResult.diagnostic.detail,
         diagnostics,
       };
     }
@@ -1139,6 +1150,7 @@ module.exports = {
   getAppOwnerDetailed,
   getAppOwner,
   getAppExpireHeight,
+  getLoginPhraseDetailed,
   verifyLoginDetailed,
   verifyLogin,
   discoverAppsWithSyncthing,
