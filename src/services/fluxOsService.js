@@ -306,7 +306,12 @@ async function getPrimaryNodeIp(appname, diagnostics) {
   }
 }
 
-async function getSecondaryNodeFromLocationApi(appname, primaryIp, diagnostics) {
+async function getSecondaryNodeFromLocationApi(
+  appname,
+  primaryIp,
+  diagnostics,
+  excludedNodes = new Set(),
+) {
   const locationUrl = `https://api.runonflux.io/apps/location/${appname}`;
   try {
     const locationResponse = await axios.get(locationUrl, { httpsAgent, timeout: 30000 });
@@ -337,20 +342,26 @@ async function getSecondaryNodeFromLocationApi(appname, primaryIp, diagnostics) 
     }
 
     if (primaryIp) {
-      const alternativeLocation = locations.find(
+      const alternativeLocations = locations.filter(
         (location) => extractNodeIp(location.ip) !== primaryIp,
       );
+      const alternativeLocation = alternativeLocations.find(
+        (location) => !excludedNodes.has(formatLocationNode(location.ip)),
+      ) || alternativeLocations[0];
 
       if (alternativeLocation) {
         const secondaryNode = formatLocationNode(alternativeLocation.ip);
+        const reused = excludedNodes.has(secondaryNode);
         diagnostics.push({
           check: 'Flux location API',
           outcome: 'success',
           endpoint: locationUrl,
           node: secondaryNode,
-          detail: `Selected a location different from primary ${primaryIp}`,
+          detail: reused
+            ? `All distinct secondary locations were already attempted; retrying ${secondaryNode}`
+            : `Selected an untried location different from primary ${primaryIp}`,
         });
-        log.info(`Found secondary node from location API (primary ${primaryIp}): ${secondaryNode}`);
+        log.info(`${reused ? 'Reusing' : 'Found'} secondary node from location API (primary ${primaryIp}): ${secondaryNode}`);
         return secondaryNode;
       }
 
@@ -394,7 +405,7 @@ async function getSecondaryNodeFromLocationApi(appname, primaryIp, diagnostics) 
  * @param {string} appname - The name of the application
  * @returns {Promise<Object>} Selected node and the diagnostic trail used to select it.
  */
-async function getSecondaryNodeSelection(appname) {
+async function getSecondaryNodeSelection(appname, excludedNodes = new Set()) {
   const diagnostics = [];
   const statsUrl = `${getFdmBaseUrl(appname)}/fluxstatistics?scope=${appname}_`;
   try {
@@ -411,7 +422,7 @@ async function getSecondaryNodeSelection(appname) {
       log.error(`No data received from HAProxy statistics for ${appname}`);
     } else {
       const secondaryNode = parseSecondaryNodeFromHAProxyStats(response.data, appname);
-      if (secondaryNode) {
+      if (secondaryNode && !excludedNodes.has(secondaryNode)) {
         diagnostics.push({
           check: 'FDM HAProxy statistics',
           outcome: 'success',
@@ -428,14 +439,27 @@ async function getSecondaryNodeSelection(appname) {
         };
       }
 
-      diagnostics.push({
-        check: 'FDM HAProxy statistics',
-        outcome: 'failed',
-        endpoint: statsUrl,
-        httpStatus: response.status,
-        detail: 'No UP backup node or second UP active node was present',
-      });
-      log.info(`HAProxy statistics for ${appname} did not yield a secondary node`);
+      if (secondaryNode) {
+        diagnostics.push({
+          check: 'FDM HAProxy statistics',
+          outcome: 'skipped',
+          endpoint: statsUrl,
+          node: secondaryNode,
+          detail: 'Previously attempted node was skipped while looking for another secondary',
+        });
+        log.info(`Skipping previously attempted HAProxy node for ${appname}: ${secondaryNode}`);
+      }
+
+      if (!secondaryNode) {
+        diagnostics.push({
+          check: 'FDM HAProxy statistics',
+          outcome: 'failed',
+          endpoint: statsUrl,
+          httpStatus: response.status,
+          detail: 'No UP backup node or second UP active node was present',
+        });
+        log.info(`HAProxy statistics for ${appname} did not yield a secondary node`);
+      }
     }
   } catch (error) {
     diagnostics.push({
@@ -464,6 +488,7 @@ async function getSecondaryNodeSelection(appname) {
     appname,
     primaryIp,
     diagnostics,
+    excludedNodes,
   );
   return {
     node: secondaryNode,

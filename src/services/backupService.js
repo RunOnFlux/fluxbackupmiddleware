@@ -1954,6 +1954,7 @@ async function processAutomaticBackupInternal() {
   let automaticBackup = null;
   let lastFailure = null;
   const failureAttempts = [];
+  const attemptedNodes = new Set();
   let automaticRunStartedAt = null;
   let automaticRunBatchKey = null;
 
@@ -2028,7 +2029,7 @@ async function processAutomaticBackupInternal() {
       const attemptDiagnostics = [];
       try {
         // Get secondary node from HAProxy
-        const nodeSelection = await fluxOS.getSecondaryNodeSelection(appname);
+        const nodeSelection = await fluxOS.getSecondaryNodeSelection(appname, attemptedNodes);
         attemptDiagnostics.push(...nodeSelection.diagnostics);
         const nodeAddress = nodeSelection.node;
         if (!nodeAddress) {
@@ -2041,6 +2042,7 @@ async function processAutomaticBackupInternal() {
         }
 
         const node = `http://${nodeAddress}`;
+        attemptedNodes.add(nodeAddress);
         log.info(`Using node: ${node}`);
 
         // Get zelidAuth from node
