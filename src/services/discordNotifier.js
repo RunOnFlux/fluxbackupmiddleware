@@ -36,8 +36,22 @@ function sanitizeDiagnosticText(value, max = 300) {
   if (value === null || typeof value === 'undefined') return '';
   const sanitized = String(value)
     .replace(/[\r\n]+/g, ' ')
-    .replace(/(zelidauth|loginPhrase|signature)=([^&\s]+)/gi, '$1=[redacted]');
+    .replace(/(zelidauth|loginPhrase|signature|authorization|apikey)=([^&\s]+)/gi, '$1=[redacted]')
+    .replace(/(["']?(?:zelidauth|loginPhrase|signature|authorization|apikey)["']?\s*:\s*["']?)[^,"'\s}]+/gi, '$1[redacted]');
   return truncate(sanitized, max);
+}
+
+function formatFileSize(bytes) {
+  const size = Number(bytes);
+  if (!Number.isFinite(size) || size < 0) return null;
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  let value = size;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  return `${size} bytes (${value.toFixed(2)} ${units[unitIndex]})`;
 }
 
 function formatDiagnostic(diagnostic) {
@@ -47,7 +61,13 @@ function formatDiagnostic(diagnostic) {
     diagnostic.node ? `node=${sanitizeDiagnosticText(diagnostic.node, 80)}` : null,
     diagnostic.httpStatus ? `HTTP=${diagnostic.httpStatus}` : null,
     diagnostic.errorCode ? `code=${sanitizeDiagnosticText(diagnostic.errorCode, 40)}` : null,
+    diagnostic.fileSize !== null && typeof diagnostic.fileSize !== 'undefined'
+      ? `size=${formatFileSize(diagnostic.fileSize)}` : null,
+    diagnostic.receivedSize !== null && typeof diagnostic.receivedSize !== 'undefined'
+      ? `received=${formatFileSize(diagnostic.receivedSize)}` : null,
     diagnostic.detail ? sanitizeDiagnosticText(diagnostic.detail, 180) : null,
+    diagnostic.responseBody
+      ? `response=${sanitizeDiagnosticText(diagnostic.responseBody, 180)}` : null,
     diagnostic.endpoint ? `<${sanitizeDiagnosticText(diagnostic.endpoint, 240)}>` : null,
   ].filter(Boolean);
   return `- ${fields.join(' | ')}`;
@@ -123,10 +143,17 @@ function formatTaskFailures(taskFailures) {
       const httpStatus = failure.httpStatus ? ` | HTTP=${failure.httpStatus}` : '';
       const errorCode = failure.errorCode
         ? ` | code=${sanitizeDiagnosticText(failure.errorCode, 40)}` : '';
+      const fileSize = failure.fileSize
+        ? ` | size=${formatFileSize(failure.fileSize)}` : '';
+      const receivedSize = failure.receivedSize !== null
+        && typeof failure.receivedSize !== 'undefined'
+        ? ` | received=${formatFileSize(failure.receivedSize)}` : '';
+      const responseBody = failure.responseBody
+        ? ` | response=${sanitizeDiagnosticText(failure.responseBody, 180)}` : '';
       if (failure.taskId) {
-        return `- **${component}** — task #${failure.taskId}${failCount}${node}${httpStatus}${errorCode}${endpoint}: ${sanitizeDiagnosticText(failure.message, 260)}`;
+        return `- **${component}** — task #${failure.taskId}${failCount}${node}${httpStatus}${errorCode}${fileSize}${receivedSize}${responseBody}${endpoint}: ${sanitizeDiagnosticText(failure.message, 260)}`;
       }
-      return `- **${component}**${node}${httpStatus}${errorCode}${endpoint}: ${sanitizeDiagnosticText(failure.message, 260)}`;
+      return `- **${component}**${node}${httpStatus}${errorCode}${fileSize}${receivedSize}${responseBody}${endpoint}: ${sanitizeDiagnosticText(failure.message, 260)}`;
     })
     .join('\n');
 }
@@ -190,6 +217,7 @@ async function sendDailyBackupReport(content, reportDate) {
 module.exports = {
   formatDiagnostic,
   formatFailureAttempts,
+  formatTaskFailures,
   notifyAutomaticBackupFailure,
   sendDailyBackupReport,
 };

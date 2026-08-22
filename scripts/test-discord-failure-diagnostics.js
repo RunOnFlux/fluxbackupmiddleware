@@ -2,6 +2,7 @@ const assert = require('assert');
 const {
   formatDiagnostic,
   formatFailureAttempts,
+  formatTaskFailures,
 } = require('../src/services/discordNotifier');
 
 const diagnostic = formatDiagnostic({
@@ -38,11 +39,28 @@ assert.strictEqual((grouped.match(/Attempts 1, 2, 3/g) || []).length, 1);
 const redacted = formatDiagnostic({
   check: 'Safety test',
   outcome: 'failed',
-  detail: 'loginPhrase=secret&signature=private&zelidauth=token',
+  detail: 'loginPhrase=secret&signature=private&zelidauth=token response={"apikey":"also-secret"}',
 });
 assert(!redacted.includes('secret'));
 assert(!redacted.includes('private'));
 assert(!redacted.includes('token'));
+assert(!redacted.includes('also-secret'));
 assert(redacted.includes('[redacted]'));
+
+const uploadFailure = formatTaskFailures([{
+  taskId: 7859,
+  component: 'palworld',
+  message: 'Storage capacity exceeded',
+  fails: 4,
+  node: 'https://fluxdrive.example',
+  endpoint: 'https://fluxdrive.example/api/v0/put',
+  httpStatus: 413,
+  fileSize: 549816340,
+  responseBody: '{"status":"error","message":"Storage capacity exceeded"}',
+}]);
+assert(uploadFailure.includes('HTTP=413'));
+assert(uploadFailure.includes('549816340 bytes (524.35 MiB)'));
+assert(uploadFailure.includes('response={"status":"error"'));
+assert(uploadFailure.includes('Storage capacity exceeded'));
 
 console.log('Discord failure diagnostic tests passed');

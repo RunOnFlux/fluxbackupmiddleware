@@ -52,7 +52,20 @@ function logUploadFailure(file, fileName, fileSize, reason, statusCode = null) {
   log.error(`FluxDrive upload failed: taskId=${file.taskId}, appname=${file.appname}, file=${fileName}, size=${fileSize} bytes (${sizeMiB} MiB)${status}, reason=${reason}`);
 }
 
-function createUploadError(reason, endpoint, httpStatus = null, errorCode = null) {
+function formatResponseBody(response) {
+  if (response === null || typeof response === 'undefined') return null;
+  const value = typeof response === 'string' ? response : JSON.stringify(response);
+  return value.replace(/[\r\n]+/g, ' ').slice(0, 500);
+}
+
+function createUploadError(
+  reason,
+  endpoint,
+  fileSize,
+  httpStatus = null,
+  errorCode = null,
+  responseBody = null,
+) {
   const error = new Error(reason);
   error.diagnostic = {
     check: 'FluxDrive upload',
@@ -61,6 +74,8 @@ function createUploadError(reason, endpoint, httpStatus = null, errorCode = null
     node: new URL(endpoint).origin,
     httpStatus,
     errorCode,
+    fileSize,
+    responseBody: formatResponseBody(responseBody),
     detail: reason,
   };
   return error;
@@ -302,7 +317,7 @@ async function uploadFile(file) {
           const reason = `Invalid FluxDrive response: ${error.message}`;
           logUploadFailure(file, fileName, fileSize, reason, res.statusCode);
           file.status = { state: 'failed', message: reason, progress: 0 };
-          reject(createUploadError(reason, fullUrl, res.statusCode));
+          reject(createUploadError(reason, fullUrl, fileSize, res.statusCode, null, data));
           return;
         }
         // console.log(result);
@@ -316,7 +331,7 @@ async function uploadFile(file) {
           const reason = getUploadFailureReason(result, 'FluxDrive did not return an upload hash');
           logUploadFailure(file, fileName, fileSize, reason, res.statusCode);
           file.status = { state: 'failed', message: reason, progress: 0 };
-          reject(createUploadError(reason, fullUrl, res.statusCode));
+          reject(createUploadError(reason, fullUrl, fileSize, res.statusCode, null, result));
         }
       });
     });
@@ -325,7 +340,7 @@ async function uploadFile(file) {
       const reason = error.message || 'FluxDrive request failed';
       logUploadFailure(file, fileName, fileSize, reason);
       file.status = { state: 'failed', message: reason, progress: 0 };
-      reject(createUploadError(reason, fullUrl, null, error.code || null));
+      reject(createUploadError(reason, fullUrl, fileSize, null, error.code || null));
     });
 
     form.pipe(req);

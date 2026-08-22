@@ -120,6 +120,49 @@ async function getDownloadResponse(url, headers, redirectsRemaining = 5) {
   return response;
 }
 
+async function getResponseSummary(response, maxLength = 500) {
+  let summary = '';
+  // eslint-disable-next-line no-restricted-syntax
+  for await (const chunk of response) {
+    if (summary.length < maxLength) {
+      summary += chunk.toString().slice(0, maxLength - summary.length);
+    }
+  }
+  return summary.replace(/[\r\n]+/g, ' ');
+}
+
+function addDownloadDiagnostic(error, task, url, node, responseBody = null) {
+  if (!error.diagnostic) {
+    error.diagnostic = {
+      check: 'Flux node backup download',
+      outcome: 'failed',
+      endpoint: url.href,
+      node,
+      httpStatus: error.httpStatus || null,
+      errorCode: error.code || null,
+      fileSize: Number(task.filesize) || 0,
+      receivedSize: Number.isFinite(error.receivedSize) ? error.receivedSize : null,
+      responseBody: responseBody || error.responseBody || null,
+      detail: error.message,
+    };
+  }
+  return error;
+}
+
+function getUnexpectedFilePreview(filePath, actualSize, maxLength = 500) {
+  if (actualSize <= 0 || actualSize > 4096 || !fs.existsSync(filePath)) return null;
+  const descriptor = fs.openSync(filePath, 'r');
+  try {
+    const buffer = Buffer.alloc(Math.min(actualSize, maxLength));
+    const bytesRead = fs.readSync(descriptor, buffer, 0, buffer.length, 0);
+    const preview = buffer.subarray(0, bytesRead).toString('utf8').replace(/[\r\n]+/g, ' ');
+    const printableCharacters = preview.replace(/[^\x20-\x7E]/g, '').length;
+    return printableCharacters / Math.max(preview.length, 1) >= 0.8 ? preview : null;
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
 /**
  * Downloads a file from a host for a given task.
  *
@@ -146,11 +189,16 @@ async function downloadFileFromHost(task) {
     );
   } catch (authError) {
     log.error('Failed to authenticate with node:', authError);
-    throw authError;
+    throw addDownloadDiagnostic(authError, task, url, node);
   }
 
   if (!zelidauth) {
-    throw new Error('Failed to authenticate with node');
+    throw addDownloadDiagnostic(
+      new Error('Failed to authenticate with node before backup download'),
+      task,
+      url,
+      node,
+    );
   }
   const finalPath = taskFileStorage.getTaskFilePath(task);
   const partialPath = taskFileStorage.getTaskPartialFilePath(task);
@@ -168,8 +216,10 @@ async function downloadFileFromHost(task) {
   try {
     const response = await getDownloadResponse(url, { zelidauth });
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      response.resume();
-      throw new Error(`Backup download returned HTTP ${response.statusCode}`);
+      const responseBody = await getResponseSummary(response);
+      const httpError = new Error(`Backup download returned HTTP ${response.statusCode}`);
+      httpError.httpStatus = response.statusCode;
+      throw addDownloadDiagnostic(httpError, task, url, node, responseBody);
     }
 
     const contentLength = Number(response.headers['content-length']);
@@ -194,7 +244,10 @@ async function downloadFileFromHost(task) {
 
     const actualSize = fs.statSync(partialPath).size;
     if (actualSize !== expectedSize) {
-      throw new Error(`File size mismatch ${expectedSize}<>${actualSize}`);
+      const sizeError = new Error(`File size mismatch ${expectedSize}<>${actualSize}`);
+      sizeError.receivedSize = actualSize;
+      sizeError.responseBody = getUnexpectedFilePreview(partialPath, actualSize);
+      throw sizeError;
     }
 
     fs.renameSync(partialPath, finalPath);
@@ -203,6 +256,7 @@ async function downloadFileFromHost(task) {
     task.downloaded = true;
     return true;
   } catch (error) {
+    addDownloadDiagnostic(error, task, url, node);
     try {
       taskFileStorage.removeTaskArtifacts(task);
     } catch (cleanupError) {

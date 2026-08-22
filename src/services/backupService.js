@@ -522,6 +522,50 @@ async function notifyAutomaticBackupFailureOnce(
   return sent;
 }
 
+const TASK_PROGRESS_STATES = new Set(['in queue', 'started', 'downloading', 'uploading']);
+
+function getTaskStatusState(task) {
+  return String(task?.status?.state || '').trim().toLowerCase();
+}
+
+function getTaskOutcome(task) {
+  if (!task) {
+    return { state: 'failed', reason: 'Task not found in database' };
+  }
+
+  const fails = Number(task.fails) || 0;
+  const finishTime = Number(task.finishTime) || 0;
+  const uploaded = Number(task.uploaded) === 1;
+  const statusState = getTaskStatusState(task);
+  const statusMessage = task.status?.message;
+
+  if (fails >= TASK_MAX_FAILURES) {
+    return {
+      state: 'failed',
+      reason: TASK_PROGRESS_STATES.has(statusState)
+        ? `Task failed ${fails} times`
+        : statusMessage || `Task failed ${fails} times`,
+    };
+  }
+
+  // A zero finishTime may be returned as either 0 or "0" by the database.
+  // Progress status messages must never be interpreted as terminal failures.
+  if (finishTime <= 0) {
+    return { state: 'pending' };
+  }
+
+  if (uploaded && statusState === 'finished') {
+    return { state: 'success' };
+  }
+
+  return {
+    state: 'failed',
+    reason: TASK_PROGRESS_STATES.has(statusState)
+      ? 'Task ended before the FluxDrive upload completed'
+      : statusMessage || 'Task did not upload successfully',
+  };
+}
+
 function buildTaskFailure(task, taskId, reason) {
   let node = null;
   let storedDiagnostic = null;
@@ -542,12 +586,19 @@ function buildTaskFailure(task, taskId, reason) {
   return {
     taskId,
     component: task?.component || 'unknown',
-    message: task?.status?.message || reason,
+    message: reason,
     fails: task?.fails || 0,
     node: storedDiagnostic?.node || node,
     endpoint: storedDiagnostic?.endpoint || task?.host || null,
     httpStatus: storedDiagnostic?.httpStatus || null,
     errorCode: storedDiagnostic?.errorCode || null,
+    fileSize: Number(storedDiagnostic?.fileSize ?? task?.filesize) || 0,
+    receivedSize: storedDiagnostic?.receivedSize !== null
+      && typeof storedDiagnostic?.receivedSize !== 'undefined'
+      && Number.isFinite(Number(storedDiagnostic.receivedSize))
+      ? Number(storedDiagnostic.receivedSize) : null,
+    responseBody: storedDiagnostic?.responseBody || null,
+    check: storedDiagnostic?.check || null,
   };
 }
 
@@ -556,7 +607,14 @@ async function collectTaskFailures(taskIds, reason) {
   for (let i = 0; i < taskIds.length; i += 1) {
     const taskId = taskIds[i];
     const task = await dbCli.getTask(taskId);
-    failures.push(buildTaskFailure(task, taskId, reason));
+    const outcome = getTaskOutcome(task);
+    if (outcome.state !== 'success') {
+      failures.push(buildTaskFailure(
+        task,
+        taskId,
+        outcome.state === 'failed' ? outcome.reason : reason,
+      ));
+    }
   }
   return failures;
 }
@@ -1423,57 +1481,32 @@ async function waitForTasksToComplete(taskIds, timeoutMinutes = 60) {
   log.info(`Waiting for ${taskIds.length} tasks to complete: ${taskIds.join(', ')}`);
 
   while (Date.now() - startTime < timeout) {
-    let allCompleted = true;
-    let allSettled = true;
-    let failureReason = null;
-    let failedTaskId = null;
+    let hasPendingTasks = false;
+    const failures = [];
 
     for (let i = 0; i < taskIds.length; i += 1) {
       const taskId = taskIds[i];
       const task = await dbCli.getTask(taskId);
+      const outcome = getTaskOutcome(task);
 
-      if (!task) {
-        failureReason = failureReason || 'Task not found in database';
-        failedTaskId = failedTaskId || taskId;
+      if (outcome.state === 'pending') {
+        hasPendingTasks = true;
         // eslint-disable-next-line no-continue
         continue;
       }
 
-      if (task.fails >= TASK_MAX_FAILURES) {
-        failureReason = failureReason || `Task failed ${task.fails} times`;
-        failedTaskId = failedTaskId || taskId;
-        log.error(`Task ${taskId} failed ${task.fails} times: ${task.status?.message || failureReason}`);
-        // eslint-disable-next-line no-continue
-        continue;
-      }
-
-      if (task.finishTime === 0) {
-        allCompleted = false;
-        allSettled = false;
-        // eslint-disable-next-line no-continue
-        continue;
-      }
-
-      if (task.uploaded !== 1) {
-        failureReason = failureReason || task.status?.message || 'Task did not upload successfully';
-        failedTaskId = failedTaskId || taskId;
-        log.error(`Task ${taskId} did not upload successfully: ${failureReason}`);
+      if (outcome.state === 'failed') {
+        failures.push(buildTaskFailure(task, taskId, outcome.reason));
+        log.error(`Task ${taskId} failed: ${outcome.reason}`);
       }
     }
 
-    if (failureReason && allSettled) {
+    if (!hasPendingTasks && failures.length > 0) {
       log.error('Some tasks failed after all component tasks settled.');
-      const failures = await collectTaskFailures(taskIds, failureReason);
-      if (failedTaskId) {
-        const failedIndex = failures.findIndex((failure) => failure.taskId === failedTaskId);
-        if (failedIndex >= 0) {
-          failures[failedIndex].message = failureReason;
-        }
-      }
       return { success: false, failures };
     }
 
-    if (allCompleted) {
+    if (!hasPendingTasks) {
       log.info('All tasks completed successfully');
       return { success: true, failures: [] };
     }
@@ -1895,57 +1928,97 @@ async function claimNextAutomaticBackup(database, now, requestedToken = null) {
   };
 }
 
-function backupTaskIdsMatch(storedTaskIds, expectedTaskIds) {
+function parseBackupTaskIds(storedTaskIds) {
   let parsed = storedTaskIds;
   if (typeof parsed === 'string') {
     try {
       parsed = JSON.parse(parsed);
     } catch (error) {
-      return false;
+      return null;
     }
   }
-  if (!Array.isArray(parsed) || parsed.length !== expectedTaskIds.length) return false;
+  return Array.isArray(parsed) ? parsed.map(Number) : null;
+}
+
+function backupTaskIdsMatch(storedTaskIds, expectedTaskIds) {
+  const parsed = parseBackupTaskIds(storedTaskIds);
+  if (!parsed || parsed.length !== expectedTaskIds.length) return false;
   return parsed.every((taskId, index) => Number(taskId) === Number(expectedTaskIds[index]));
 }
 
-async function persistAutomaticBackupCompletion(database, automaticBackup, taskIds) {
+async function persistAutomaticBackupCompletion(
+  database,
+  automaticBackup,
+  taskIds,
+  retryDelayMs = 1000,
+) {
   const backupTasksJson = JSON.stringify(taskIds);
   let updateError = null;
-  try {
-    const result = await database.execute(
-      `UPDATE automatic_backups SET backup_tasks = ?, status = ?,
-        dispatch_token = NULL, dispatch_lease_until = 0,
-        last_failure_fingerprint = NULL, last_failure_notified_at = 0
-       WHERE id = ? AND dispatch_token = ?`,
-      [backupTasksJson, 'done', automaticBackup.id, automaticBackup.dispatch_token],
-    );
-    if (result.affectedRows === 1) return true;
-    updateError = createBackupFailure(
-      `Lost dispatch lease while marking ${automaticBackup.appname} as completed`,
-      'database',
-    );
-  } catch (error) {
-    updateError = error;
+  const maxAttempts = 3;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const result = await database.execute(
+        `UPDATE automatic_backups SET backup_tasks = ?, status = ?,
+          dispatch_token = NULL, dispatch_lease_until = 0,
+          last_failure_fingerprint = NULL, last_failure_notified_at = 0
+         WHERE id = ? AND dispatch_token = ?`,
+        [backupTasksJson, 'done', automaticBackup.id, automaticBackup.dispatch_token],
+      );
+      if (result.affectedRows === 1) {
+        return { canonicalTaskIds: taskIds, duplicateTaskIds: [] };
+      }
+      updateError = new Error(
+        `Dispatch token no longer matched while marking ${automaticBackup.appname} as completed`,
+      );
+    } catch (error) {
+      updateError = error;
+    }
+
+    try {
+      const rows = await database.execute(
+        `SELECT status, backup_tasks, dispatch_token, last_backup_timestamp
+         FROM automatic_backups WHERE id = ?`,
+        [automaticBackup.id],
+      );
+      const stored = rows[0];
+      const storedTaskIds = parseBackupTaskIds(stored?.backup_tasks);
+      const sameDispatch = Number(stored?.last_backup_timestamp)
+        === Number(automaticBackup.last_backup_timestamp);
+
+      if (stored?.status === 'done' && !stored.dispatch_token) {
+        if (backupTaskIdsMatch(stored.backup_tasks, taskIds)) {
+          log.warn(`Automatic backup completion for ${automaticBackup.appname} was confirmed after an ambiguous database response`);
+          return { canonicalTaskIds: taskIds, duplicateTaskIds: [] };
+        }
+        if (sameDispatch && storedTaskIds) {
+          log.warn(`Automatic backup ${automaticBackup.appname} was already completed by an earlier attempt in the same dispatch; keeping tasks ${storedTaskIds.join(', ')} and rolling back duplicates ${taskIds.join(', ')}`);
+          return { canonicalTaskIds: storedTaskIds, duplicateTaskIds: taskIds };
+        }
+      }
+
+      if (stored && stored.dispatch_token !== automaticBackup.dispatch_token) {
+        updateError = new Error(
+          `Dispatch ownership changed before ${automaticBackup.appname} could be marked completed`,
+        );
+        break;
+      }
+    } catch (confirmationError) {
+      log.error(`Could not confirm automatic backup completion for ${automaticBackup.appname} (attempt ${attempt}/${maxAttempts}): ${getErrorMessage(confirmationError)}`);
+    }
+
+    if (attempt < maxAttempts && retryDelayMs > 0) {
+      await new Promise((resolve) => { setTimeout(resolve, retryDelayMs); });
+    }
   }
 
-  try {
-    const rows = await database.execute(
-      'SELECT status, backup_tasks, dispatch_token FROM automatic_backups WHERE id = ?',
-      [automaticBackup.id],
-    );
-    const stored = rows[0];
-    if (
-      stored?.status === 'done'
-      && !stored.dispatch_token
-      && backupTaskIdsMatch(stored.backup_tasks, taskIds)
-    ) {
-      log.warn(`Automatic backup completion for ${automaticBackup.appname} was confirmed after an ambiguous database response`);
-      return true;
-    }
-  } catch (confirmationError) {
-    log.error(`Could not confirm automatic backup completion for ${automaticBackup.appname}: ${getErrorMessage(confirmationError)}`);
-  }
-  throw updateError;
+  const reason = `Backup files uploaded, but completion could not be confirmed for ${automaticBackup.appname}: ${getErrorMessage(updateError)}`;
+  throw createBackupFailure(reason, 'completion_persistence', [], [{
+    check: 'Persist automatic backup completion',
+    outcome: 'failed',
+    errorCode: updateError?.code || null,
+    detail: getErrorMessage(updateError),
+  }]);
 }
 
 async function processAutomaticBackupInternal() {
@@ -2209,25 +2282,46 @@ async function processAutomaticBackupInternal() {
           log.info(`Remote file removal complete: ${remoteRemovalCount}/${taskIds.length} files removed from nodes`);
 
           // Update automatic_backups record with new task IDs and set status to 'done'
-          await persistAutomaticBackupCompletion(dbCli, automaticBackup, taskIds);
-
-          const [completedStats] = await dbCli.execute(
-            `SELECT COUNT(*) AS file_count, COALESCE(SUM(filesize), 0) AS total_size
-             FROM tasks WHERE taskId IN (${taskIds.map(() => '?').join(', ')})`,
+          const completionResult = await persistAutomaticBackupCompletion(
+            dbCli,
+            automaticBackup,
             taskIds,
           );
+          const completedTaskIds = completionResult.canonicalTaskIds;
+
+          if (completionResult.duplicateTaskIds.length > 0) {
+            try {
+              const duplicateCleanup = await cleanupIncompleteAutomaticBackupTasks(
+                completionResult.duplicateTaskIds,
+              );
+              log.warn(`Duplicate automatic backup rollback for ${appname}: ${duplicateCleanup.removed} removed, ${duplicateCleanup.failed} failed, ${duplicateCleanup.inProgress} still in progress`);
+            } catch (cleanupError) {
+              log.error(`Could not roll back duplicate automatic tasks for ${appname}; periodic cleanup will retry: ${getErrorMessage(cleanupError)}`);
+            }
+          }
+
+          let completedStats = null;
+          try {
+            [completedStats] = await dbCli.execute(
+              `SELECT COUNT(*) AS file_count, COALESCE(SUM(filesize), 0) AS total_size
+               FROM tasks WHERE taskId IN (${completedTaskIds.map(() => '?').join(', ')})`,
+              completedTaskIds,
+            );
+          } catch (statsError) {
+            log.error(`Automatic backup ${appname} is complete, but its activity statistics could not be loaded: ${getErrorMessage(statsError)}`);
+          }
           await recordAutomaticRunActivity({
             automaticBackup,
             runStartedAt: automaticRunStartedAt,
             batchKey: automaticRunBatchKey,
             outcome: 'success',
-            fileCount: Number(completedStats?.file_count) || taskIds.length,
+            fileCount: Number(completedStats?.file_count) || completedTaskIds.length,
             filesize: Number(completedStats?.total_size) || 0,
             stage: 'completed',
             reason: 'All component tasks completed successfully',
           });
 
-          log.info(`Successfully processed automatic backup for ${appname}. Created ${taskIds.length} tasks.`);
+          log.info(`Successfully processed automatic backup for ${appname}. Stored ${completedTaskIds.length} canonical tasks.`);
           return true;
         }
 
@@ -2237,12 +2331,15 @@ async function processAutomaticBackupInternal() {
         const rollbackResult = await cleanupIncompleteAutomaticBackupTasks(taskIds);
         waitResult.failures.forEach((failure) => {
           attemptDiagnostics.push({
-            check: `Component pipeline (${failure.component})`,
+            check: failure.check || `Component pipeline (${failure.component})`,
             outcome: 'failed',
             node: failure.node || node,
             endpoint: failure.endpoint || null,
             httpStatus: failure.httpStatus || null,
             errorCode: failure.errorCode || null,
+            fileSize: failure.fileSize || 0,
+            receivedSize: failure.receivedSize,
+            responseBody: failure.responseBody || null,
             detail: failure.message,
           });
         });
@@ -2270,6 +2367,10 @@ async function processAutomaticBackupInternal() {
         });
         if (lastFailure.stage === 'task_pipeline') {
           log.error(`Automatic backup ${appname} failed after component-level retries:`, lastFailure.reason);
+          break;
+        }
+        if (lastFailure.stage === 'completion_persistence') {
+          log.error(`Automatic backup ${appname} will not recreate uploaded files because completion is unconfirmed:`, lastFailure.reason);
           break;
         }
 
@@ -2465,5 +2566,7 @@ module.exports = {
     inferFailureStage,
     buildAutomaticFailureFingerprint,
     notifyAutomaticBackupFailureOnce,
+    getTaskOutcome,
+    buildTaskFailure,
   },
 };

@@ -77,8 +77,11 @@ async function main() {
       assert(sql.includes('UPDATE automatic_backups'));
       return { affectedRows: 1 };
     },
-  }, automaticBackup, completionTasks);
-  assert.strictEqual(completed, true);
+  }, automaticBackup, completionTasks, 0);
+  assert.deepStrictEqual(completed, {
+    canonicalTaskIds: completionTasks,
+    duplicateTaskIds: [],
+  });
 
   let completionCalls = 0;
   const confirmedAfterTimeout = await testHooks.persistAutomaticBackupCompletion({
@@ -87,9 +90,50 @@ async function main() {
       if (sql.includes('UPDATE automatic_backups')) throw timeout;
       return [{ status: 'done', backup_tasks: '[10,11]', dispatch_token: null }];
     },
-  }, automaticBackup, completionTasks);
-  assert.strictEqual(confirmedAfterTimeout, true);
+  }, automaticBackup, completionTasks, 0);
+  assert.deepStrictEqual(confirmedAfterTimeout, {
+    canonicalTaskIds: completionTasks,
+    duplicateTaskIds: [],
+  });
   assert.strictEqual(completionCalls, 2);
+
+  let retryUpdateCalls = 0;
+  const completedOnDatabaseRetry = await testHooks.persistAutomaticBackupCompletion({
+    execute: async (sql) => {
+      if (sql.includes('UPDATE automatic_backups')) {
+        retryUpdateCalls += 1;
+        if (retryUpdateCalls === 1) throw timeout;
+        return { affectedRows: 1 };
+      }
+      return [{
+        status: 'pending',
+        backup_tasks: null,
+        dispatch_token: 'completion-token',
+        last_backup_timestamp: automaticBackup.last_backup_timestamp,
+      }];
+    },
+  }, automaticBackup, completionTasks, 0);
+  assert.strictEqual(retryUpdateCalls, 2);
+  assert.deepStrictEqual(completedOnDatabaseRetry, {
+    canonicalTaskIds: completionTasks,
+    duplicateTaskIds: [],
+  });
+
+  const priorAttemptCompleted = await testHooks.persistAutomaticBackupCompletion({
+    execute: async (sql) => {
+      if (sql.includes('UPDATE automatic_backups')) return { affectedRows: 0 };
+      return [{
+        status: 'done',
+        backup_tasks: '[7]',
+        dispatch_token: null,
+        last_backup_timestamp: automaticBackup.last_backup_timestamp,
+      }];
+    },
+  }, automaticBackup, completionTasks, 0);
+  assert.deepStrictEqual(priorAttemptCompleted, {
+    canonicalTaskIds: [7],
+    duplicateTaskIds: completionTasks,
+  });
 
   await assert.rejects(
     testHooks.persistAutomaticBackupCompletion({
@@ -97,8 +141,8 @@ async function main() {
         if (sql.includes('UPDATE automatic_backups')) throw timeout;
         return [{ status: 'pending', backup_tasks: null, dispatch_token: 'completion-token' }];
       },
-    }, automaticBackup, completionTasks),
-    /Query inactivity timeout/,
+    }, automaticBackup, completionTasks, 0),
+    /Backup files uploaded, but completion could not be confirmed/,
   );
 
   let releaseDispatcher;
