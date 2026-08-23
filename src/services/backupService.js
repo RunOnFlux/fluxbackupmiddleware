@@ -157,13 +157,26 @@ async function backfillTerminalTaskActivity(period) {
 
 async function collectDailyBackupMetrics(period) {
   await backfillTerminalTaskActivity(period);
+  const now = Date.now();
+  const marketplaceCutoff = now - (
+    config.automaticBackupSchedule.marketplaceIntervalHours * 60 * 60 * 1000
+  );
   const [appInventoryRow] = await dbCli.execute(`
     SELECT
       COALESCE(SUM(status IS NULL OR status != 'cancelled'), 0) AS active_apps,
       COALESCE(SUM((status IS NULL OR status != 'cancelled') AND is_marketplace = 1), 0)
-        AS marketplace_apps
+        AS marketplace_apps,
+      COALESCE(SUM(
+        status != 'cancelled' AND is_marketplace = 1 AND status = 'pending'
+        AND dispatch_token IS NOT NULL AND dispatch_lease_until > 0
+        AND dispatch_lease_until < ?
+      ), 0) AS stale_marketplace_leases,
+      COALESCE(SUM(
+        status != 'cancelled' AND is_marketplace = 1
+        AND last_backup_timestamp < ?
+      ), 0) AS overdue_marketplace_apps
     FROM automatic_backups
-  `);
+  `, [now, marketplaceCutoff]);
   const aggregateRows = await dbCli.execute(`
     SELECT
       CASE WHEN backup_type LIKE 'automatic%' THEN 'automatic' ELSE 'manual' END AS report_type,
@@ -198,17 +211,28 @@ async function collectDailyBackupMetrics(period) {
 
   const batchRows = await dbCli.execute(`
     SELECT
-      CASE WHEN backup_type LIKE 'automatic%' THEN 'automatic' ELSE 'manual' END AS report_type,
-      CONCAT(appname, ':', SUBSTRING_INDEX(batch_key, ':', -1)) AS report_batch,
-      SUM(event_kind = 'run' AND outcome = 'success') AS successful_runs,
-      SUM(event_kind = 'run' AND outcome = 'failed') AS failed_runs,
-      SUM(event_kind = 'file' AND outcome = 'success') AS successful_files,
-      SUM(event_kind = 'file' AND outcome = 'failed') AS failed_files
-    FROM backup_activity_events
-    WHERE occurred_at >= ? AND occurred_at < ?
-    GROUP BY report_type, report_batch
+      events.appname,
+      CASE WHEN events.backup_type LIKE 'automatic%' THEN 'automatic' ELSE 'manual' END
+        AS report_type,
+      CONCAT(events.appname, ':', SUBSTRING_INDEX(events.batch_key, ':', -1))
+        AS report_batch,
+      MAX(
+        apps.is_marketplace = 1 AND (apps.status IS NULL OR apps.status != 'cancelled')
+      ) AS is_active_marketplace,
+      SUM(events.event_kind = 'run' AND events.outcome = 'success') AS successful_runs,
+      SUM(events.event_kind = 'run' AND events.outcome = 'failed') AS failed_runs,
+      SUM(events.event_kind = 'file' AND events.outcome = 'success') AS successful_files,
+      SUM(events.event_kind = 'file' AND events.outcome = 'failed') AS failed_files
+    FROM backup_activity_events events
+    LEFT JOIN automatic_backups apps
+      ON events.appname COLLATE utf8mb4_unicode_ci
+        = apps.appname COLLATE utf8mb4_unicode_ci
+    WHERE events.occurred_at >= ? AND events.occurred_at < ?
+    GROUP BY events.appname, report_type, report_batch
   `, [period.start, period.end]);
   const manualRuns = emptyReportMetric();
+  const attemptedMarketplaceApps = new Set();
+  const successfulMarketplaceApps = new Set();
   batchRows.forEach((row) => {
     const target = row.report_type === 'automatic' ? automaticRuns : manualRuns;
     const failed = Number(row.failed_runs) > 0 || Number(row.failed_files) > 0;
@@ -217,12 +241,28 @@ async function collectDailyBackupMetrics(period) {
     target.total += 1;
     if (failed) target.failed += 1;
     else target.successful += 1;
+    if (row.report_type === 'automatic' && Number(row.is_active_marketplace) === 1) {
+      attemptedMarketplaceApps.add(row.appname);
+      if (!failed && successful) successfulMarketplaceApps.add(row.appname);
+    }
   });
+
+  const marketplaceApps = Number(appInventoryRow?.marketplace_apps) || 0;
+  const marketplaceAttempted = attemptedMarketplaceApps.size;
+  const marketplaceSuccessful = successfulMarketplaceApps.size;
 
   return {
     appInventory: {
       active: Number(appInventoryRow?.active_apps) || 0,
-      marketplace: Number(appInventoryRow?.marketplace_apps) || 0,
+      marketplace: marketplaceApps,
+    },
+    marketplaceCoverage: {
+      attempted: marketplaceAttempted,
+      successful: marketplaceSuccessful,
+      failedOrIncomplete: Math.max(marketplaceAttempted - marketplaceSuccessful, 0),
+      noActivity: Math.max(marketplaceApps - marketplaceAttempted, 0),
+      staleLeases: Number(appInventoryRow?.stale_marketplace_leases) || 0,
+      overdue: Number(appInventoryRow?.overdue_marketplace_apps) || 0,
     },
     automaticRuns,
     automaticFiles,
@@ -1861,19 +1901,28 @@ async function claimNextAutomaticBackup(database, now, requestedToken = null) {
      WHERE status != ?
      AND (dispatch_lease_until = 0 OR dispatch_lease_until < ?)
      AND (
-       (is_marketplace = 1 AND last_backup_timestamp < ?)
+       (
+         status = 'pending' AND dispatch_token IS NOT NULL
+         AND dispatch_lease_until > 0 AND dispatch_lease_until < ?
+       )
+       OR (is_marketplace = 1 AND last_backup_timestamp < ?)
        OR ((is_marketplace = 0 OR is_marketplace IS NULL) AND last_backup_timestamp < ?)
      )
-     ORDER BY CASE
-       WHEN is_marketplace = 1 THEN last_backup_timestamp + ?
-       ELSE last_backup_timestamp + ?
-     END ASC
+     ORDER BY
+       CASE WHEN status = 'pending' AND dispatch_token IS NOT NULL
+         AND dispatch_lease_until > 0 AND dispatch_lease_until < ? THEN 0 ELSE 1 END ASC,
+       CASE
+         WHEN is_marketplace = 1 THEN last_backup_timestamp + ?
+         ELSE last_backup_timestamp + ?
+       END ASC
      LIMIT 1`,
     [
       'cancelled',
       now,
+      now,
       marketplaceCutoff,
       standardCutoff,
+      now,
       marketplaceIntervalMs,
       standardIntervalMs,
     ],
@@ -1881,6 +1930,10 @@ async function claimNextAutomaticBackup(database, now, requestedToken = null) {
   if (candidates.length === 0) return null;
 
   const candidate = candidates[0];
+  const reclaimingStaleLease = candidate.status === 'pending'
+    && Boolean(candidate.dispatch_token)
+    && Number(candidate.dispatch_lease_until) > 0
+    && Number(candidate.dispatch_lease_until) < now;
   const dispatchToken = requestedToken || crypto.randomBytes(16).toString('hex');
   const leaseUntil = now + (
     config.automaticBackupSchedule.dispatcherLeaseMinutes * 60 * 1000
@@ -1904,6 +1957,9 @@ async function claimNextAutomaticBackup(database, now, requestedToken = null) {
       log.info(`Automatic backup claim lost for ${candidate.appname}; another dispatcher claimed it`);
       return null;
     }
+    if (reclaimingStaleLease) {
+      log.warn(`Reclaimed expired automatic backup dispatch for ${candidate.appname}; previous lease expired at ${new Date(Number(candidate.dispatch_lease_until)).toISOString()}`);
+    }
   } catch (error) {
     log.error(`Automatic backup claim update failed for ${candidate.appname}: ${getErrorMessage(error)}`);
     try {
@@ -1925,6 +1981,7 @@ async function claimNextAutomaticBackup(database, now, requestedToken = null) {
     dispatch_lease_until: leaseUntil,
     last_backup_timestamp: now,
     status: candidate.status,
+    reclaimed_stale_lease: reclaimingStaleLease,
   };
 }
 

@@ -52,6 +52,14 @@ assert.strictEqual(dailyBackupReport.formatBytes(5 * 1024 * 1024), '5.00 MiB');
 const content = dailyBackupReport.buildDailyReportContent({
   reportDate: '2026-08-20',
   appInventory: { active: 504, marketplace: 347 },
+  marketplaceCoverage: {
+    attempted: 320,
+    successful: 300,
+    failedOrIncomplete: 20,
+    noActivity: 27,
+    staleLeases: 4,
+    overdue: 31,
+  },
   automaticRuns: { total: 3, successful: 2, failed: 1 },
   automaticFiles: {
     total: 5,
@@ -71,6 +79,8 @@ const content = dailyBackupReport.buildDailyReportContent({
 assert(content.includes('**Period:** 2026-08-20 00:00–24:00 UTC'));
 assert(content.includes('Active apps: 504'));
 assert(content.includes('Marketplace apps: 347'));
+assert(content.includes('Marketplace period coverage: 320 attempted — 300 successful, 20 failed/incomplete, 27 no activity'));
+assert(content.includes('Marketplace scheduler health now: 4 stale leases, 31 overdue'));
 assert(content.includes('Backup batches: 3 total — 2 successful, 1 failed'));
 assert(content.includes('Backup batches: 2 total — 1 successful, 1 failed'));
 assert(content.includes('Component files: 5 total — 4 successful, 1 failed'));

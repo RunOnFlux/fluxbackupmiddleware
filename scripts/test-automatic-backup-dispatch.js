@@ -1,5 +1,6 @@
 const assert = require('assert');
 
+const config = require('../config/default');
 const log = require('../src/lib/log');
 const { testHooks } = require('../src/services/backupService');
 
@@ -15,10 +16,19 @@ const candidate = {
   is_marketplace: 1,
 };
 
-function createDatabase({ claimResult, claimError, confirmation = [] }) {
+function createDatabase({
+  claimResult,
+  claimError,
+  confirmation = [],
+  selectedCandidate = candidate,
+  onSelect = null,
+}) {
   return {
     async execute(sql) {
-      if (sql.includes('SELECT *')) return [candidate];
+      if (sql.includes('SELECT *')) {
+        if (onSelect) onSelect(sql);
+        return [selectedCandidate];
+      }
       if (sql.includes('SET dispatch_token')) {
         if (claimError) throw claimError;
         return claimResult;
@@ -34,6 +44,9 @@ async function main() {
   log.warn = () => {};
   log.info = () => {};
 
+  assert.strictEqual(config.automaticBackupSchedule.dispatcherIntervalMinutes, 2);
+  assert.strictEqual(config.automaticBackupSchedule.maxConcurrentAutomaticBackups, 4);
+
   const now = Date.parse('2026-08-21T10:00:00.000Z');
   const claimed = await testHooks.claimNextAutomaticBackup(
     createDatabase({ claimResult: { affectedRows: 1 } }),
@@ -44,6 +57,27 @@ async function main() {
   assert.strictEqual(claimed.dispatch_token, 'claim-token');
   assert.strictEqual(claimed.last_backup_timestamp, now);
   assert(claimed.dispatch_lease_until > now);
+
+  const staleCandidate = {
+    ...candidate,
+    status: 'pending',
+    dispatch_token: 'expired-token',
+    dispatch_lease_until: now - 1,
+    last_backup_timestamp: now - (60 * 60 * 1000),
+  };
+  let staleSelectionSql = '';
+  const reclaimed = await testHooks.claimNextAutomaticBackup(
+    createDatabase({
+      claimResult: { affectedRows: 1 },
+      selectedCandidate: staleCandidate,
+      onSelect: (sql) => { staleSelectionSql = sql; },
+    }),
+    now,
+    'replacement-token',
+  );
+  assert(staleSelectionSql.includes("status = 'pending' AND dispatch_token IS NOT NULL"));
+  assert.strictEqual(reclaimed.reclaimed_stale_lease, true);
+  assert.strictEqual(reclaimed.dispatch_token, 'replacement-token');
 
   const lost = await testHooks.claimNextAutomaticBackup(
     createDatabase({ claimResult: { affectedRows: 0 } }),
