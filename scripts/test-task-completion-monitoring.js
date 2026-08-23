@@ -2,7 +2,7 @@ const assert = require('assert');
 
 const { testHooks } = require('../src/services/backupService');
 
-const progressStates = ['in queue', 'started', 'downloading', 'uploading'];
+const progressStates = ['in queue', 'started', 'downloading', 'uploading', 'waiting'];
 progressStates.forEach((state) => {
   const task = {
     finishTime: '0',

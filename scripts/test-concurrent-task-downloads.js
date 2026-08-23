@@ -11,6 +11,8 @@ const taskFileStorage = require('../src/services/utils/taskFileStorage');
 
 const storageRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'flux-download-test-'));
 const originalStoragePath = config.storagePath;
+const originalFluxDriveMaxFileSizeMb = config.fluxDriveMaxFileSizeMb;
+const originalStorageMinimumFreeGb = config.storageMinimumFreeGb;
 const originalVerifyLogin = fluxOS.verifyLogin;
 const originalGetKey = Vault.getKey;
 const originalLogInfo = log.info;
@@ -140,6 +142,34 @@ async function main() {
       },
     );
 
+    const oversizedTask = {
+      taskId: 4533,
+      filename: 'backup_wp.tar.gz',
+      filesize: firstContent.length,
+      host: `http://127.0.0.1:${port}/first`,
+    };
+    config.fluxDriveMaxFileSizeMb = 0.001;
+    await assert.rejects(
+      fileService.downloadFileFromHost(oversizedTask),
+      (error) => error.code === 'FLUXDRIVE_FILE_TOO_LARGE' && error.terminal === true,
+    );
+    assert.strictEqual(fs.existsSync(taskFileStorage.getTaskDirectory(oversizedTask)), false);
+    config.fluxDriveMaxFileSizeMb = originalFluxDriveMaxFileSizeMb;
+
+    const capacityTask = {
+      taskId: 4534,
+      filename: 'backup_wp.tar.gz',
+      filesize: firstContent.length,
+      host: `http://127.0.0.1:${port}/first`,
+    };
+    config.storageMinimumFreeGb = Number.MAX_SAFE_INTEGER;
+    await assert.rejects(
+      fileService.downloadFileFromHost(capacityTask),
+      (error) => error.code === 'INSUFFICIENT_LOCAL_STORAGE'
+        && error.deferWithoutFailure === true,
+    );
+    assert.strictEqual(fs.existsSync(taskFileStorage.getTaskDirectory(capacityTask)), false);
+
     console.log('Concurrent task download tests passed');
   } finally {
     if (server.listening) await close(server);
@@ -153,6 +183,8 @@ main()
   })
   .finally(() => {
     config.storagePath = originalStoragePath;
+    config.fluxDriveMaxFileSizeMb = originalFluxDriveMaxFileSizeMb;
+    config.storageMinimumFreeGb = originalStorageMinimumFreeGb;
     fluxOS.verifyLogin = originalVerifyLogin;
     Vault.getKey = originalGetKey;
     log.info = originalLogInfo;

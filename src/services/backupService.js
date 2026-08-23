@@ -870,6 +870,11 @@ async function runTask(id) {
       // task.status = { state: 'downloading', message: 'fetching file from node', progress: 100 };
       await dbCli.updateTask(task);
     }
+    if (!task.uploaded) {
+      // Revalidate here as well as at registration so legacy queued tasks cannot
+      // retain an oversized downloaded artifact after FluxDrive rejects it.
+      fileManager.validateFluxDriveFileSize(task);
+    }
     if (!task.uploaded && !await ensureUserQuotaForDownloadedTask(task)) {
       await cancelTaskDueToQuota(task, id, task.filesize);
       return;
@@ -904,19 +909,39 @@ async function runTask(id) {
     taskQueue.delete(id);
   } catch (error) {
     const message = getErrorMessage(error);
-    if (!task.status || task.status.state !== 'failed') {
-      task.status = { state: 'failed', message, progress: 0 };
+    const deferredForStorage = error.deferWithoutFailure === true;
+    if (deferredForStorage || !task.status || task.status.state !== 'failed') {
+      task.status = {
+        state: deferredForStorage ? 'waiting' : 'failed',
+        message,
+        progress: 0,
+      };
     }
     if (error.diagnostic) {
       task.extra = JSON.stringify({ failureDiagnostic: error.diagnostic });
     }
-    task.fails += 1;
+    if (error.terminal === true) task.fails = TASK_MAX_FAILURES;
+    else if (!deferredForStorage) task.fails += 1;
+
+    if (task.fails >= TASK_MAX_FAILURES) {
+      try {
+        fileManager.deleteFile(task);
+        task.localRemoved = true;
+        log.info(`Removed local artifacts for terminally failed task ${id}`);
+      } catch (cleanupError) {
+        log.error(`Failed to remove local artifacts for terminally failed task ${id}: ${cleanupError.message}`);
+      }
+    }
     await dbCli.updateTask(task);
     if (task.fails >= TASK_MAX_FAILURES) {
       await recordTaskActivity(task, 'failed', task.status?.state || 'task_pipeline', message);
     }
     taskQueue.delete(id);
-    log.error(`task ${id} failed:`, error instanceof Error ? error : message);
+    if (deferredForStorage) {
+      log.warn(`task ${id} deferred until local storage capacity is available: ${message}`);
+    } else {
+      log.error(`task ${id} failed:`, error instanceof Error ? error : message);
+    }
   }
 }
 
@@ -1236,6 +1261,7 @@ async function registerBackupTask(req, res, taskObj = null) {
     if (!numberpRegex.test(filesize)) {
       throw new Error('filesize is not valid');
     }
+    fileManager.validateFluxDriveFileSize({ filesize, host, filename });
     if (Number(filesize) > getQuotaLimitBytes()) {
       throw new Error('backup file is larger than the user quota.');
     }

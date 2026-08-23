@@ -10,6 +10,10 @@ const fluxOS = require('./fluxOsService');
 const Vault = require('./Vault');
 const taskFileStorage = require('./utils/taskFileStorage');
 
+const MEBIBYTE = 1024 * 1024;
+const GIBIBYTE = 1024 * 1024 * 1024;
+const downloadReservations = new Map();
+
 // Ensure the storage directory exists on module load
 if (!fs.existsSync(config.storagePath)) {
   fs.mkdirSync(config.storagePath, { recursive: true });
@@ -23,6 +27,88 @@ if (!fs.existsSync(config.storagePath)) {
  */
 function fileExists(task) {
   return fs.existsSync(taskFileStorage.getTaskFilePath(task));
+}
+
+function getFluxDriveMaxFileSizeBytes() {
+  return Number(config.fluxDriveMaxFileSizeMb) * MEBIBYTE;
+}
+
+function createFileSizeLimitError(task) {
+  const error = new Error(
+    `Backup file size ${task.filesize} bytes exceeds FluxDrive upload limit of ${config.fluxDriveMaxFileSizeMb} MiB`,
+  );
+  error.code = 'FLUXDRIVE_FILE_TOO_LARGE';
+  error.terminal = true;
+  error.diagnostic = {
+    check: 'FluxDrive upload size limit',
+    outcome: 'failed',
+    endpoint: task.host || null,
+    fileSize: Number(task.filesize) || 0,
+    detail: error.message,
+  };
+  return error;
+}
+
+function validateFluxDriveFileSize(task) {
+  const expectedSize = Number(task.filesize);
+  const maxBytes = getFluxDriveMaxFileSizeBytes();
+  if (!Number.isFinite(expectedSize) || expectedSize < 0) {
+    throw new Error(`Invalid expected backup size for task ${task.taskId || 'new'}`);
+  }
+  if (!Number.isFinite(maxBytes) || maxBytes <= 0) {
+    throw new Error('FluxDrive maximum file size is not configured correctly');
+  }
+  if (expectedSize > maxBytes) throw createFileSizeLimitError(task);
+  return expectedSize;
+}
+
+function getAvailableStorageBytes() {
+  const stats = fs.statfsSync(config.storagePath);
+  return Number(stats.bavail) * Number(stats.bsize);
+}
+
+function getReservedDownloadBytes() {
+  let reservedBytes = 0;
+  downloadReservations.forEach((reservation) => {
+    reservedBytes += Math.max(0, reservation.expectedSize - reservation.receivedBytes);
+  });
+  return reservedBytes;
+}
+
+function reserveDownloadCapacity(task, expectedSize) {
+  const taskId = Number(task.taskId);
+  const availableBytes = getAvailableStorageBytes();
+  const reservedBytes = getReservedDownloadBytes();
+  const minimumFreeBytes = Number(config.storageMinimumFreeGb) * GIBIBYTE;
+  const requiredBytes = expectedSize + reservedBytes + minimumFreeBytes;
+
+  if (availableBytes < requiredBytes) {
+    const error = new Error(
+      `Insufficient local storage for backup download: available=${availableBytes} bytes, expected=${expectedSize} bytes, reserved=${reservedBytes} bytes, safetyReserve=${minimumFreeBytes} bytes`,
+    );
+    error.code = 'INSUFFICIENT_LOCAL_STORAGE';
+    error.deferWithoutFailure = true;
+    error.diagnostic = {
+      check: 'Middleware download storage capacity',
+      outcome: 'failed',
+      endpoint: task.host || null,
+      fileSize: expectedSize,
+      detail: error.message,
+    };
+    throw error;
+  }
+
+  downloadReservations.set(taskId, { expectedSize, receivedBytes: 0 });
+  log.info(`Reserved ${expectedSize} bytes for task ${taskId}; available=${availableBytes}, otherReserved=${reservedBytes}, safetyReserve=${minimumFreeBytes}`);
+}
+
+function updateDownloadReservation(taskId, receivedBytes) {
+  const reservation = downloadReservations.get(Number(taskId));
+  if (reservation) reservation.receivedBytes = receivedBytes;
+}
+
+function releaseDownloadCapacity(taskId) {
+  downloadReservations.delete(Number(taskId));
 }
 
 /**
@@ -174,46 +260,41 @@ function getUnexpectedFilePreview(filePath, actualSize, maxLength = 500) {
 async function downloadFileFromHost(task) {
   const { filename } = task;
   const url = new URL(`${task.host}`);
-
-  // Construct node URL from hostname and port
   const protocol = url.protocol.startsWith('https:') ? 'https' : 'http';
   const node = `${protocol}://${url.hostname}${url.port ? `:${url.port}` : ''}`;
 
-  // Get fresh zelidauth token first (outside of Promise)
-  let zelidauth;
-  try {
-    zelidauth = await fluxOS.verifyLogin(
-      await Vault.getKey('teamFluxID'),
-      await Vault.getKey('teamPK'),
-      node,
-    );
-  } catch (authError) {
-    log.error('Failed to authenticate with node:', authError);
-    throw addDownloadDiagnostic(authError, task, url, node);
-  }
-
-  if (!zelidauth) {
-    throw addDownloadDiagnostic(
-      new Error('Failed to authenticate with node before backup download'),
-      task,
-      url,
-      node,
-    );
-  }
-  const finalPath = taskFileStorage.getTaskFilePath(task);
-  const partialPath = taskFileStorage.getTaskPartialFilePath(task);
-  const expectedSize = Number(task.filesize);
-
-  if (!Number.isFinite(expectedSize) || expectedSize < 0) {
-    throw new Error(`Invalid expected backup size for task ${task.taskId}`);
-  }
-
+  const expectedSize = validateFluxDriveFileSize(task);
   taskFileStorage.ensureTaskDirectory(task);
-  taskFileStorage.unlinkIfPresent(finalPath);
-  taskFileStorage.unlinkIfPresent(partialPath);
+  taskFileStorage.unlinkIfPresent(taskFileStorage.getTaskFilePath(task));
+  taskFileStorage.unlinkIfPresent(taskFileStorage.getTaskPartialFilePath(task));
 
-  log.info(`Downloading ${filename} for task ${task.taskId} from ${url.href}`);
   try {
+    reserveDownloadCapacity(task, expectedSize);
+    // Get fresh zelidauth token first (outside of Promise)
+    let zelidauth;
+    try {
+      zelidauth = await fluxOS.verifyLogin(
+        await Vault.getKey('teamFluxID'),
+        await Vault.getKey('teamPK'),
+        node,
+      );
+    } catch (authError) {
+      log.error('Failed to authenticate with node:', authError);
+      throw addDownloadDiagnostic(authError, task, url, node);
+    }
+
+    if (!zelidauth) {
+      throw addDownloadDiagnostic(
+        new Error('Failed to authenticate with node before backup download'),
+        task,
+        url,
+        node,
+      );
+    }
+    const finalPath = taskFileStorage.getTaskFilePath(task);
+    const partialPath = taskFileStorage.getTaskPartialFilePath(task);
+
+    log.info(`Downloading ${filename} for task ${task.taskId} from ${url.href}`);
     const response = await getDownloadResponse(url, { zelidauth });
     if (response.statusCode < 200 || response.statusCode >= 300) {
       const responseBody = await getResponseSummary(response);
@@ -227,6 +308,7 @@ async function downloadFileFromHost(task) {
     const progressStream = new Transform({
       transform(chunk, encoding, callback) {
         receivedBytes += chunk.length;
+        updateDownloadReservation(task.taskId, receivedBytes);
         const progressTotal = Number.isFinite(contentLength) && contentLength > 0
           ? contentLength : expectedSize;
         const progress = progressTotal > 0
@@ -266,6 +348,8 @@ async function downloadFileFromHost(task) {
     task.downloaded = false;
     log.error(`Downloading ${filename} for task ${task.taskId} failed: ${error.message}`);
     throw error;
+  } finally {
+    releaseDownloadCapacity(task.taskId);
   }
 }
 
@@ -273,5 +357,7 @@ module.exports = {
   fileExists,
   deleteFile,
   getRemoteFileSize,
+  getFluxDriveMaxFileSizeBytes,
+  validateFluxDriveFileSize,
   downloadFileFromHost,
 };
