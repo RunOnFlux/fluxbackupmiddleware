@@ -60,6 +60,19 @@ async function main() {
       response.end(responseBody);
       return;
     }
+    if (request.url === '/remote-file-missing') {
+      const responseBody = JSON.stringify({
+        status: 'error',
+        data: {
+          code: 1,
+          name: 'Error',
+          message: "chmod: cannot access '/backup/local/backup_wp.tar.gz': No such file or directory",
+        },
+      });
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(responseBody);
+      return;
+    }
     const content = request.url === '/first' ? firstContent : secondContent;
     response.writeHead(200, { 'content-length': content.length });
     const midpoint = Math.floor(content.length / 2);
@@ -134,13 +147,36 @@ async function main() {
     await assert.rejects(
       fileService.downloadFileFromHost(unexpectedResponseTask),
       (error) => {
+        assert.strictEqual(error.code, 'FLUX_NODE_DOWNLOAD_ERROR');
+        assert.match(error.message, /Flux node rejected backup download/);
         assert.strictEqual(error.diagnostic.check, 'Flux node backup download');
-        assert.strictEqual(error.diagnostic.httpStatus, null);
+        assert.strictEqual(error.diagnostic.httpStatus, 200);
         assert(error.diagnostic.receivedSize > 0);
         assert(error.diagnostic.responseBody.includes('backup file is not available'));
         return true;
       },
     );
+
+    const missingRemoteFileTask = {
+      taskId: 4535,
+      filename: 'backup_wp.tar.gz',
+      filesize: firstContent.length,
+      host: `http://127.0.0.1:${port}/remote-file-missing`,
+    };
+    await assert.rejects(
+      fileService.downloadFileFromHost(missingRemoteFileTask),
+      (error) => {
+        assert.strictEqual(error.code, 'REMOTE_BACKUP_FILE_MISSING');
+        assert.strictEqual(error.terminal, true);
+        assert.strictEqual(error.httpStatus, 200);
+        assert.strictEqual(error.diagnostic.httpStatus, 200);
+        assert.match(error.message, /no longer exists on Flux node/);
+        assert(error.diagnostic.responseBody.includes('No such file or directory'));
+        return true;
+      },
+    );
+    assert.strictEqual(fs.existsSync(taskFileStorage.getTaskFilePath(missingRemoteFileTask)), false);
+    assert.strictEqual(fs.existsSync(taskFileStorage.getTaskPartialFilePath(missingRemoteFileTask)), false);
 
     const oversizedTask = {
       taskId: 4533,

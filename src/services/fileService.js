@@ -249,6 +249,30 @@ function getUnexpectedFilePreview(filePath, actualSize, maxLength = 500) {
   }
 }
 
+function getFluxNodeResponseError(responseBody, httpStatus) {
+  if (!responseBody) return null;
+  let payload;
+  try {
+    payload = JSON.parse(responseBody);
+  } catch (error) {
+    return null;
+  }
+  if (!payload || String(payload.status).toLowerCase() !== 'error') return null;
+
+  const nodeMessage = payload.data?.message || payload.message || 'Unknown Flux node error';
+  const remoteFileMissing = /no such file or directory/i.test(nodeMessage);
+  const error = new Error(remoteFileMissing
+    ? 'Remote backup file no longer exists on Flux node'
+    : `Flux node rejected backup download: ${nodeMessage}`);
+  error.code = remoteFileMissing
+    ? 'REMOTE_BACKUP_FILE_MISSING'
+    : 'FLUX_NODE_DOWNLOAD_ERROR';
+  error.httpStatus = httpStatus;
+  error.responseBody = responseBody;
+  if (remoteFileMissing) error.terminal = true;
+  return error;
+}
+
 /**
  * Downloads a file from a host for a given task.
  *
@@ -325,10 +349,16 @@ async function downloadFileFromHost(task) {
     );
 
     const actualSize = fs.statSync(partialPath).size;
+    const responseBody = getUnexpectedFilePreview(partialPath, actualSize, 4096);
+    const nodeResponseError = getFluxNodeResponseError(responseBody, response.statusCode);
+    if (nodeResponseError) {
+      nodeResponseError.receivedSize = actualSize;
+      throw nodeResponseError;
+    }
     if (actualSize !== expectedSize) {
       const sizeError = new Error(`File size mismatch ${expectedSize}<>${actualSize}`);
       sizeError.receivedSize = actualSize;
-      sizeError.responseBody = getUnexpectedFilePreview(partialPath, actualSize);
+      sizeError.responseBody = responseBody;
       throw sizeError;
     }
 
