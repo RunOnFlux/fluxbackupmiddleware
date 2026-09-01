@@ -1,7 +1,7 @@
 const assert = require('assert');
 const config = require('../config/default');
 const log = require('../src/lib/log');
-const { DBClient } = require('../src/services/utils/DBClient');
+const { DBClient, serializeStatus } = require('../src/services/utils/DBClient');
 
 const originalOperationTimeout = config.dbOperationTimeoutMs;
 const originalSlowQuery = config.dbSlowQueryMs;
@@ -60,6 +60,32 @@ async function main() {
     hangingClient.execute('SELECT taskId FROM tasks', []),
     (error) => error.code === 'DB_OPERATION_TIMEOUT',
   );
+
+  const longStatus = {
+    state: 'failed',
+    message: `SQL failed: ${'very long database error '.repeat(30)}`,
+    progress: 0,
+    diagnostic: 'this optional field is deliberately discarded when oversized',
+  };
+  const serializedStatus = serializeStatus(longStatus);
+  assert(serializedStatus.length <= 256);
+  assert.strictEqual(JSON.parse(serializedStatus).state, 'failed');
+  assert(JSON.parse(serializedStatus).message.endsWith('...'));
+
+  let updateParams;
+  const statusClient = createClient({
+    execute: async (options, params) => {
+      updateParams = params;
+      return [{ affectedRows: 1 }, []];
+    },
+  });
+  await statusClient.updateTask({ taskId: 42, status: longStatus });
+  assert(updateParams[0].length <= 256);
+  assert.doesNotThrow(() => JSON.parse(updateParams[0]));
+
+  await statusClient.updateTask({ taskId: 43, status: JSON.stringify(longStatus) });
+  assert(updateParams[0].length <= 256);
+  assert.doesNotThrow(() => JSON.parse(updateParams[0]));
 
   console.log('DB client resilience tests passed');
 }

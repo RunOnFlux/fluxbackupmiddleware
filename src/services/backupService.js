@@ -755,29 +755,29 @@ function runUserQuotaOperation(owner, operation) {
 
 async function getQuotaPruningCandidates(task) {
   return dbCli.execute(`
-    SELECT stored.taskId, stored.appname, stored.timestamp, stored.hash,
-      stored.filename, stored.filesize
-    FROM tasks stored
-    WHERE stored.owner = ?
-    AND stored.backup_type = 'automatic'
-    AND stored.uploaded = 1
-    AND stored.removedFromFluxdrive = 0
-    AND stored.finishTime > 0
-    AND stored.hash IS NOT NULL
-    AND stored.hash <> ''
-    AND NOT (stored.appname = ? AND stored.timestamp = ?)
+    SELECT retained_task.taskId, retained_task.appname, retained_task.timestamp,
+      retained_task.hash, retained_task.filename, retained_task.filesize
+    FROM tasks AS retained_task
+    WHERE retained_task.owner = ?
+    AND retained_task.backup_type = 'automatic'
+    AND retained_task.uploaded = 1
+    AND retained_task.removedFromFluxdrive = 0
+    AND retained_task.finishTime > 0
+    AND retained_task.hash IS NOT NULL
+    AND retained_task.hash <> ''
+    AND NOT (retained_task.appname = ? AND retained_task.timestamp = ?)
     AND NOT EXISTS (
       SELECT 1
-      FROM tasks pending
-      WHERE pending.owner = stored.owner
-      AND pending.appname = stored.appname
-      AND pending.timestamp = stored.timestamp
-      AND pending.removedFromFluxdrive = 0
-      AND pending.uploaded = 0
-      AND pending.finishTime = 0
-      AND pending.fails < ?
+      FROM tasks AS pending_task
+      WHERE pending_task.owner = retained_task.owner
+      AND pending_task.appname = retained_task.appname
+      AND pending_task.timestamp = retained_task.timestamp
+      AND pending_task.removedFromFluxdrive = 0
+      AND pending_task.uploaded = 0
+      AND pending_task.finishTime = 0
+      AND pending_task.fails < ?
     )
-    ORDER BY stored.timestamp ASC, stored.taskId ASC
+    ORDER BY retained_task.timestamp ASC, retained_task.taskId ASC
   `, [task.owner, task.appname, task.timestamp, TASK_MAX_FAILURES]);
 }
 
@@ -849,6 +849,10 @@ async function ensureUserQuotaForDownloadedTask(task) {
 async function runTask(id) {
   log.info(`ruuning task ${id}`);
   const task = taskQueue.get(id);
+  if (!task) {
+    log.error(`Cannot run task ${id}: task is not registered in the in-memory queue`);
+    return;
+  }
   try {
     if (task.extra) {
       try {
@@ -906,7 +910,6 @@ async function runTask(id) {
     task.extra = '';
     await dbCli.updateTask(task);
     await recordTaskActivity(task, 'success', 'completed', 'finished');
-    taskQueue.delete(id);
   } catch (error) {
     const message = getErrorMessage(error);
     const deferredForStorage = error.deferWithoutFailure === true;
@@ -932,17 +935,33 @@ async function runTask(id) {
         log.error(`Failed to remove local artifacts for terminally failed task ${id}: ${cleanupError.message}`);
       }
     }
-    await dbCli.updateTask(task);
-    if (task.fails >= TASK_MAX_FAILURES) {
-      await recordTaskActivity(task, 'failed', task.status?.state || 'task_pipeline', message);
+    try {
+      await dbCli.updateTask(task);
+    } catch (persistenceError) {
+      log.error(`Failed to persist failure state for task ${id}: ${getErrorMessage(persistenceError)}`);
     }
-    taskQueue.delete(id);
+    if (task.fails >= TASK_MAX_FAILURES) {
+      try {
+        await recordTaskActivity(task, 'failed', task.status?.state || 'task_pipeline', message);
+      } catch (activityError) {
+        log.error(`Failed to record failure activity for task ${id}: ${getErrorMessage(activityError)}`);
+      }
+    }
     if (deferredForStorage) {
       log.warn(`task ${id} deferred until local storage capacity is available: ${message}`);
     } else {
       log.error(`task ${id} failed:`, error instanceof Error ? error : message);
     }
+  } finally {
+    taskQueue.delete(id);
   }
+}
+
+function launchTask(id) {
+  runTask(id).catch((error) => {
+    taskQueue.delete(id);
+    log.error(`Unexpected task runner rejection for task ${id}: ${getErrorMessage(error)}`);
+  });
 }
 
 /**
@@ -976,7 +995,7 @@ async function updateQueue() {
         taskQueue.set(Number(records[i].taskId), records[i]);
         // run task
         log.debug(`retrying task ${records[i].taskId}`);
-        runTask(Number(records[i].taskId));
+        launchTask(Number(records[i].taskId));
       } else {
         // log.warn(`task ${records[i].taskId} already in queue.`);
       }
@@ -1311,7 +1330,7 @@ async function registerBackupTask(req, res, taskObj = null) {
           task.removedFromFluxdrive = 0;
           await dbCli.updateTask(task);
           taskQueue.set(Number(taskId), task);
-          runTask(Number(taskId));
+          launchTask(Number(taskId));
         }
       }
     } else {
@@ -1329,7 +1348,7 @@ async function registerBackupTask(req, res, taskObj = null) {
         const task = await dbCli.getTask(taskId);
         if (task) {
           taskQueue.set(Number(taskId), task);
-          runTask(Number(taskId));
+          launchTask(Number(taskId));
         }
       }
     }

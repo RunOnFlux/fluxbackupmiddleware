@@ -11,6 +11,7 @@ const RETRYABLE_READ_ERROR_CODES = new Set([
   'PROTOCOL_CONNECTION_LOST',
   'PROTOCOL_ENQUEUE_AFTER_FATAL_ERROR',
 ]);
+const STATUS_COLUMN_MAX_LENGTH = 256;
 
 function summarizeSql(sql) {
   return String(sql).replace(/\s+/g, ' ').trim().slice(0, 180);
@@ -34,23 +35,44 @@ function withTimeout(operation, timeoutMs, sqlSummary) {
 }
 
 /**
- * Sanitizes status object to ensure it doesn't exceed database column limit.
- * Truncates message to fit within VARCHAR(256) limit when JSON-serialized.
- * @param {Object} status - The status object with state, message, and progress
- * @returns {Object} - Sanitized status object
+ * Serializes status while ensuring it fits the VARCHAR(256) database column.
+ * @param {Object|string} status - Status object or an existing JSON status string
+ * @returns {string} A valid, size-bounded JSON status string
  */
-function sanitizeStatus(status) {
-  if (!status || typeof status !== 'object') {
-    return status;
+function normalizeStatus(status) {
+  if (typeof status !== 'string') return status;
+  try {
+    return JSON.parse(status);
+  } catch (error) {
+    return { state: 'unknown', message: status, progress: 0 };
   }
-  const sanitized = { ...status };
-  // Reserve ~35 chars for JSON structure: {"state":"","progress":0}
-  // Maximum message length to stay under 256 chars total
-  const maxMessageLength = 180;
-  if (sanitized.message && sanitized.message.length > maxMessageLength) {
-    sanitized.message = `${sanitized.message.substring(0, maxMessageLength - 3)}...`;
+}
+
+function serializeStatus(status) {
+  const normalized = normalizeStatus(status);
+  if (!normalized || typeof normalized !== 'object') {
+    return JSON.stringify({ state: 'unknown', message: String(normalized ?? ''), progress: 0 });
   }
-  return sanitized;
+
+  const serialized = JSON.stringify(normalized);
+  if (serialized.length <= STATUS_COLUMN_MAX_LENGTH) return serialized;
+
+  const compact = {
+    state: String(normalized.state || 'unknown').slice(0, 32),
+    message: String(normalized.message || ''),
+    progress: Number.isFinite(Number(normalized.progress)) ? Number(normalized.progress) : 0,
+  };
+  const suffix = '...';
+  let low = 0;
+  let high = compact.message.length;
+  while (low < high) {
+    const midpoint = Math.ceil((low + high) / 2);
+    compact.message = String(normalized.message || '').slice(0, midpoint) + suffix;
+    if (JSON.stringify(compact).length <= STATUS_COLUMN_MAX_LENGTH) low = midpoint;
+    else high = midpoint - 1;
+  }
+  compact.message = String(normalized.message || '').slice(0, low) + suffix;
+  return JSON.stringify(compact);
 }
 
 class DBClient {
@@ -266,13 +288,7 @@ class DBClient {
       fields += `${key},`;
       values += '?,';
       if (key === 'status') {
-        const statusValue = task[key];
-        if (typeof statusValue === 'string') {
-          params.push(statusValue);
-        } else {
-          const sanitizedStatus = sanitizeStatus(statusValue);
-          params.push(JSON.stringify(sanitizedStatus));
-        }
+        params.push(serializeStatus(task[key]));
       } else {
         params.push(task[key]);
       }
@@ -299,7 +315,7 @@ class DBClient {
       // eslint-disable-next-line no-prototype-builtins
       if (key !== 'taskId') {
         fields += ` ${key}=?,`;
-        if (key === 'status') params.push(typeof task[key] === 'string' ? task[key] : JSON.stringify(task[key]));
+        if (key === 'status') params.push(serializeStatus(task[key]));
         else params.push(task[key]);
       }
     }
@@ -570,3 +586,4 @@ exports.createClient = async function () {
 };
 
 exports.DBClient = DBClient;
+exports.serializeStatus = serializeStatus;
