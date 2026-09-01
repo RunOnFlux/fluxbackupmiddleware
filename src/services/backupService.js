@@ -1131,16 +1131,24 @@ async function syncSyncthingApps() {
       for (let i = 0; i < syncthingApps.length; i += 1) {
         const app = syncthingApps[i];
         const existingApp = existingAppsByName.get(app.appName);
-        if (existingApp && existingApp.is_marketplace === null) {
-          const isMarketplace = Number(
-            marketplaceService.matchesMarketplaceRepotags(app.repotags, marketplaceTemplates),
+        if (existingApp) {
+          const matchesMarketplace = marketplaceService.matchesMarketplaceRepotags(
+            app.repotags,
+            marketplaceTemplates,
           );
-          await dbCli.execute(
-            'UPDATE automatic_backups SET is_marketplace = ? WHERE appname = ? AND is_marketplace IS NULL',
-            [isMarketplace, app.appName],
+          const isMarketplace = marketplaceService.getMarketplaceClassificationUpdate(
+            existingApp.is_marketplace,
+            matchesMarketplace,
           );
-          classifiedExistingApps += 1;
-          log.info(`Classified existing app ${app.appName} as marketplace=${Boolean(isMarketplace)}`);
+          if (isMarketplace !== null) {
+            await dbCli.execute(
+              `UPDATE automatic_backups SET is_marketplace = ?
+               WHERE appname = ? AND (is_marketplace IS NULL OR is_marketplace = 0)`,
+              [isMarketplace, app.appName],
+            );
+            classifiedExistingApps += 1;
+            log.info(`Classified existing app ${app.appName} as marketplace=${Boolean(isMarketplace)}`);
+          }
         }
       }
     }
