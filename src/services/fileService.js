@@ -7,7 +7,6 @@ const { pipeline } = require('stream/promises');
 const log = require('../lib/log');
 const config = require('../../config/default');
 const fluxOS = require('./fluxOsService');
-const Vault = require('./Vault');
 const taskFileStorage = require('./utils/taskFileStorage');
 
 const MEBIBYTE = 1024 * 1024;
@@ -142,11 +141,7 @@ async function getRemoteFileSize(task) {
 
   let zelidauth;
   try {
-    zelidauth = await fluxOS.verifyLogin(
-      await Vault.getKey('teamFluxID'),
-      await Vault.getKey('teamPK'),
-      node,
-    );
+    zelidauth = await fluxOS.verifyTeamLogin(node);
   } catch (authError) {
     log.error('Failed to authenticate with node for file size probe:', authError);
     return null;
@@ -297,11 +292,7 @@ async function downloadFileFromHost(task) {
     // Get fresh zelidauth token first (outside of Promise)
     let zelidauth;
     try {
-      zelidauth = await fluxOS.verifyLogin(
-        await Vault.getKey('teamFluxID'),
-        await Vault.getKey('teamPK'),
-        node,
-      );
+      zelidauth = await fluxOS.verifyTeamLogin(node);
     } catch (authError) {
       log.error('Failed to authenticate with node:', authError);
       throw addDownloadDiagnostic(authError, task, url, node);

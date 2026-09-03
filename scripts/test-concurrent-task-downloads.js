@@ -13,7 +13,7 @@ const storageRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'flux-download-test-')
 const originalStoragePath = config.storagePath;
 const originalFluxDriveMaxFileSizeMb = config.fluxDriveMaxFileSizeMb;
 const originalStorageMinimumFreeGb = config.storageMinimumFreeGb;
-const originalVerifyLogin = fluxOS.verifyLogin;
+const originalVerifyTeamLogin = fluxOS.verifyTeamLogin;
 const originalGetKey = Vault.getKey;
 const originalLogInfo = log.info;
 const originalLogError = log.error;
@@ -40,7 +40,7 @@ async function close(server) {
 
 async function main() {
   config.storagePath = storageRoot;
-  fluxOS.verifyLogin = async () => 'test-auth';
+  fluxOS.verifyTeamLogin = async () => 'test-auth';
   Vault.getKey = async () => 'test-secret';
   log.info = () => {};
   log.error = () => {};
@@ -221,7 +221,7 @@ main()
     config.storagePath = originalStoragePath;
     config.fluxDriveMaxFileSizeMb = originalFluxDriveMaxFileSizeMb;
     config.storageMinimumFreeGb = originalStorageMinimumFreeGb;
-    fluxOS.verifyLogin = originalVerifyLogin;
+    fluxOS.verifyTeamLogin = originalVerifyTeamLogin;
     Vault.getKey = originalGetKey;
     log.info = originalLogInfo;
     log.error = originalLogError;

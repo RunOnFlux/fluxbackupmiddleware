@@ -101,9 +101,9 @@ async function verifyAppOwner(owner, appname) {
     return true;
   }
 
-  const teamFluxID = await Vault.getKey('teamFluxID');
-  if (owner === teamFluxID) {
-    log.info(`App ${appname} verified as owned by teamFluxID`);
+  // eslint-disable-next-line no-use-before-define
+  if (await isTeamFluxId(owner)) {
+    log.info(`App ${appname} verified as owned by a team Flux ID`);
     return true;
   }
   return false;
@@ -672,6 +672,129 @@ async function verifyLogin(zelid, privateKeySign, node) {
   return result.zelidAuth || false;
 }
 
+async function getTeamCredentials() {
+  const [primaryId, primaryKey, secondaryId, secondaryKey] = await Promise.all([
+    Vault.getKey('teamFluxID'),
+    Vault.getKey('teamPK'),
+    Vault.getKey('teamFluxID2'),
+    Vault.getKey('teamPK2'),
+  ]);
+  const credentials = [];
+  if (primaryId && primaryKey) {
+    credentials.push({ label: 'primary', zelid: primaryId, privateKey: primaryKey });
+  }
+  if (secondaryId && secondaryKey
+    && (secondaryId !== primaryId || secondaryKey !== primaryKey)) {
+    credentials.push({ label: 'secondary', zelid: secondaryId, privateKey: secondaryKey });
+  }
+  return credentials;
+}
+
+async function isTeamFluxId(zelid) {
+  if (!zelid) return false;
+  const [primaryId, secondaryId] = await Promise.all([
+    Vault.getKey('teamFluxID'),
+    Vault.getKey('teamFluxID2'),
+  ]);
+  return zelid === primaryId || zelid === secondaryId;
+}
+
+function labelLoginDiagnostics(diagnostics, credentialLabel) {
+  return (diagnostics || []).map((diagnostic) => ({
+    ...diagnostic,
+    check: `${diagnostic.check} (${credentialLabel} credentials)`,
+    credential: credentialLabel,
+  }));
+}
+
+function reachedCredentialVerification(result) {
+  return (result.diagnostics || []).some((diagnostic) => (
+    diagnostic.check === 'Flux node login phrase' && diagnostic.outcome === 'success'
+  ));
+}
+
+async function verifyTeamLoginDetailed(node, verifier = verifyLoginDetailed) {
+  const credentials = await getTeamCredentials();
+  if (credentials.length === 0) {
+    return {
+      zelidAuth: null,
+      reason: 'No complete team Flux credentials are configured',
+      diagnostics: [{
+        check: 'Team Flux credentials',
+        outcome: 'failed',
+        node,
+        detail: 'Configure teamFluxID/teamPK or teamFluxID2/teamPK2',
+      }],
+    };
+  }
+
+  const diagnostics = [];
+  let lastResult = null;
+  for (let index = 0; index < credentials.length; index += 1) {
+    const credential = credentials[index];
+    // eslint-disable-next-line no-await-in-loop
+    const result = await verifier(credential.zelid, credential.privateKey, node);
+    lastResult = result;
+    diagnostics.push(...labelLoginDiagnostics(result.diagnostics, credential.label));
+    if (result.zelidAuth) {
+      if (credential.label === 'secondary') {
+        log.info(`Authenticated with ${node} using secondary team credentials`);
+      }
+      return {
+        ...result,
+        diagnostics,
+        credential: credential.label,
+      };
+    }
+
+    const hasAnotherCredential = index + 1 < credentials.length;
+    if (!hasAnotherCredential || !reachedCredentialVerification(result)) break;
+    log.warn(`Primary team authentication was rejected by ${node}; trying secondary credentials`);
+  }
+
+  return {
+    zelidAuth: null,
+    reason: lastResult?.reason || `Failed to authenticate with ${node}`,
+    diagnostics,
+    credential: null,
+  };
+}
+
+async function verifyTeamLogin(node) {
+  const result = await verifyTeamLoginDetailed(node);
+  return result.zelidAuth || false;
+}
+
+async function createTeamArcaneNodeSessions(
+  sessionFactory = enterpriseCrypto.createArcaneNodeSessions,
+) {
+  const credentials = await getTeamCredentials();
+  for (let index = 0; index < credentials.length; index += 1) {
+    const credential = credentials[index];
+    let sessions = [];
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      sessions = await sessionFactory(
+        credential.zelid,
+        credential.privateKey,
+        enterpriseCrypto.ARCANE_NODE_RETRY_COUNT,
+      );
+    } catch (error) {
+      log.error(`Failed to prepare ArcaneOS sessions with ${credential.label} credentials:`, error.message);
+    }
+    if (sessions.length > 0) {
+      if (credential.label === 'secondary') {
+        log.info('Using secondary team credentials for enterprise decryption');
+      }
+      return sessions;
+    }
+    if (index + 1 < credentials.length) {
+      log.warn('Primary team credentials produced no ArcaneOS sessions; trying secondary credentials');
+    }
+  }
+  return [];
+}
+
 /**
  * Checks whether an app is expired via global app specifications.
  * Expired apps return success with an empty data array.
@@ -762,33 +885,22 @@ async function discoverAppsWithSyncthing(
     });
 
     if (enterpriseAppsToDecrypt.length > 0) {
-      const teamFluxID = await Vault.getKey('teamFluxID');
-      const teamPK = await Vault.getKey('teamPK');
-
-      if (!teamFluxID || !teamPK) {
-        log.error('teamFluxID and teamPK are required to decrypt enterprise apps');
+      const teamCredentials = await getTeamCredentials();
+      if (teamCredentials.length === 0) {
+        log.error('Complete team Flux credentials are required to decrypt enterprise apps');
         enterpriseAppsToDecrypt.forEach((app) => unresolvedEnterpriseAppNames.add(app.name));
         decryptFailures = enterpriseAppsToDecrypt.length;
       } else {
-        let arcaneSessions = [];
-        try {
-          arcaneSessions = await enterpriseCrypto.createArcaneNodeSessions(
-            teamFluxID,
-            teamPK,
-            enterpriseCrypto.ARCANE_NODE_RETRY_COUNT,
-          );
-          log.info(`Decrypting ${enterpriseAppsToDecrypt.length} new or changed enterprise apps`);
-        } catch (error) {
-          log.error('Failed to prepare ArcaneOS node sessions for enterprise decryption:', error.message);
+        const arcaneSessions = await createTeamArcaneNodeSessions();
+
+        if (arcaneSessions.length === 0) {
           enterpriseAppsToDecrypt.forEach((app) => unresolvedEnterpriseAppNames.add(app.name));
           decryptFailures = enterpriseAppsToDecrypt.length;
+        } else {
+          log.info(`Decrypting ${enterpriseAppsToDecrypt.length} new or changed enterprise apps`);
         }
 
-        if (arcaneSessions.length === 0 && decryptFailures === 0) {
-          log.error('ArcaneOS session discovery returned no usable sessions');
-          enterpriseAppsToDecrypt.forEach((app) => unresolvedEnterpriseAppNames.add(app.name));
-          decryptFailures = enterpriseAppsToDecrypt.length;
-        } else if (arcaneSessions.length > 0) {
+        if (arcaneSessions.length > 0) {
           for (let i = 0; i < enterpriseAppsToDecrypt.length; i += 1) {
             const app = enterpriseAppsToDecrypt[i];
             try {
@@ -1178,6 +1290,11 @@ module.exports = {
   getLoginPhraseDetailed,
   verifyLoginDetailed,
   verifyLogin,
+  getTeamCredentials,
+  isTeamFluxId,
+  verifyTeamLoginDetailed,
+  verifyTeamLogin,
+  createTeamArcaneNodeSessions,
   discoverAppsWithSyncthing,
   getAppsWithSyncthing,
   isAppExpiredInGlobalSpecs,

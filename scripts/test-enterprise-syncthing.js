@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+/* eslint-disable no-await-in-loop */
 /**
  * Test script: discover Syncthing apps from globalappsspecifications,
  * including enterprise apps that require decryption on an ArcaneOS node.
@@ -10,7 +11,6 @@
 
 const axios = require('axios');
 const https = require('https');
-const Vault = require('../src/services/Vault');
 const fluxOS = require('../src/services/fluxOsService');
 const enterpriseCrypto = require('../src/services/enterpriseCrypto');
 
@@ -40,13 +40,7 @@ async function fetchGlobalAppSpecs() {
 }
 
 async function inspectEnterpriseApps(enterpriseApps) {
-  const teamFluxID = await Vault.getKey('teamFluxID');
-  const teamPK = await Vault.getKey('teamPK');
-  const arcaneSessions = await enterpriseCrypto.createArcaneNodeSessions(
-    teamFluxID,
-    teamPK,
-    enterpriseCrypto.ARCANE_NODE_RETRY_COUNT,
-  );
+  const arcaneSessions = await fluxOS.createTeamArcaneNodeSessions();
 
   log(`ArcaneOS nodes: ${arcaneSessions.map((session) => session.nodeBase).join(', ')}`);
 

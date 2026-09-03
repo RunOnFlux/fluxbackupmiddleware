@@ -14,7 +14,6 @@ const fluxDrive = require('./fluxDrive');
 const fluxOS = require('./fluxOsService');
 const marketplaceService = require('./marketplaceService');
 const enterpriseDiscoveryCache = require('./utils/enterpriseDiscoveryCache');
-const Vault = require('./Vault');
 const discordNotifier = require('./discordNotifier');
 const dailyBackupReport = require('./utils/dailyBackupReport');
 const {
@@ -1400,8 +1399,7 @@ async function getBackupList(req, res) {
 
     // If owner is fluxteam, get the real app owner for backup retrieval
     let backupOwner = owner;
-    const teamFluxID = await Vault.getKey('teamFluxID');
-    if (owner === teamFluxID) {
+    if (await fluxOS.isTeamFluxId(owner)) {
       const realOwner = await fluxOS.getAppOwner(appname);
       if (realOwner) {
         backupOwner = realOwner;
@@ -1892,16 +1890,12 @@ async function removeBackupFromRemoteHost(host, taskId) {
 
     log.info(`Attempting to remove remote file for task ${taskId} from: ${removalUrl}`);
 
-    // Get team credentials for authentication
-    const teamFluxID = await Vault.getKey('teamFluxID');
-    const teamPK = await Vault.getKey('teamPK');
-
     // Parse URL to get node address
     const urlParts = new URL(removalUrl);
     const nodeUrl = `${urlParts.protocol}//${urlParts.host}`;
 
     // Get zelidAuth for the request
-    const zelidAuth = await fluxOS.verifyLogin(teamFluxID, teamPK, nodeUrl);
+    const zelidAuth = await fluxOS.verifyTeamLogin(nodeUrl);
 
     if (!zelidAuth) {
       log.error(`Failed to authenticate with node for task ${taskId}`);
@@ -2229,11 +2223,7 @@ async function processAutomaticBackupInternal() {
         log.info(`Using node: ${node}`);
 
         // Get zelidAuth from node
-        const loginResult = await fluxOS.verifyLoginDetailed(
-          await Vault.getKey('teamFluxID'),
-          await Vault.getKey('teamPK'),
-          node,
-        );
+        const loginResult = await fluxOS.verifyTeamLoginDetailed(node);
         attemptDiagnostics.push(...loginResult.diagnostics);
 
         if (!loginResult.zelidAuth) {
