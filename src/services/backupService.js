@@ -1054,6 +1054,30 @@ async function checkExpiredApps() {
   }
 }
 
+function normalizeAppName(appName) {
+  return String(appName || '').trim().toLowerCase();
+}
+
+const AUTOMATIC_BACKUP_UPSERT_SQL = `INSERT INTO automatic_backups (
+  appname, components, status, expire_counter, last_backup_timestamp, is_marketplace
+) VALUES (?, ?, 'pending', 0, 0, ?)
+ON DUPLICATE KEY UPDATE
+  components = VALUES(components),
+  expire_counter = 0,
+  is_marketplace = CASE
+    WHEN automatic_backups.is_marketplace IS NULL THEN VALUES(is_marketplace)
+    WHEN automatic_backups.is_marketplace = 0 AND VALUES(is_marketplace) = 1 THEN 1
+    ELSE automatic_backups.is_marketplace
+  END`;
+
+async function upsertAutomaticBackupApp(database, app, isMarketplace) {
+  return database.execute(AUTOMATIC_BACKUP_UPSERT_SQL, [
+    app.appName,
+    JSON.stringify(app.componentNames),
+    isMarketplace,
+  ]);
+}
+
 /**
  * Syncs apps with Syncthing to the automatic_backups table.
  * Adds new apps found and increments expire_count for apps no longer present.
@@ -1068,7 +1092,9 @@ async function syncSyncthingApps() {
     const existingApps = await dbCli.execute(
       'SELECT appname, components, expire_counter, is_marketplace FROM automatic_backups',
     );
-    const existingAppsByName = new Map(existingApps.map((app) => [app.appname, app]));
+    const existingAppsByName = new Map(
+      existingApps.map((app) => [normalizeAppName(app.appname), app]),
+    );
     const cacheRows = await dbCli.execute(`
       SELECT appname, spec_hash, has_syncthing, components, repotags
       FROM enterprise_app_discovery
@@ -1080,7 +1106,18 @@ async function syncSyncthingApps() {
       log.error('Failed to fetch apps with Syncthing');
       return;
     }
-    const syncthingApps = discovery.apps;
+    // MySQL's appname key uses a case-insensitive collation, while Map keys are
+    // case-sensitive. Canonicalize and de-duplicate the discovery response so
+    // names such as `dcmsbackend` and `DCMSBackend` cannot pass the in-memory
+    // existence check and then abort the sync with ER_DUP_ENTRY.
+    const syncthingAppsByName = new Map();
+    discovery.apps.forEach((app) => {
+      const normalizedName = normalizeAppName(app.appName);
+      if (normalizedName) {
+        syncthingAppsByName.set(normalizedName, app);
+      }
+    });
+    const syncthingApps = Array.from(syncthingAppsByName.values());
 
     for (let i = 0; i < discovery.cacheUpdates.length; i += 1) {
       const update = discovery.cacheUpdates[i];
@@ -1125,30 +1162,38 @@ async function syncSyncthingApps() {
     // Check for new apps to add
     const newAppsToAdd = [];
     syncthingApps.forEach((app) => {
-      if (!existingAppsByName.has(app.appName)) {
+      if (!existingAppsByName.has(normalizeAppName(app.appName))) {
         newAppsToAdd.push(app);
       }
     });
 
     // Add new apps to the table
+    let addedApps = 0;
+    let insertFailures = 0;
     for (let i = 0; i < newAppsToAdd.length; i += 1) {
       const app = newAppsToAdd[i];
-      const componentsJson = JSON.stringify(app.componentNames);
       const isMarketplace = marketplaceClassificationAvailable
         ? Number(marketplaceService.matchesMarketplaceRepotags(app.repotags, marketplaceTemplates))
         : null;
-      const query = `INSERT INTO automatic_backups (
-        appname, components, status, expire_counter, last_backup_timestamp, is_marketplace
-      ) VALUES (?, ?, 'pending', 0, 0, ?)`;
-      await dbCli.execute(query, [app.appName, componentsJson, isMarketplace]);
-      log.info(`Added new app ${app.appName} to automatic_backups (marketplace=${isMarketplace === null ? 'unchecked' : Boolean(isMarketplace)})`);
+      try {
+        const result = await upsertAutomaticBackupApp(dbCli, app, isMarketplace);
+        if (result.affectedRows === 1) {
+          addedApps += 1;
+          log.info(`Added new app ${app.appName} to automatic_backups (marketplace=${isMarketplace === null ? 'unchecked' : Boolean(isMarketplace)})`);
+        } else {
+          log.warn(`App ${app.appName} appeared during Syncthing sync; refreshed its existing automatic_backups record`);
+        }
+      } catch (error) {
+        insertFailures += 1;
+        log.error(`Failed to add Syncthing app ${app.appName}; continuing with remaining apps: ${error.message}`);
+      }
     }
 
     let classifiedExistingApps = 0;
     if (marketplaceClassificationAvailable) {
       for (let i = 0; i < syncthingApps.length; i += 1) {
         const app = syncthingApps[i];
-        const existingApp = existingAppsByName.get(app.appName);
+        const existingApp = existingAppsByName.get(normalizeAppName(app.appName));
         if (existingApp) {
           const matchesMarketplace = marketplaceService.matchesMarketplaceRepotags(
             app.repotags,
@@ -1172,12 +1217,18 @@ async function syncSyncthingApps() {
     }
 
     // Check for expired apps (in DB but not in current syncthing list)
-    const currentAppNames = new Set(syncthingApps.map((app) => app.appName));
+    const currentAppNames = new Set(
+      syncthingApps.map((app) => normalizeAppName(app.appName)),
+    );
+    const unresolvedEnterpriseAppNames = new Set(
+      Array.from(discovery.unresolvedEnterpriseAppNames || [])
+        .map((appName) => normalizeAppName(appName)),
+    );
     const expiredApps = [];
-    existingAppsByName.forEach((existingApp, appName) => {
-      if (!currentAppNames.has(appName)
-        && !discovery.unresolvedEnterpriseAppNames.has(appName)) {
-        expiredApps.push(appName);
+    existingAppsByName.forEach((existingApp, normalizedAppName) => {
+      if (!currentAppNames.has(normalizedAppName)
+        && !unresolvedEnterpriseAppNames.has(normalizedAppName)) {
+        expiredApps.push(existingApp.appname);
       }
     });
 
@@ -1189,7 +1240,7 @@ async function syncSyncthingApps() {
       log.info(`Incremented expire_counter for expired app ${appName}`);
     }
 
-    log.info(`Sync complete. Added ${newAppsToAdd.length} new apps, classified ${classifiedExistingApps} existing apps, marked ${expiredApps.length} as expired.`);
+    log.info(`Sync complete. Added ${addedApps} new apps, ${insertFailures} inserts failed, classified ${classifiedExistingApps} existing apps, marked ${expiredApps.length} as expired.`);
   } catch (error) {
     log.error('Error syncing Syncthing apps:', error);
   }
@@ -2668,5 +2719,7 @@ module.exports = {
     notifyAutomaticBackupFailureOnce,
     getTaskOutcome,
     buildTaskFailure,
+    normalizeAppName,
+    upsertAutomaticBackupApp,
   },
 };
