@@ -11,7 +11,9 @@ const taskFileStorage = require('../src/services/utils/taskFileStorage');
 
 const storageRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'flux-download-test-'));
 const originalStoragePath = config.storagePath;
-const originalVerifyLogin = fluxOS.verifyLogin;
+const originalFluxDriveMaxFileSizeMb = config.fluxDriveMaxFileSizeMb;
+const originalStorageMinimumFreeGb = config.storageMinimumFreeGb;
+const originalVerifyTeamLogin = fluxOS.verifyTeamLogin;
 const originalGetKey = Vault.getKey;
 const originalLogInfo = log.info;
 const originalLogError = log.error;
@@ -38,7 +40,7 @@ async function close(server) {
 
 async function main() {
   config.storagePath = storageRoot;
-  fluxOS.verifyLogin = async () => 'test-auth';
+  fluxOS.verifyTeamLogin = async () => 'test-auth';
   Vault.getKey = async () => 'test-secret';
   log.info = () => {};
   log.error = () => {};
@@ -50,6 +52,25 @@ async function main() {
     if (request.url === '/missing') {
       response.writeHead(404, { 'content-type': 'text/plain' });
       response.end('not found');
+      return;
+    }
+    if (request.url === '/unexpected') {
+      const responseBody = JSON.stringify({ status: 'error', message: 'backup file is not available' });
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(responseBody);
+      return;
+    }
+    if (request.url === '/remote-file-missing') {
+      const responseBody = JSON.stringify({
+        status: 'error',
+        data: {
+          code: 1,
+          name: 'Error',
+          message: "chmod: cannot access '/backup/local/backup_wp.tar.gz': No such file or directory",
+        },
+      });
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(responseBody);
       return;
     }
     const content = request.url === '/first' ? firstContent : secondContent;
@@ -117,6 +138,74 @@ async function main() {
     assert.strictEqual(fs.existsSync(taskFileStorage.getTaskFilePath(mismatchedTask)), false);
     assert.strictEqual(fs.existsSync(taskFileStorage.getTaskPartialFilePath(mismatchedTask)), false);
 
+    const unexpectedResponseTask = {
+      taskId: 4532,
+      filename: 'backup_wp.tar.gz',
+      filesize: firstContent.length,
+      host: `http://127.0.0.1:${port}/unexpected`,
+    };
+    await assert.rejects(
+      fileService.downloadFileFromHost(unexpectedResponseTask),
+      (error) => {
+        assert.strictEqual(error.code, 'FLUX_NODE_DOWNLOAD_ERROR');
+        assert.match(error.message, /Flux node rejected backup download/);
+        assert.strictEqual(error.diagnostic.check, 'Flux node backup download');
+        assert.strictEqual(error.diagnostic.httpStatus, 200);
+        assert(error.diagnostic.receivedSize > 0);
+        assert(error.diagnostic.responseBody.includes('backup file is not available'));
+        return true;
+      },
+    );
+
+    const missingRemoteFileTask = {
+      taskId: 4535,
+      filename: 'backup_wp.tar.gz',
+      filesize: firstContent.length,
+      host: `http://127.0.0.1:${port}/remote-file-missing`,
+    };
+    await assert.rejects(
+      fileService.downloadFileFromHost(missingRemoteFileTask),
+      (error) => {
+        assert.strictEqual(error.code, 'REMOTE_BACKUP_FILE_MISSING');
+        assert.strictEqual(error.terminal, true);
+        assert.strictEqual(error.httpStatus, 200);
+        assert.strictEqual(error.diagnostic.httpStatus, 200);
+        assert.match(error.message, /no longer exists on Flux node/);
+        assert(error.diagnostic.responseBody.includes('No such file or directory'));
+        return true;
+      },
+    );
+    assert.strictEqual(fs.existsSync(taskFileStorage.getTaskFilePath(missingRemoteFileTask)), false);
+    assert.strictEqual(fs.existsSync(taskFileStorage.getTaskPartialFilePath(missingRemoteFileTask)), false);
+
+    const oversizedTask = {
+      taskId: 4533,
+      filename: 'backup_wp.tar.gz',
+      filesize: firstContent.length,
+      host: `http://127.0.0.1:${port}/first`,
+    };
+    config.fluxDriveMaxFileSizeMb = 0.001;
+    await assert.rejects(
+      fileService.downloadFileFromHost(oversizedTask),
+      (error) => error.code === 'FLUXDRIVE_FILE_TOO_LARGE' && error.terminal === true,
+    );
+    assert.strictEqual(fs.existsSync(taskFileStorage.getTaskDirectory(oversizedTask)), false);
+    config.fluxDriveMaxFileSizeMb = originalFluxDriveMaxFileSizeMb;
+
+    const capacityTask = {
+      taskId: 4534,
+      filename: 'backup_wp.tar.gz',
+      filesize: firstContent.length,
+      host: `http://127.0.0.1:${port}/first`,
+    };
+    config.storageMinimumFreeGb = Number.MAX_SAFE_INTEGER;
+    await assert.rejects(
+      fileService.downloadFileFromHost(capacityTask),
+      (error) => error.code === 'INSUFFICIENT_LOCAL_STORAGE'
+        && error.deferWithoutFailure === true,
+    );
+    assert.strictEqual(fs.existsSync(taskFileStorage.getTaskDirectory(capacityTask)), false);
+
     console.log('Concurrent task download tests passed');
   } finally {
     if (server.listening) await close(server);
@@ -130,7 +219,9 @@ main()
   })
   .finally(() => {
     config.storagePath = originalStoragePath;
-    fluxOS.verifyLogin = originalVerifyLogin;
+    config.fluxDriveMaxFileSizeMb = originalFluxDriveMaxFileSizeMb;
+    config.storageMinimumFreeGb = originalStorageMinimumFreeGb;
+    fluxOS.verifyTeamLogin = originalVerifyTeamLogin;
     Vault.getKey = originalGetKey;
     log.info = originalLogInfo;
     log.error = originalLogError;

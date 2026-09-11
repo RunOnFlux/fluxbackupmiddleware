@@ -16,10 +16,16 @@ function extractMarketplaceTemplates(response) {
   if (!apps) return null;
 
   return apps
-    .filter((app) => app?.redirectUrl && Array.isArray(app.compose))
+    // The marketplace API returns templates. Some valid enabled templates
+    // (including Terraria) do not define redirectUrl, so it cannot be used as
+    // a marketplace discriminator.
+    .filter((app) => app?.enabled !== false
+      && Array.isArray(app.compose)
+      && app.compose.length > 0)
     .map((app) => ({
       repotags: app.compose.map((component) => component?.repotag || ''),
-    }));
+    }))
+    .filter((template) => template.repotags.every(Boolean));
 }
 
 function matchesMarketplaceRepotags(repotags, marketplaceTemplates) {
@@ -30,6 +36,16 @@ function matchesMarketplaceRepotags(repotags, marketplaceTemplates) {
     template.repotags.length === repotags.length
     && template.repotags.every((repotag, index) => repotag === repotags[index])
   ));
+}
+
+function getMarketplaceClassificationUpdate(currentValue, matchesMarketplace) {
+  const nextValue = Number(Boolean(matchesMarketplace));
+  if (currentValue === null || currentValue === undefined) return nextValue;
+  // A refreshed catalog may recognize a template that an older classifier
+  // missed. Promote false to true, but never automatically demote an app that
+  // was already confirmed as marketplace.
+  if (Number(currentValue) !== 1 && nextValue === 1) return 1;
+  return null;
 }
 
 async function getMarketplaceTemplates(forceRefresh = false) {
@@ -44,7 +60,7 @@ async function getMarketplaceTemplates(forceRefresh = false) {
     const response = await axios.get(config.marketplaceCatalog.url, { timeout: 30000 });
     const templates = extractMarketplaceTemplates(response.data);
     if (!templates || templates.length === 0) {
-      throw new Error('Marketplace catalog contained no templates with redirectUrl');
+      throw new Error('Marketplace catalog contained no valid compose templates');
     }
     marketplaceTemplatesCache = templates;
     marketplaceCacheTimestamp = now;
@@ -64,6 +80,7 @@ function resetMarketplaceCache() {
 module.exports = {
   extractMarketplaceTemplates,
   matchesMarketplaceRepotags,
+  getMarketplaceClassificationUpdate,
   getMarketplaceTemplates,
   resetMarketplaceCache,
 };

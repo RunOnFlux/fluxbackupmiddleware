@@ -11,6 +11,7 @@ const RETRYABLE_READ_ERROR_CODES = new Set([
   'PROTOCOL_CONNECTION_LOST',
   'PROTOCOL_ENQUEUE_AFTER_FATAL_ERROR',
 ]);
+const STATUS_COLUMN_MAX_LENGTH = 256;
 
 function summarizeSql(sql) {
   return String(sql).replace(/\s+/g, ' ').trim().slice(0, 180);
@@ -34,23 +35,44 @@ function withTimeout(operation, timeoutMs, sqlSummary) {
 }
 
 /**
- * Sanitizes status object to ensure it doesn't exceed database column limit.
- * Truncates message to fit within VARCHAR(256) limit when JSON-serialized.
- * @param {Object} status - The status object with state, message, and progress
- * @returns {Object} - Sanitized status object
+ * Serializes status while ensuring it fits the VARCHAR(256) database column.
+ * @param {Object|string} status - Status object or an existing JSON status string
+ * @returns {string} A valid, size-bounded JSON status string
  */
-function sanitizeStatus(status) {
-  if (!status || typeof status !== 'object') {
-    return status;
+function normalizeStatus(status) {
+  if (typeof status !== 'string') return status;
+  try {
+    return JSON.parse(status);
+  } catch (error) {
+    return { state: 'unknown', message: status, progress: 0 };
   }
-  const sanitized = { ...status };
-  // Reserve ~35 chars for JSON structure: {"state":"","progress":0}
-  // Maximum message length to stay under 256 chars total
-  const maxMessageLength = 180;
-  if (sanitized.message && sanitized.message.length > maxMessageLength) {
-    sanitized.message = `${sanitized.message.substring(0, maxMessageLength - 3)}...`;
+}
+
+function serializeStatus(status) {
+  const normalized = normalizeStatus(status);
+  if (!normalized || typeof normalized !== 'object') {
+    return JSON.stringify({ state: 'unknown', message: String(normalized ?? ''), progress: 0 });
   }
-  return sanitized;
+
+  const serialized = JSON.stringify(normalized);
+  if (serialized.length <= STATUS_COLUMN_MAX_LENGTH) return serialized;
+
+  const compact = {
+    state: String(normalized.state || 'unknown').slice(0, 32),
+    message: String(normalized.message || ''),
+    progress: Number.isFinite(Number(normalized.progress)) ? Number(normalized.progress) : 0,
+  };
+  const suffix = '...';
+  let low = 0;
+  let high = compact.message.length;
+  while (low < high) {
+    const midpoint = Math.ceil((low + high) / 2);
+    compact.message = String(normalized.message || '').slice(0, midpoint) + suffix;
+    if (JSON.stringify(compact).length <= STATUS_COLUMN_MAX_LENGTH) low = midpoint;
+    else high = midpoint - 1;
+  }
+  compact.message = String(normalized.message || '').slice(0, low) + suffix;
+  return JSON.stringify(compact);
 }
 
 class DBClient {
@@ -266,13 +288,7 @@ class DBClient {
       fields += `${key},`;
       values += '?,';
       if (key === 'status') {
-        const statusValue = task[key];
-        if (typeof statusValue === 'string') {
-          params.push(statusValue);
-        } else {
-          const sanitizedStatus = sanitizeStatus(statusValue);
-          params.push(JSON.stringify(sanitizedStatus));
-        }
+        params.push(serializeStatus(task[key]));
       } else {
         params.push(task[key]);
       }
@@ -299,7 +315,7 @@ class DBClient {
       // eslint-disable-next-line no-prototype-builtins
       if (key !== 'taskId') {
         fields += ` ${key}=?,`;
-        if (key === 'status') params.push(typeof task[key] === 'string' ? task[key] : JSON.stringify(task[key]));
+        if (key === 'status') params.push(serializeStatus(task[key]));
         else params.push(task[key]);
       }
     }
@@ -399,6 +415,10 @@ class DBClient {
         expire_counter int DEFAULT '0',
         last_backup_timestamp bigint unsigned DEFAULT '0',
         is_marketplace tinyint DEFAULT NULL,
+        dispatch_token varchar(64) DEFAULT NULL,
+        dispatch_lease_until bigint unsigned NOT NULL DEFAULT '0',
+        last_failure_fingerprint varchar(64) DEFAULT NULL,
+        last_failure_notified_at bigint unsigned NOT NULL DEFAULT '0',
         PRIMARY KEY (\`id\`),
         UNIQUE KEY \`appname_unique\` (\`appname\`))ENGINE=InnoDB;`);
     } else {
@@ -423,6 +443,74 @@ class DBClient {
     } else {
       log.info('is_marketplace column already exists, moving on...');
     }
+
+    const dispatchColumnRows = await this.query(`
+      SELECT COLUMN_NAME
+      FROM INFORMATION_SCHEMA.COLUMNS
+      WHERE TABLE_SCHEMA = '${this.InitDB}'
+      AND TABLE_NAME = 'automatic_backups'
+      AND COLUMN_NAME IN (
+        'dispatch_token',
+        'dispatch_lease_until',
+        'last_failure_fingerprint',
+        'last_failure_notified_at'
+      )
+    `);
+    const dispatchColumns = new Set(dispatchColumnRows.map((row) => row.COLUMN_NAME));
+    const missingDispatchColumns = [];
+    if (!dispatchColumns.has('dispatch_token')) {
+      missingDispatchColumns.push('ADD COLUMN dispatch_token VARCHAR(64) DEFAULT NULL');
+    }
+    if (!dispatchColumns.has('dispatch_lease_until')) {
+      missingDispatchColumns.push("ADD COLUMN dispatch_lease_until BIGINT UNSIGNED NOT NULL DEFAULT '0'");
+    }
+    if (!dispatchColumns.has('last_failure_fingerprint')) {
+      missingDispatchColumns.push('ADD COLUMN last_failure_fingerprint VARCHAR(64) DEFAULT NULL');
+    }
+    if (!dispatchColumns.has('last_failure_notified_at')) {
+      missingDispatchColumns.push("ADD COLUMN last_failure_notified_at BIGINT UNSIGNED NOT NULL DEFAULT '0'");
+    }
+    if (missingDispatchColumns.length > 0) {
+      log.info(`Adding automatic backup dispatch columns: ${missingDispatchColumns.length}`);
+      await this.query(`ALTER TABLE automatic_backups ${missingDispatchColumns.join(', ')}`);
+    }
+
+    await this.query(`CREATE TABLE IF NOT EXISTS enterprise_app_discovery (
+      appname varchar(128) NOT NULL,
+      spec_hash varchar(128) NOT NULL,
+      has_syncthing tinyint NOT NULL DEFAULT '0',
+      components JSON,
+      repotags JSON,
+      checked_at bigint unsigned NOT NULL,
+      PRIMARY KEY (\`appname\`),
+      KEY \`spec_hash_idx\` (\`spec_hash\`)
+    )ENGINE=InnoDB;`);
+
+    await this.query(`CREATE TABLE IF NOT EXISTS backup_activity_events (
+      event_key varchar(191) NOT NULL,
+      event_kind varchar(16) NOT NULL,
+      backup_type varchar(32) NOT NULL,
+      appname varchar(128) NOT NULL,
+      batch_key varchar(191) NOT NULL,
+      task_id bigint unsigned DEFAULT NULL,
+      outcome varchar(16) NOT NULL,
+      file_count int unsigned NOT NULL DEFAULT '0',
+      filesize bigint unsigned NOT NULL DEFAULT '0',
+      stage varchar(64) DEFAULT NULL,
+      reason varchar(512) DEFAULT NULL,
+      occurred_at bigint unsigned NOT NULL,
+      PRIMARY KEY (\`event_key\`),
+      KEY \`activity_period_idx\` (\`occurred_at\`,\`backup_type\`,\`event_kind\`),
+      KEY \`activity_batch_idx\` (\`batch_key\`)
+    )ENGINE=InnoDB;`);
+
+    await this.query(`CREATE TABLE IF NOT EXISTS daily_backup_reports (
+      report_date date NOT NULL,
+      status varchar(16) NOT NULL DEFAULT 'sending',
+      reserved_at bigint unsigned NOT NULL,
+      sent_at bigint unsigned DEFAULT NULL,
+      PRIMARY KEY (\`report_date\`)
+    )ENGINE=InnoDB;`);
 
     // Check if backup_type column exists in tasks table, if not add it
     const backupTypeColumnCheck = await this.query(`
@@ -498,3 +586,4 @@ exports.createClient = async function () {
 };
 
 exports.DBClient = DBClient;
+exports.serializeStatus = serializeStatus;

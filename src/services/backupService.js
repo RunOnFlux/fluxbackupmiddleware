@@ -2,6 +2,7 @@
 /* eslint-disable no-undef */
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const axios = require('axios');
 const DBClient = require('./utils/DBClient');
 const log = require('../lib/log');
@@ -12,8 +13,9 @@ const fileManager = require('./fileService');
 const fluxDrive = require('./fluxDrive');
 const fluxOS = require('./fluxOsService');
 const marketplaceService = require('./marketplaceService');
-const Vault = require('./Vault');
+const enterpriseDiscoveryCache = require('./utils/enterpriseDiscoveryCache');
 const discordNotifier = require('./discordNotifier');
+const dailyBackupReport = require('./utils/dailyBackupReport');
 const {
   extractReconciledTasks,
   isRecoverableTask,
@@ -29,6 +31,408 @@ const taskQueue = new Map();
 const userQuotaOperations = new Map();
 const TASK_MAX_FAILURES = 4;
 let fluxDriveReconciliationRunning = false;
+let activeAutomaticBackupDispatchers = 0;
+const automaticFailureNotifications = new Map();
+const activeScheduledJobs = new Set();
+
+function getErrorMessage(error) {
+  if (error instanceof Error) return error.message;
+  if (typeof error === 'string') return error;
+  if (error === null || error === undefined) return String(error);
+  if (typeof error === 'object') {
+    if (typeof error.message === 'string' && error.message.length > 0) {
+      return error.message;
+    }
+    try {
+      return JSON.stringify(error);
+    } catch {
+      return String(error);
+    }
+  }
+  return String(error);
+}
+
+function launchScheduledJob(name, operation, preventOverlap = true) {
+  if (preventOverlap && activeScheduledJobs.has(name)) {
+    log.warn(`Skipping scheduled job ${name}: previous run is still active`);
+    return Promise.resolve(false);
+  }
+  if (preventOverlap) activeScheduledJobs.add(name);
+  return Promise.resolve()
+    .then(operation)
+    .catch((error) => {
+      log.error(`Scheduled job ${name} failed: ${getErrorMessage(error)}`);
+      return false;
+    })
+    .finally(() => {
+      if (preventOverlap) activeScheduledJobs.delete(name);
+    });
+}
+
+async function recordBackupActivity(event) {
+  try {
+    await dbCli.execute(`
+      INSERT IGNORE INTO backup_activity_events (
+        event_key, event_kind, backup_type, appname, batch_key, task_id,
+        outcome, file_count, filesize, stage, reason, occurred_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `, [
+      event.eventKey,
+      event.eventKind,
+      event.backupType,
+      event.appname,
+      event.batchKey,
+      event.taskId || null,
+      event.outcome,
+      event.fileCount || 0,
+      event.filesize || 0,
+      event.stage || null,
+      event.reason ? String(event.reason).slice(0, 512) : null,
+      event.occurredAt || Date.now(),
+    ]);
+  } catch (error) {
+    log.error(`Failed to record backup activity ${event.eventKey}: ${getErrorMessage(error)}`);
+  }
+}
+
+async function recordTaskActivity(task, outcome, stage, reason) {
+  await recordBackupActivity({
+    eventKey: `task:${task.taskId}`,
+    eventKind: 'file',
+    backupType: task.backup_type || 'manual',
+    appname: task.appname,
+    batchKey: `${task.backup_type || 'manual'}:${task.appname}:${task.timestamp}`,
+    taskId: task.taskId,
+    outcome,
+    fileCount: outcome === 'success' ? 1 : 0,
+    filesize: outcome === 'success' ? Number(task.filesize) || 0 : 0,
+    stage,
+    reason,
+  });
+}
+
+async function recordAutomaticRunActivity({
+  automaticBackup,
+  runStartedAt,
+  batchKey,
+  outcome,
+  fileCount = 0,
+  filesize = 0,
+  stage,
+  reason,
+}) {
+  if (!automaticBackup || !runStartedAt) return;
+  await recordBackupActivity({
+    eventKey: `automatic-run:${automaticBackup.id}:${runStartedAt}`,
+    eventKind: 'run',
+    backupType: 'automatic',
+    appname: automaticBackup.appname,
+    batchKey: batchKey || `automatic:${automaticBackup.appname}:${runStartedAt}`,
+    outcome,
+    fileCount,
+    filesize,
+    stage,
+    reason,
+  });
+}
+
+function emptyReportMetric() {
+  return {
+    total: 0, successful: 0, failed: 0, successBytes: 0,
+  };
+}
+
+async function backfillTerminalTaskActivity(period) {
+  await dbCli.execute(`
+    INSERT IGNORE INTO backup_activity_events (
+      event_key, event_kind, backup_type, appname, batch_key, task_id,
+      outcome, file_count, filesize, stage, reason, occurred_at
+    )
+    SELECT
+      CONCAT('task:', taskId),
+      'file',
+      CASE WHEN backup_type LIKE 'automatic%' THEN 'automatic' ELSE 'manual' END,
+      appname,
+      CONCAT(
+        CASE WHEN backup_type LIKE 'automatic%' THEN 'automatic' ELSE 'manual' END,
+        ':', appname, ':', timestamp
+      ),
+      taskId,
+      CASE WHEN status LIKE '%"state":"finished"%' THEN 'success' ELSE 'failed' END,
+      CASE WHEN status LIKE '%"state":"finished"%' THEN 1 ELSE 0 END,
+      CASE WHEN status LIKE '%"state":"finished"%' THEN COALESCE(filesize, 0) ELSE 0 END,
+      CASE WHEN status LIKE '%"state":"finished"%' THEN 'completed' ELSE 'task_pipeline' END,
+      LEFT(status, 512),
+      CASE WHEN finishTime > 0 THEN finishTime * 1000 ELSE startTime * 1000 END
+    FROM tasks
+    WHERE (
+      (finishTime > 0 AND finishTime * 1000 >= ? AND finishTime * 1000 < ?)
+      OR (finishTime = 0 AND fails >= ? AND startTime * 1000 >= ? AND startTime * 1000 < ?)
+    )
+  `, [period.start, period.end, TASK_MAX_FAILURES, period.start, period.end]);
+}
+
+async function collectDailyBackupMetrics(period) {
+  await backfillTerminalTaskActivity(period);
+  const now = Date.now();
+  const marketplaceCutoff = now - (
+    config.automaticBackupSchedule.marketplaceIntervalHours * 60 * 60 * 1000
+  );
+  const [appInventoryRow] = await dbCli.execute(`
+    SELECT
+      COALESCE(SUM(status IS NULL OR status != 'cancelled'), 0) AS active_apps,
+      COALESCE(SUM((status IS NULL OR status != 'cancelled') AND is_marketplace = 1), 0)
+        AS marketplace_apps,
+      COALESCE(SUM(
+        status != 'cancelled' AND is_marketplace = 1 AND status = 'pending'
+        AND dispatch_token IS NOT NULL AND dispatch_lease_until > 0
+        AND dispatch_lease_until < ?
+      ), 0) AS stale_marketplace_leases,
+      COALESCE(SUM(
+        status != 'cancelled' AND is_marketplace = 1
+        AND last_backup_timestamp < ?
+      ), 0) AS overdue_marketplace_apps
+    FROM automatic_backups
+  `, [now, marketplaceCutoff]);
+  const aggregateRows = await dbCli.execute(`
+    SELECT
+      CASE WHEN backup_type LIKE 'automatic%' THEN 'automatic' ELSE 'manual' END AS report_type,
+      event_kind, outcome, COUNT(*) AS event_count,
+      COALESCE(SUM(filesize), 0) AS total_size
+    FROM backup_activity_events
+    WHERE occurred_at >= ? AND occurred_at < ?
+    GROUP BY report_type, event_kind, outcome
+  `, [period.start, period.end]);
+
+  const automaticRuns = emptyReportMetric();
+  const automaticFiles = emptyReportMetric();
+  const manualFiles = emptyReportMetric();
+  aggregateRows.forEach((row) => {
+    const count = Number(row.event_count) || 0;
+    const bytes = Number(row.total_size) || 0;
+    let target = null;
+    if (row.report_type === 'automatic' && row.event_kind === 'file') {
+      target = automaticFiles;
+    } else if (row.report_type === 'manual' && row.event_kind === 'file') {
+      target = manualFiles;
+    }
+    if (!target) return;
+    target.total += count;
+    if (row.outcome === 'success') {
+      target.successful += count;
+      target.successBytes += bytes;
+    } else if (row.outcome === 'failed') {
+      target.failed += count;
+    }
+  });
+
+  const batchRows = await dbCli.execute(`
+    SELECT
+      events.appname,
+      CASE WHEN events.backup_type LIKE 'automatic%' THEN 'automatic' ELSE 'manual' END
+        AS report_type,
+      CONCAT(events.appname, ':', SUBSTRING_INDEX(events.batch_key, ':', -1))
+        AS report_batch,
+      MAX(
+        apps.is_marketplace = 1 AND (apps.status IS NULL OR apps.status != 'cancelled')
+      ) AS is_active_marketplace,
+      SUM(events.event_kind = 'run' AND events.outcome = 'success') AS successful_runs,
+      SUM(events.event_kind = 'run' AND events.outcome = 'failed') AS failed_runs,
+      SUM(events.event_kind = 'file' AND events.outcome = 'success') AS successful_files,
+      SUM(events.event_kind = 'file' AND events.outcome = 'failed') AS failed_files
+    FROM backup_activity_events events
+    LEFT JOIN automatic_backups apps
+      ON events.appname COLLATE utf8mb4_unicode_ci
+        = apps.appname COLLATE utf8mb4_unicode_ci
+    WHERE events.occurred_at >= ? AND events.occurred_at < ?
+    GROUP BY events.appname, report_type, report_batch
+  `, [period.start, period.end]);
+  const manualRuns = emptyReportMetric();
+  const attemptedMarketplaceApps = new Set();
+  const successfulMarketplaceApps = new Set();
+  batchRows.forEach((row) => {
+    const target = row.report_type === 'automatic' ? automaticRuns : manualRuns;
+    const failed = Number(row.failed_runs) > 0 || Number(row.failed_files) > 0;
+    const successful = Number(row.successful_runs) > 0 || Number(row.successful_files) > 0;
+    if (!failed && !successful) return;
+    target.total += 1;
+    if (failed) target.failed += 1;
+    else target.successful += 1;
+    if (row.report_type === 'automatic' && Number(row.is_active_marketplace) === 1) {
+      attemptedMarketplaceApps.add(row.appname);
+      if (!failed && successful) successfulMarketplaceApps.add(row.appname);
+    }
+  });
+
+  const marketplaceApps = Number(appInventoryRow?.marketplace_apps) || 0;
+  const marketplaceAttempted = attemptedMarketplaceApps.size;
+  const marketplaceSuccessful = successfulMarketplaceApps.size;
+
+  return {
+    appInventory: {
+      active: Number(appInventoryRow?.active_apps) || 0,
+      marketplace: marketplaceApps,
+    },
+    marketplaceCoverage: {
+      attempted: marketplaceAttempted,
+      successful: marketplaceSuccessful,
+      failedOrIncomplete: Math.max(marketplaceAttempted - marketplaceSuccessful, 0),
+      noActivity: Math.max(marketplaceApps - marketplaceAttempted, 0),
+      staleLeases: Number(appInventoryRow?.stale_marketplace_leases) || 0,
+      overdue: Number(appInventoryRow?.overdue_marketplace_apps) || 0,
+    },
+    automaticRuns,
+    automaticFiles,
+    manualRuns,
+    manualFiles,
+  };
+}
+
+async function generateDailyBackupReport(period) {
+  const metrics = await collectDailyBackupMetrics(period);
+  const content = dailyBackupReport.buildDailyReportContent({
+    reportDate: period.reportDate,
+    periodLabel: period.periodLabel,
+    ...metrics,
+  });
+  return { period, metrics, content };
+}
+
+async function claimDailyBackupReport(reportDate) {
+  const now = Date.now();
+  const insertResult = await dbCli.execute(`
+    INSERT IGNORE INTO daily_backup_reports (report_date, status, reserved_at)
+    VALUES (?, 'sending', ?)
+  `, [reportDate, now]);
+  if (insertResult.affectedRows === 1) return true;
+
+  const reclaimResult = await dbCli.execute(`
+    UPDATE daily_backup_reports
+    SET reserved_at = ?
+    WHERE report_date = ? AND status = 'sending' AND reserved_at < ?
+  `, [now, reportDate, now - (60 * 60 * 1000)]);
+  return reclaimResult.affectedRows === 1;
+}
+
+async function sendDailyBackupReport(period = dailyBackupReport.getPreviousUtcPeriod()) {
+  let claimed = false;
+  try {
+    claimed = await claimDailyBackupReport(period.reportDate);
+    if (!claimed) return null;
+
+    const { content } = await generateDailyBackupReport(period);
+    const sent = await discordNotifier.sendDailyBackupReport(content, period.reportDate);
+    if (!sent) {
+      await dbCli.execute(
+        "DELETE FROM daily_backup_reports WHERE report_date = ? AND status = 'sending'",
+        [period.reportDate],
+      );
+      return false;
+    }
+    await dbCli.execute(`
+      UPDATE daily_backup_reports SET status = 'sent', sent_at = ? WHERE report_date = ?
+    `, [Date.now(), period.reportDate]);
+    return true;
+  } catch (error) {
+    log.error(`Daily backup report failed for ${period.reportDate}: ${getErrorMessage(error)}`);
+    if (claimed) {
+      try {
+        await dbCli.execute(
+          "DELETE FROM daily_backup_reports WHERE report_date = ? AND status = 'sending'",
+          [period.reportDate],
+        );
+      } catch (releaseError) {
+        log.error(`Failed to release daily report claim: ${getErrorMessage(releaseError)}`);
+      }
+    }
+    return false;
+  }
+}
+
+function isLocalReportRequest(req) {
+  const remoteAddress = req.socket?.remoteAddress || req.connection?.remoteAddress || '';
+  const loopbackAddresses = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
+  const host = String(req.headers?.host || '').toLowerCase();
+  const hostname = host.startsWith('[') && host.includes(']')
+    ? host.slice(1, host.indexOf(']'))
+    : host.split(':')[0];
+  const localHosts = new Set(['localhost', '127.0.0.1', '::1']);
+  const forwarded = req.headers?.['x-forwarded-for'] || req.headers?.forwarded;
+  return loopbackAddresses.has(remoteAddress) && localHosts.has(hostname) && !forwarded;
+}
+
+function getRequestedReportPeriod(req) {
+  const date = typeof req.query?.date === 'string' ? req.query.date.trim() : '';
+  return date
+    ? dailyBackupReport.getUtcDatePeriod(date)
+    : dailyBackupReport.getRolling24HourPeriod();
+}
+
+async function getDailyBackupReport(req, res) {
+  if (!isLocalReportRequest(req)) {
+    res.status(403).json({ error: 'This endpoint is available only through localhost' });
+    return;
+  }
+  try {
+    const report = await generateDailyBackupReport(getRequestedReportPeriod(req));
+    res.json(report);
+  } catch (error) {
+    const invalidDate = getErrorMessage(error).startsWith('date ');
+    log.error(`Local daily backup report preview failed: ${getErrorMessage(error)}`);
+    res.status(invalidDate ? 400 : 500).json({ error: getErrorMessage(error) });
+  }
+}
+
+async function forceSendDailyBackupReport(req, res) {
+  if (!isLocalReportRequest(req)) {
+    res.status(403).json({ error: 'This endpoint is available only through localhost' });
+    return;
+  }
+  try {
+    const report = await generateDailyBackupReport(getRequestedReportPeriod(req));
+    const sent = await discordNotifier.sendDailyBackupReport(
+      report.content,
+      report.period.reportDate,
+    );
+    if (!sent) {
+      res.status(502).json({ error: 'Discord report delivery failed', ...report });
+      return;
+    }
+    log.info(`Forced daily backup report sent for ${report.period.periodLabel}`);
+    res.json({ sent: true, ...report });
+  } catch (error) {
+    const invalidDate = getErrorMessage(error).startsWith('date ');
+    log.error(`Forced daily backup report failed: ${getErrorMessage(error)}`);
+    res.status(invalidDate ? 400 : 500).json({ error: getErrorMessage(error) });
+  }
+}
+
+function scheduleNextDailyBackupReport() {
+  const reportConfig = config.dailyBackupReport;
+  const delay = dailyBackupReport.getMillisecondsUntilNextReport(
+    new Date(),
+    reportConfig.hourUtc,
+    reportConfig.minuteUtc,
+  );
+  setTimeout(() => {
+    launchScheduledJob('daily-backup-report', async () => {
+      try {
+        const period = dailyBackupReport.getPreviousUtcPeriod();
+        const sent = await sendDailyBackupReport(period);
+        if (sent === false) {
+          setTimeout(() => {
+            launchScheduledJob(
+              `daily-backup-report-retry-${period.reportDate}`,
+              () => sendDailyBackupReport(period),
+            );
+          }, 60 * 60 * 1000);
+        }
+      } finally {
+        scheduleNextDailyBackupReport();
+      }
+    });
+  }, delay);
+}
 
 function getQuotaLimitBytes() {
   return config.quotaPerUser * 1024 * 1024 * 1024;
@@ -48,23 +452,6 @@ async function getUserStorageUsed(owner) {
     return Number(totalUsed[0].totalUsed);
   }
   return 0;
-}
-
-function getErrorMessage(error) {
-  if (error instanceof Error) return error.message;
-  if (typeof error === 'string') return error;
-  if (error === null || error === undefined) return String(error);
-  if (typeof error === 'object') {
-    if (typeof error.message === 'string' && error.message.length > 0) {
-      return error.message;
-    }
-    try {
-      return JSON.stringify(error);
-    } catch {
-      return String(error);
-    }
-  }
-  return String(error);
 }
 
 async function logFluxDriveStoredSize() {
@@ -99,10 +486,11 @@ function getFluxDriveRemovalError(removeResult) {
   return null;
 }
 
-function createBackupFailure(reason, stage, taskFailures = []) {
+function createBackupFailure(reason, stage, taskFailures = [], diagnostics = []) {
   const error = new Error(reason);
   error.stage = stage;
   error.taskFailures = taskFailures;
+  error.diagnostics = diagnostics;
   return error;
 }
 
@@ -110,6 +498,11 @@ function inferFailureStage(error) {
   if (error.stage) return error.stage;
 
   const message = getErrorMessage(error);
+  if (
+    message.includes('Query inactivity timeout')
+    || message.includes('Database operation timed out')
+    || String(error.code || '').startsWith('ER_')
+  ) return 'database';
   if (message.includes('secondary node')) return 'node_selection';
   if (message.includes('authenticate')) return 'node_auth';
   if (message.includes('app owner')) return 'app_owner';
@@ -119,12 +512,158 @@ function inferFailureStage(error) {
   return 'automatic_backup';
 }
 
+function buildAutomaticFailureFingerprint(payload) {
+  const stableFailure = {
+    stage: payload.stage,
+    reason: payload.reason,
+    taskFailures: (payload.taskFailures || []).map((failure) => ({
+      component: failure.component,
+      message: failure.message,
+      node: failure.node,
+      errorCode: failure.errorCode,
+      httpStatus: failure.httpStatus,
+    })),
+    attempts: (payload.failureAttempts || []).map((attempt) => ({
+      stage: attempt.stage,
+      reason: attempt.reason,
+    })),
+  };
+  return crypto.createHash('sha256').update(JSON.stringify(stableFailure)).digest('hex');
+}
+
+async function notifyAutomaticBackupFailureOnce(
+  automaticBackup,
+  payload,
+  database = dbCli,
+  notifier = discordNotifier,
+  notificationCache = automaticFailureNotifications,
+) {
+  const fingerprint = buildAutomaticFailureFingerprint(payload);
+  const now = Date.now();
+  const cooldownMs = config.automaticBackupSchedule.discordFailureCooldownMinutes
+    * 60 * 1000;
+  const cached = notificationCache.get(automaticBackup.id);
+  if (cached && cached.fingerprint === fingerprint && cached.notifiedAt >= now - cooldownMs) {
+    log.warn(`Suppressed duplicate Discord failure notification for ${automaticBackup.appname} (memory cooldown)`);
+    return false;
+  }
+
+  let databaseReservation = false;
+  try {
+    const reservation = await database.execute(`
+      UPDATE automatic_backups
+      SET last_failure_fingerprint = ?, last_failure_notified_at = ?
+      WHERE id = ? AND (
+        last_failure_fingerprint IS NULL
+        OR last_failure_fingerprint != ?
+        OR last_failure_notified_at < ?
+      )
+    `, [fingerprint, now, automaticBackup.id, fingerprint, now - cooldownMs]);
+    if (reservation.affectedRows !== 1) {
+      log.warn(`Suppressed duplicate Discord failure notification for ${automaticBackup.appname} (database cooldown)`);
+      notificationCache.set(automaticBackup.id, { fingerprint, notifiedAt: now });
+      return false;
+    }
+    databaseReservation = true;
+  } catch (error) {
+    log.error(`Could not reserve Discord failure notification for ${automaticBackup.appname}; using memory cooldown: ${getErrorMessage(error)}`);
+  }
+
+  notificationCache.set(automaticBackup.id, { fingerprint, notifiedAt: now });
+  const sent = await notifier.notifyAutomaticBackupFailure(payload);
+  if (!sent) {
+    notificationCache.delete(automaticBackup.id);
+    if (databaseReservation) {
+      try {
+        await database.execute(`
+          UPDATE automatic_backups SET last_failure_notified_at = 0
+          WHERE id = ? AND last_failure_fingerprint = ? AND last_failure_notified_at = ?
+        `, [automaticBackup.id, fingerprint, now]);
+      } catch (error) {
+        log.error(`Failed to release Discord notification reservation for ${automaticBackup.appname}: ${getErrorMessage(error)}`);
+      }
+    }
+  }
+  return sent;
+}
+
+const TASK_PROGRESS_STATES = new Set(['in queue', 'started', 'downloading', 'uploading']);
+
+function getTaskStatusState(task) {
+  return String(task?.status?.state || '').trim().toLowerCase();
+}
+
+function getTaskOutcome(task) {
+  if (!task) {
+    return { state: 'failed', reason: 'Task not found in database' };
+  }
+
+  const fails = Number(task.fails) || 0;
+  const finishTime = Number(task.finishTime) || 0;
+  const uploaded = Number(task.uploaded) === 1;
+  const statusState = getTaskStatusState(task);
+  const statusMessage = task.status?.message;
+
+  if (fails >= TASK_MAX_FAILURES) {
+    return {
+      state: 'failed',
+      reason: TASK_PROGRESS_STATES.has(statusState)
+        ? `Task failed ${fails} times`
+        : statusMessage || `Task failed ${fails} times`,
+    };
+  }
+
+  // A zero finishTime may be returned as either 0 or "0" by the database.
+  // Progress status messages must never be interpreted as terminal failures.
+  if (finishTime <= 0) {
+    return { state: 'pending' };
+  }
+
+  if (uploaded && statusState === 'finished') {
+    return { state: 'success' };
+  }
+
+  return {
+    state: 'failed',
+    reason: TASK_PROGRESS_STATES.has(statusState)
+      ? 'Task ended before the FluxDrive upload completed'
+      : statusMessage || 'Task did not upload successfully',
+  };
+}
+
 function buildTaskFailure(task, taskId, reason) {
+  let node = null;
+  let storedDiagnostic = null;
+  if (task?.extra) {
+    try {
+      storedDiagnostic = JSON.parse(task.extra).failureDiagnostic || null;
+    } catch (error) {
+      storedDiagnostic = null;
+    }
+  }
+  if (task?.host) {
+    try {
+      node = new URL(task.host).origin;
+    } catch (error) {
+      [node] = String(task.host).split('/backup/');
+    }
+  }
   return {
     taskId,
     component: task?.component || 'unknown',
-    message: task?.status?.message || reason,
+    message: reason,
     fails: task?.fails || 0,
+    node: storedDiagnostic?.node || node,
+    endpoint: storedDiagnostic?.endpoint || task?.host || null,
+    httpStatus: storedDiagnostic?.httpStatus || null,
+    errorCode: storedDiagnostic?.errorCode || null,
+    fileSize: Number(storedDiagnostic?.fileSize ?? task?.filesize) || 0,
+    receivedSize: storedDiagnostic?.receivedSize !== null
+      && typeof storedDiagnostic?.receivedSize !== 'undefined'
+      && Number.isFinite(Number(storedDiagnostic.receivedSize))
+      ? Number(storedDiagnostic.receivedSize) : null,
+    responseBody: storedDiagnostic?.responseBody || null,
+    check: storedDiagnostic?.check || null,
   };
 }
 
@@ -133,7 +672,14 @@ async function collectTaskFailures(taskIds, reason) {
   for (let i = 0; i < taskIds.length; i += 1) {
     const taskId = taskIds[i];
     const task = await dbCli.getTask(taskId);
-    failures.push(buildTaskFailure(task, taskId, reason));
+    const outcome = getTaskOutcome(task);
+    if (outcome.state !== 'success') {
+      failures.push(buildTaskFailure(
+        task,
+        taskId,
+        outcome.state === 'failed' ? outcome.reason : reason,
+      ));
+    }
   }
   return failures;
 }
@@ -212,6 +758,12 @@ async function cancelTaskDueToQuota(task, taskId, filesize) {
     }
   }
   await dbCli.updateTask(cancelledTask);
+  await recordTaskActivity(
+    cancelledTask,
+    'failed',
+    'quota',
+    cancelledTask.status.message,
+  );
   taskQueue.delete(Number(taskId));
 }
 
@@ -228,29 +780,29 @@ function runUserQuotaOperation(owner, operation) {
 
 async function getQuotaPruningCandidates(task) {
   return dbCli.execute(`
-    SELECT stored.taskId, stored.appname, stored.timestamp, stored.hash,
-      stored.filename, stored.filesize
-    FROM tasks stored
-    WHERE stored.owner = ?
-    AND stored.backup_type = 'automatic'
-    AND stored.uploaded = 1
-    AND stored.removedFromFluxdrive = 0
-    AND stored.finishTime > 0
-    AND stored.hash IS NOT NULL
-    AND stored.hash <> ''
-    AND NOT (stored.appname = ? AND stored.timestamp = ?)
+    SELECT retained_task.taskId, retained_task.appname, retained_task.timestamp,
+      retained_task.hash, retained_task.filename, retained_task.filesize
+    FROM tasks AS retained_task
+    WHERE retained_task.owner = ?
+    AND retained_task.backup_type = 'automatic'
+    AND retained_task.uploaded = 1
+    AND retained_task.removedFromFluxdrive = 0
+    AND retained_task.finishTime > 0
+    AND retained_task.hash IS NOT NULL
+    AND retained_task.hash <> ''
+    AND NOT (retained_task.appname = ? AND retained_task.timestamp = ?)
     AND NOT EXISTS (
       SELECT 1
-      FROM tasks pending
-      WHERE pending.owner = stored.owner
-      AND pending.appname = stored.appname
-      AND pending.timestamp = stored.timestamp
-      AND pending.removedFromFluxdrive = 0
-      AND pending.uploaded = 0
-      AND pending.finishTime = 0
-      AND pending.fails < ?
+      FROM tasks AS pending_task
+      WHERE pending_task.owner = retained_task.owner
+      AND pending_task.appname = retained_task.appname
+      AND pending_task.timestamp = retained_task.timestamp
+      AND pending_task.removedFromFluxdrive = 0
+      AND pending_task.uploaded = 0
+      AND pending_task.finishTime = 0
+      AND pending_task.fails < ?
     )
-    ORDER BY stored.timestamp ASC, stored.taskId ASC
+    ORDER BY retained_task.timestamp ASC, retained_task.taskId ASC
   `, [task.owner, task.appname, task.timestamp, TASK_MAX_FAILURES]);
 }
 
@@ -322,7 +874,18 @@ async function ensureUserQuotaForDownloadedTask(task) {
 async function runTask(id) {
   log.info(`ruuning task ${id}`);
   const task = taskQueue.get(id);
+  if (!task) {
+    log.error(`Cannot run task ${id}: task is not registered in the in-memory queue`);
+    return;
+  }
   try {
+    if (task.extra) {
+      try {
+        if (JSON.parse(task.extra).failureDiagnostic) task.extra = '';
+      } catch (error) {
+        // Preserve non-diagnostic legacy task metadata.
+      }
+    }
     task.startTime = Math.floor(Date.now() / 1000);
     task.status = { state: 'started', message: 'backup to FluxDrive started', progress: 0 };
     await dbCli.updateTask(task);
@@ -335,6 +898,11 @@ async function runTask(id) {
       await fileManager.downloadFileFromHost(task);
       // task.status = { state: 'downloading', message: 'fetching file from node', progress: 100 };
       await dbCli.updateTask(task);
+    }
+    if (!task.uploaded) {
+      // Revalidate here as well as at registration so legacy queued tasks cannot
+      // retain an oversized downloaded artifact after FluxDrive rejects it.
+      fileManager.validateFluxDriveFileSize(task);
     }
     if (!task.uploaded && !await ensureUserQuotaForDownloadedTask(task)) {
       await cancelTaskDueToQuota(task, id, task.filesize);
@@ -366,17 +934,59 @@ async function runTask(id) {
     task.finishTime = Math.floor(Date.now() / 1000);
     task.extra = '';
     await dbCli.updateTask(task);
-    taskQueue.delete(id);
+    await recordTaskActivity(task, 'success', 'completed', 'finished');
   } catch (error) {
     const message = getErrorMessage(error);
-    if (!task.status || task.status.state !== 'failed') {
-      task.status = { state: 'failed', message, progress: 0 };
+    const deferredForStorage = error.deferWithoutFailure === true;
+    if (deferredForStorage || !task.status || task.status.state !== 'failed') {
+      task.status = {
+        state: deferredForStorage ? 'waiting' : 'failed',
+        message,
+        progress: 0,
+      };
     }
-    task.fails += 1;
-    await dbCli.updateTask(task);
+    if (error.diagnostic) {
+      task.extra = JSON.stringify({ failureDiagnostic: error.diagnostic });
+    }
+    if (error.terminal === true) task.fails = TASK_MAX_FAILURES;
+    else if (!deferredForStorage) task.fails += 1;
+
+    if (task.fails >= TASK_MAX_FAILURES) {
+      try {
+        fileManager.deleteFile(task);
+        task.localRemoved = true;
+        log.info(`Removed local artifacts for terminally failed task ${id}`);
+      } catch (cleanupError) {
+        log.error(`Failed to remove local artifacts for terminally failed task ${id}: ${cleanupError.message}`);
+      }
+    }
+    try {
+      await dbCli.updateTask(task);
+    } catch (persistenceError) {
+      log.error(`Failed to persist failure state for task ${id}: ${getErrorMessage(persistenceError)}`);
+    }
+    if (task.fails >= TASK_MAX_FAILURES) {
+      try {
+        await recordTaskActivity(task, 'failed', task.status?.state || 'task_pipeline', message);
+      } catch (activityError) {
+        log.error(`Failed to record failure activity for task ${id}: ${getErrorMessage(activityError)}`);
+      }
+    }
+    if (deferredForStorage) {
+      log.warn(`task ${id} deferred until local storage capacity is available: ${message}`);
+    } else {
+      log.error(`task ${id} failed:`, error instanceof Error ? error : message);
+    }
+  } finally {
     taskQueue.delete(id);
-    log.error(`task ${id} failed:`, error instanceof Error ? error : message);
   }
+}
+
+function launchTask(id) {
+  runTask(id).catch((error) => {
+    taskQueue.delete(id);
+    log.error(`Unexpected task runner rejection for task ${id}: ${getErrorMessage(error)}`);
+  });
 }
 
 /**
@@ -410,7 +1020,7 @@ async function updateQueue() {
         taskQueue.set(Number(records[i].taskId), records[i]);
         // run task
         log.debug(`retrying task ${records[i].taskId}`);
-        runTask(Number(records[i].taskId));
+        launchTask(Number(records[i].taskId));
       } else {
         // log.warn(`task ${records[i].taskId} already in queue.`);
       }
@@ -470,6 +1080,28 @@ async function checkExpiredApps() {
   }
 }
 
+const { normalizeAppName } = enterpriseDiscoveryCache;
+
+const AUTOMATIC_BACKUP_UPSERT_SQL = `INSERT INTO automatic_backups (
+  appname, components, status, expire_counter, last_backup_timestamp, is_marketplace
+) VALUES (?, ?, 'pending', 0, 0, ?)
+ON DUPLICATE KEY UPDATE
+  components = VALUES(components),
+  expire_counter = 0,
+  is_marketplace = CASE
+    WHEN automatic_backups.is_marketplace IS NULL THEN VALUES(is_marketplace)
+    WHEN automatic_backups.is_marketplace = 0 AND VALUES(is_marketplace) = 1 THEN 1
+    ELSE automatic_backups.is_marketplace
+  END`;
+
+async function upsertAutomaticBackupApp(database, app, isMarketplace) {
+  return database.execute(AUTOMATIC_BACKUP_UPSERT_SQL, [
+    app.appName,
+    JSON.stringify(app.componentNames),
+    isMarketplace,
+  ]);
+}
+
 /**
  * Syncs apps with Syncthing to the automatic_backups table.
  * Adds new apps found and increments expire_count for apps no longer present.
@@ -481,12 +1113,78 @@ async function syncSyncthingApps() {
   try {
     log.info('Syncing Syncthing apps with automatic_backups table...');
 
-    // Get all apps with Syncthing
-    const syncthingApps = await fluxOS.getAppsWithSyncthing();
+    const existingApps = await dbCli.execute(
+      'SELECT appname, components, expire_counter, is_marketplace FROM automatic_backups',
+    );
+    const existingAppsByName = new Map(
+      existingApps.map((app) => [normalizeAppName(app.appname), app]),
+    );
+    const cacheRows = await dbCli.execute(`
+      SELECT appname, spec_hash, has_syncthing, components, repotags
+      FROM enterprise_app_discovery
+    `);
+    const cacheByName = enterpriseDiscoveryCache.normalizeCacheRows(cacheRows);
+    const discovery = await fluxOS.discoverAppsWithSyncthing(cacheByName, existingAppsByName);
 
-    if (!syncthingApps) {
+    if (!discovery) {
       log.error('Failed to fetch apps with Syncthing');
       return;
+    }
+    // MySQL's appname key uses a case-insensitive collation, while Map keys are
+    // case-sensitive. Canonicalize and de-duplicate the discovery response so
+    // names such as `dcmsbackend` and `DCMSBackend` cannot pass the in-memory
+    // existence check and then abort the sync with ER_DUP_ENTRY.
+    const syncthingAppsByName = new Map();
+    discovery.apps.forEach((app) => {
+      const normalizedName = normalizeAppName(app.appName);
+      if (normalizedName) {
+        syncthingAppsByName.set(normalizedName, app);
+      }
+    });
+    const syncthingApps = Array.from(syncthingAppsByName.values());
+
+    let cacheUpdateFailures = 0;
+    for (let i = 0; i < discovery.cacheUpdates.length; i += 1) {
+      const update = discovery.cacheUpdates[i];
+      try {
+        await dbCli.execute(`
+          INSERT INTO enterprise_app_discovery (
+            appname, spec_hash, has_syncthing, components, repotags, checked_at
+          ) VALUES (?, ?, ?, ?, ?, ?)
+          ON DUPLICATE KEY UPDATE
+            spec_hash = VALUES(spec_hash),
+            has_syncthing = VALUES(has_syncthing),
+            components = VALUES(components),
+            repotags = VALUES(repotags),
+            checked_at = VALUES(checked_at)
+        `, [
+          update.appname,
+          update.specHash,
+          Number(update.hasSyncthing),
+          JSON.stringify(update.componentNames),
+          JSON.stringify(update.repotags),
+          Date.now(),
+        ]);
+      } catch (error) {
+        cacheUpdateFailures += 1;
+        log.error(`Failed to cache Syncthing discovery for ${update.appname}; continuing: ${getErrorMessage(error)}`);
+      }
+    }
+
+    const currentEnterpriseNames = discovery.currentEnterpriseAppNames.filter(Boolean);
+    try {
+      if (currentEnterpriseNames.length === 0) {
+        await dbCli.execute('DELETE FROM enterprise_app_discovery');
+      } else {
+        const placeholders = currentEnterpriseNames.map(() => '?').join(', ');
+        await dbCli.execute(
+          `DELETE FROM enterprise_app_discovery WHERE appname NOT IN (${placeholders})`,
+          currentEnterpriseNames,
+        );
+      }
+    } catch (error) {
+      cacheUpdateFailures += 1;
+      log.error(`Failed to remove stale enterprise discovery cache rows; continuing: ${getErrorMessage(error)}`);
     }
 
     const marketplaceTemplates = await marketplaceService.getMarketplaceTemplates();
@@ -496,69 +1194,107 @@ async function syncSyncthingApps() {
       log.warn('Marketplace classification unavailable; unchecked apps will be retried during the next sync');
     }
 
-    // Get all apps currently in automatic_backups table
-    const existingApps = await dbCli.execute('SELECT appname, expire_counter, is_marketplace FROM automatic_backups');
-    const existingAppsByName = new Map(existingApps.map((app) => [app.appname, app]));
-
     // Check for new apps to add
     const newAppsToAdd = [];
     syncthingApps.forEach((app) => {
-      if (!existingAppsByName.has(app.appName)) {
+      if (!existingAppsByName.has(normalizeAppName(app.appName))) {
         newAppsToAdd.push(app);
       }
     });
 
     // Add new apps to the table
+    let addedApps = 0;
+    let insertFailures = 0;
     for (let i = 0; i < newAppsToAdd.length; i += 1) {
       const app = newAppsToAdd[i];
-      const componentsJson = JSON.stringify(app.componentNames);
       const isMarketplace = marketplaceClassificationAvailable
         ? Number(marketplaceService.matchesMarketplaceRepotags(app.repotags, marketplaceTemplates))
         : null;
-      const query = `INSERT INTO automatic_backups (
-        appname, components, status, expire_counter, last_backup_timestamp, is_marketplace
-      ) VALUES (?, ?, 'pending', 0, 0, ?)`;
-      await dbCli.execute(query, [app.appName, componentsJson, isMarketplace]);
-      log.info(`Added new app ${app.appName} to automatic_backups (marketplace=${isMarketplace === null ? 'unchecked' : Boolean(isMarketplace)})`);
+      try {
+        const result = await upsertAutomaticBackupApp(dbCli, app, isMarketplace);
+        if (result.affectedRows === 1) {
+          addedApps += 1;
+          log.info(`Added new app ${app.appName} to automatic_backups (marketplace=${isMarketplace === null ? 'unchecked' : Boolean(isMarketplace)})`);
+        } else {
+          log.warn(`App ${app.appName} appeared during Syncthing sync; refreshed its existing automatic_backups record`);
+        }
+      } catch (error) {
+        insertFailures += 1;
+        log.error(`Failed to add Syncthing app ${app.appName}; continuing with remaining apps: ${error.message}`);
+      }
     }
 
     let classifiedExistingApps = 0;
+    let classificationFailures = 0;
     if (marketplaceClassificationAvailable) {
       for (let i = 0; i < syncthingApps.length; i += 1) {
         const app = syncthingApps[i];
-        const existingApp = existingAppsByName.get(app.appName);
-        if (existingApp && existingApp.is_marketplace === null) {
-          const isMarketplace = Number(
-            marketplaceService.matchesMarketplaceRepotags(app.repotags, marketplaceTemplates),
+        const existingApp = existingAppsByName.get(normalizeAppName(app.appName));
+        if (existingApp) {
+          const matchesMarketplace = marketplaceService.matchesMarketplaceRepotags(
+            app.repotags,
+            marketplaceTemplates,
           );
-          await dbCli.execute(
-            'UPDATE automatic_backups SET is_marketplace = ? WHERE appname = ? AND is_marketplace IS NULL',
-            [isMarketplace, app.appName],
+          const isMarketplace = marketplaceService.getMarketplaceClassificationUpdate(
+            existingApp.is_marketplace,
+            matchesMarketplace,
           );
-          classifiedExistingApps += 1;
-          log.info(`Classified existing app ${app.appName} as marketplace=${Boolean(isMarketplace)}`);
+          if (isMarketplace !== null) {
+            try {
+              await dbCli.execute(
+                `UPDATE automatic_backups SET is_marketplace = ?
+                 WHERE appname = ? AND (is_marketplace IS NULL OR is_marketplace = 0)`,
+                [isMarketplace, app.appName],
+              );
+              classifiedExistingApps += 1;
+              log.info(`Classified existing app ${app.appName} as marketplace=${Boolean(isMarketplace)}`);
+            } catch (error) {
+              classificationFailures += 1;
+              log.error(`Failed to classify Syncthing app ${app.appName}; continuing: ${getErrorMessage(error)}`);
+            }
+          }
         }
       }
     }
 
     // Check for expired apps (in DB but not in current syncthing list)
-    const currentAppNames = new Set(syncthingApps.map((app) => app.appName));
+    const currentAppNames = new Set(
+      syncthingApps.map((app) => normalizeAppName(app.appName)),
+    );
+    const unresolvedEnterpriseAppNames = new Set(
+      Array.from(discovery.unresolvedEnterpriseAppNames || [])
+        .map((appName) => normalizeAppName(appName)),
+    );
     const expiredApps = [];
-    existingAppsByName.forEach((existingApp, appName) => {
-      if (!currentAppNames.has(appName)) {
-        expiredApps.push(appName);
+    existingAppsByName.forEach((existingApp, normalizedAppName) => {
+      if (!currentAppNames.has(normalizedAppName)
+        && !unresolvedEnterpriseAppNames.has(normalizedAppName)) {
+        expiredApps.push(existingApp.appname);
       }
     });
 
     // Increment expire_counter for expired apps
+    let expirationUpdateFailures = 0;
     for (let i = 0; i < expiredApps.length; i += 1) {
       const appName = expiredApps[i];
       const query = 'UPDATE automatic_backups SET expire_counter = expire_counter + 1 WHERE appname = ?';
-      await dbCli.execute(query, [appName]);
-      log.info(`Incremented expire_counter for expired app ${appName}`);
+      try {
+        await dbCli.execute(query, [appName]);
+        log.info(`Incremented expire_counter for expired app ${appName}`);
+      } catch (error) {
+        expirationUpdateFailures += 1;
+        log.error(`Failed to update expiration counter for ${appName}; continuing: ${getErrorMessage(error)}`);
+      }
     }
 
-    log.info(`Sync complete. Added ${newAppsToAdd.length} new apps, classified ${classifiedExistingApps} existing apps, marked ${expiredApps.length} as expired.`);
+    const syncSummary = [
+      `Added ${addedApps} new apps, ${insertFailures} inserts failed`,
+      `classified ${classifiedExistingApps} existing apps (${classificationFailures} failed)`,
+      `marked ${expiredApps.length - expirationUpdateFailures} as expired`,
+      `(${expirationUpdateFailures} expiration updates failed)`,
+      `cache failures=${cacheUpdateFailures}`,
+    ].join(', ');
+    log.info(`Sync complete. ${syncSummary}.`);
   } catch (error) {
     log.error('Error syncing Syncthing apps:', error);
   }
@@ -612,18 +1348,20 @@ async function registerBackupTask(req, res, taskObj = null) {
     // Default to 'manual' if not specified in taskObj
     backupType = backupType || 'manual';
   } else {
-    ({ appname } = req.body);
-    appname = appname || req.query.appname;
-    ({ component } = req.body);
-    component = component || req.query.component;
-    ({ filename } = req.body);
-    filename = filename || req.query.filename;
-    ({ timestamp } = req.body);
-    timestamp = timestamp || req.query.timestamp;
-    ({ host } = req.body);
-    host = host || req.query.host;
-    ({ filesize } = req.body);
-    filesize = filesize || req.query.filesize;
+    const body = req.body || {};
+    const query = req.query || {};
+    ({ appname } = body);
+    appname = appname || query.appname;
+    ({ component } = body);
+    component = component || query.component;
+    ({ filename } = body);
+    filename = filename || query.filename;
+    ({ timestamp } = body);
+    timestamp = timestamp || query.timestamp;
+    ({ host } = body);
+    host = host || query.host;
+    ({ filesize } = body);
+    filesize = filesize || query.filesize;
     // Manual backups from API requests default to 'manual'
     backupType = 'manual';
   }
@@ -656,6 +1394,7 @@ async function registerBackupTask(req, res, taskObj = null) {
     if (!numberpRegex.test(filesize)) {
       throw new Error('filesize is not valid');
     }
+    fileManager.validateFluxDriveFileSize({ filesize, host, filename });
     if (Number(filesize) > getQuotaLimitBytes()) {
       throw new Error('backup file is larger than the user quota.');
     }
@@ -697,7 +1436,7 @@ async function registerBackupTask(req, res, taskObj = null) {
           task.removedFromFluxdrive = 0;
           await dbCli.updateTask(task);
           taskQueue.set(Number(taskId), task);
-          runTask(Number(taskId));
+          launchTask(Number(taskId));
         }
       }
     } else {
@@ -715,7 +1454,7 @@ async function registerBackupTask(req, res, taskObj = null) {
         const task = await dbCli.getTask(taskId);
         if (task) {
           taskQueue.set(Number(taskId), task);
-          runTask(Number(taskId));
+          launchTask(Number(taskId));
         }
       }
     }
@@ -739,8 +1478,8 @@ async function registerBackupTask(req, res, taskObj = null) {
  * @throws Will throw an error if the user session is invalid, application name is invalid, or database operation fails.
  */
 async function getBackupList(req, res) {
-  let { appname } = req.body;
-  appname = appname || req.query.appname;
+  let { appname } = req.body || {};
+  appname = appname || (req.query || {}).appname;
   const requestStartedAt = Date.now();
   const suppliedRequestId = String(req.headers['x-request-id'] || '');
   const requestId = /^[A-Za-z0-9._-]{1,80}$/.test(suppliedRequestId)
@@ -767,8 +1506,7 @@ async function getBackupList(req, res) {
 
     // If owner is fluxteam, get the real app owner for backup retrieval
     let backupOwner = owner;
-    const teamFluxID = await Vault.getKey('teamFluxID');
-    if (owner === teamFluxID) {
+    if (await fluxOS.isTeamFluxId(owner)) {
       const realOwner = await fluxOS.getAppOwner(appname);
       if (realOwner) {
         backupOwner = realOwner;
@@ -821,8 +1559,8 @@ async function getBackupList(req, res) {
  * @throws Will throw an error if the user session is invalid, taskId is invalid, or database operation fails.
  */
 async function getTaskStatus(req, res) {
-  let { taskId } = req.body;
-  taskId = taskId || req.query.taskId;
+  let { taskId } = req.body || {};
+  taskId = taskId || (req.query || {}).taskId;
 
   try {
     // validate session
@@ -860,10 +1598,10 @@ async function getTaskStatus(req, res) {
  * @throws Will throw an error if the user session is invalid, taskId is invalid, or database operation fails.
  */
 async function removeCheckpoint(req, res) {
-  let { timestamp } = req.body;
-  timestamp = timestamp || req.query.timestamp;
-  let { appname } = req.body;
-  appname = appname || req.query.appname;
+  let { timestamp } = req.body || {};
+  timestamp = timestamp || (req.query || {}).timestamp;
+  let { appname } = req.body || {};
+  appname = appname || (req.query || {}).appname;
 
   try {
     // validate session
@@ -941,57 +1679,32 @@ async function waitForTasksToComplete(taskIds, timeoutMinutes = 60) {
   log.info(`Waiting for ${taskIds.length} tasks to complete: ${taskIds.join(', ')}`);
 
   while (Date.now() - startTime < timeout) {
-    let allCompleted = true;
-    let allSettled = true;
-    let failureReason = null;
-    let failedTaskId = null;
+    let hasPendingTasks = false;
+    const failures = [];
 
     for (let i = 0; i < taskIds.length; i += 1) {
       const taskId = taskIds[i];
       const task = await dbCli.getTask(taskId);
+      const outcome = getTaskOutcome(task);
 
-      if (!task) {
-        failureReason = failureReason || 'Task not found in database';
-        failedTaskId = failedTaskId || taskId;
+      if (outcome.state === 'pending') {
+        hasPendingTasks = true;
         // eslint-disable-next-line no-continue
         continue;
       }
 
-      if (task.fails >= TASK_MAX_FAILURES) {
-        failureReason = failureReason || `Task failed ${task.fails} times`;
-        failedTaskId = failedTaskId || taskId;
-        log.error(`Task ${taskId} failed ${task.fails} times: ${task.status?.message || failureReason}`);
-        // eslint-disable-next-line no-continue
-        continue;
-      }
-
-      if (task.finishTime === 0) {
-        allCompleted = false;
-        allSettled = false;
-        // eslint-disable-next-line no-continue
-        continue;
-      }
-
-      if (task.uploaded !== 1) {
-        failureReason = failureReason || task.status?.message || 'Task did not upload successfully';
-        failedTaskId = failedTaskId || taskId;
-        log.error(`Task ${taskId} did not upload successfully: ${failureReason}`);
+      if (outcome.state === 'failed') {
+        failures.push(buildTaskFailure(task, taskId, outcome.reason));
+        log.error(`Task ${taskId} failed: ${outcome.reason}`);
       }
     }
 
-    if (failureReason && allSettled) {
+    if (!hasPendingTasks && failures.length > 0) {
       log.error('Some tasks failed after all component tasks settled.');
-      const failures = await collectTaskFailures(taskIds, failureReason);
-      if (failedTaskId) {
-        const failedIndex = failures.findIndex((failure) => failure.taskId === failedTaskId);
-        if (failedIndex >= 0) {
-          failures[failedIndex].message = failureReason;
-        }
-      }
       return { success: false, failures };
     }
 
-    if (allCompleted) {
+    if (!hasPendingTasks) {
       log.info('All tasks completed successfully');
       return { success: true, failures: [] };
     }
@@ -1284,16 +1997,12 @@ async function removeBackupFromRemoteHost(host, taskId) {
 
     log.info(`Attempting to remove remote file for task ${taskId} from: ${removalUrl}`);
 
-    // Get team credentials for authentication
-    const teamFluxID = await Vault.getKey('teamFluxID');
-    const teamPK = await Vault.getKey('teamPK');
-
     // Parse URL to get node address
     const urlParts = new URL(removalUrl);
     const nodeUrl = `${urlParts.protocol}//${urlParts.host}`;
 
     // Get zelidAuth for the request
-    const zelidAuth = await fluxOS.verifyLogin(teamFluxID, teamPK, nodeUrl);
+    const zelidAuth = await fluxOS.verifyTeamLogin(nodeUrl);
 
     if (!zelidAuth) {
       log.error(`Failed to authenticate with node for task ${taskId}`);
@@ -1333,55 +2042,218 @@ async function removeBackupFromRemoteHost(host, taskId) {
  * @async
  * @returns {Promise<boolean>} - Returns true if successful, false if failed
  */
-async function processAutomaticBackup() {
+async function claimNextAutomaticBackup(database, now, requestedToken = null) {
+  const standardIntervalMs = config.automaticBackupSchedule.standardIntervalHours
+    * 60 * 60 * 1000;
+  const marketplaceIntervalMs = config.automaticBackupSchedule.marketplaceIntervalHours
+    * 60 * 60 * 1000;
+  const standardCutoff = now - standardIntervalMs;
+  const marketplaceCutoff = now - marketplaceIntervalMs;
+  const candidates = await database.execute(
+    `SELECT *
+     FROM automatic_backups
+     WHERE status != ?
+     AND (dispatch_lease_until = 0 OR dispatch_lease_until < ?)
+     AND (
+       (
+         status = 'pending' AND dispatch_token IS NOT NULL
+         AND dispatch_lease_until > 0 AND dispatch_lease_until < ?
+       )
+       OR (is_marketplace = 1 AND last_backup_timestamp < ?)
+       OR ((is_marketplace = 0 OR is_marketplace IS NULL) AND last_backup_timestamp < ?)
+     )
+     ORDER BY
+       CASE WHEN status = 'pending' AND dispatch_token IS NOT NULL
+         AND dispatch_lease_until > 0 AND dispatch_lease_until < ? THEN 0 ELSE 1 END ASC,
+       CASE
+         WHEN is_marketplace = 1 THEN last_backup_timestamp + ?
+         ELSE last_backup_timestamp + ?
+       END ASC
+     LIMIT 1`,
+    [
+      'cancelled',
+      now,
+      now,
+      marketplaceCutoff,
+      standardCutoff,
+      now,
+      marketplaceIntervalMs,
+      standardIntervalMs,
+    ],
+  );
+  if (candidates.length === 0) return null;
+
+  const candidate = candidates[0];
+  const reclaimingStaleLease = candidate.status === 'pending'
+    && Boolean(candidate.dispatch_token)
+    && Number(candidate.dispatch_lease_until) > 0
+    && Number(candidate.dispatch_lease_until) < now;
+  const dispatchToken = requestedToken || crypto.randomBytes(16).toString('hex');
+  const leaseUntil = now + (
+    config.automaticBackupSchedule.dispatcherLeaseMinutes * 60 * 1000
+  );
+  try {
+    const claim = await database.execute(`
+      UPDATE automatic_backups
+      SET dispatch_token = ?, dispatch_lease_until = ?,
+        last_backup_timestamp = ?, status = 'pending'
+      WHERE id = ? AND last_backup_timestamp = ? AND status != 'cancelled'
+      AND (dispatch_lease_until = 0 OR dispatch_lease_until < ?)
+    `, [
+      dispatchToken,
+      leaseUntil,
+      now,
+      candidate.id,
+      candidate.last_backup_timestamp,
+      now,
+    ]);
+    if (claim.affectedRows !== 1) {
+      log.info(`Automatic backup claim lost for ${candidate.appname}; another dispatcher claimed it`);
+      return null;
+    }
+    if (reclaimingStaleLease) {
+      log.warn(`Reclaimed expired automatic backup dispatch for ${candidate.appname}; previous lease expired at ${new Date(Number(candidate.dispatch_lease_until)).toISOString()}`);
+    }
+  } catch (error) {
+    log.error(`Automatic backup claim update failed for ${candidate.appname}: ${getErrorMessage(error)}`);
+    try {
+      const confirmation = await database.execute(
+        'SELECT id FROM automatic_backups WHERE id = ? AND dispatch_token = ?',
+        [candidate.id, dispatchToken],
+      );
+      if (confirmation.length === 0) throw error;
+      log.warn(`Automatic backup claim for ${candidate.appname} succeeded despite a timed-out acknowledgement`);
+    } catch (confirmationError) {
+      log.error(`Could not confirm automatic backup claim for ${candidate.appname}; skipping without Discord notification: ${getErrorMessage(confirmationError)}`);
+      return null;
+    }
+  }
+
+  return {
+    ...candidate,
+    dispatch_token: dispatchToken,
+    dispatch_lease_until: leaseUntil,
+    last_backup_timestamp: now,
+    status: candidate.status,
+    reclaimed_stale_lease: reclaimingStaleLease,
+  };
+}
+
+function parseBackupTaskIds(storedTaskIds) {
+  let parsed = storedTaskIds;
+  if (typeof parsed === 'string') {
+    try {
+      parsed = JSON.parse(parsed);
+    } catch (error) {
+      return null;
+    }
+  }
+  return Array.isArray(parsed) ? parsed.map(Number) : null;
+}
+
+function backupTaskIdsMatch(storedTaskIds, expectedTaskIds) {
+  const parsed = parseBackupTaskIds(storedTaskIds);
+  if (!parsed || parsed.length !== expectedTaskIds.length) return false;
+  return parsed.every((taskId, index) => Number(taskId) === Number(expectedTaskIds[index]));
+}
+
+async function persistAutomaticBackupCompletion(
+  database,
+  automaticBackup,
+  taskIds,
+  retryDelayMs = 1000,
+) {
+  const backupTasksJson = JSON.stringify(taskIds);
+  let updateError = null;
+  const maxAttempts = 3;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const result = await database.execute(
+        `UPDATE automatic_backups SET backup_tasks = ?, status = ?,
+          dispatch_token = NULL, dispatch_lease_until = 0,
+          last_failure_fingerprint = NULL, last_failure_notified_at = 0
+         WHERE id = ? AND dispatch_token = ?`,
+        [backupTasksJson, 'done', automaticBackup.id, automaticBackup.dispatch_token],
+      );
+      if (result.affectedRows === 1) {
+        return { canonicalTaskIds: taskIds, duplicateTaskIds: [] };
+      }
+      updateError = new Error(
+        `Dispatch token no longer matched while marking ${automaticBackup.appname} as completed`,
+      );
+    } catch (error) {
+      updateError = error;
+    }
+
+    try {
+      const rows = await database.execute(
+        `SELECT status, backup_tasks, dispatch_token, last_backup_timestamp
+         FROM automatic_backups WHERE id = ?`,
+        [automaticBackup.id],
+      );
+      const stored = rows[0];
+      const storedTaskIds = parseBackupTaskIds(stored?.backup_tasks);
+      const sameDispatch = Number(stored?.last_backup_timestamp)
+        === Number(automaticBackup.last_backup_timestamp);
+
+      if (stored?.status === 'done' && !stored.dispatch_token) {
+        if (backupTaskIdsMatch(stored.backup_tasks, taskIds)) {
+          log.warn(`Automatic backup completion for ${automaticBackup.appname} was confirmed after an ambiguous database response`);
+          return { canonicalTaskIds: taskIds, duplicateTaskIds: [] };
+        }
+        if (sameDispatch && storedTaskIds) {
+          log.warn(`Automatic backup ${automaticBackup.appname} was already completed by an earlier attempt in the same dispatch; keeping tasks ${storedTaskIds.join(', ')} and rolling back duplicates ${taskIds.join(', ')}`);
+          return { canonicalTaskIds: storedTaskIds, duplicateTaskIds: taskIds };
+        }
+      }
+
+      if (stored && stored.dispatch_token !== automaticBackup.dispatch_token) {
+        updateError = new Error(
+          `Dispatch ownership changed before ${automaticBackup.appname} could be marked completed`,
+        );
+        break;
+      }
+    } catch (confirmationError) {
+      log.error(`Could not confirm automatic backup completion for ${automaticBackup.appname} (attempt ${attempt}/${maxAttempts}): ${getErrorMessage(confirmationError)}`);
+    }
+
+    if (attempt < maxAttempts && retryDelayMs > 0) {
+      await new Promise((resolve) => { setTimeout(resolve, retryDelayMs); });
+    }
+  }
+
+  const reason = `Backup files uploaded, but completion could not be confirmed for ${automaticBackup.appname}: ${getErrorMessage(updateError)}`;
+  throw createBackupFailure(reason, 'completion_persistence', [], [{
+    check: 'Persist automatic backup completion',
+    outcome: 'failed',
+    errorCode: updateError?.code || null,
+    detail: getErrorMessage(updateError),
+  }]);
+}
+
+async function processAutomaticBackupInternal() {
   const maxRetries = 3;
   let retryCount = 0;
   let automaticBackup = null;
   let lastFailure = null;
+  const failureAttempts = [];
+  const attemptedNodes = new Set();
+  let automaticRunStartedAt = null;
+  let automaticRunBatchKey = null;
 
   try {
     const now = Date.now();
-    const standardIntervalMs = config.automaticBackupSchedule.standardIntervalHours
-      * 60 * 60 * 1000;
-    const marketplaceIntervalMs = config.automaticBackupSchedule.marketplaceIntervalHours
-      * 60 * 60 * 1000;
-    const standardCutoff = now - standardIntervalMs;
-    const marketplaceCutoff = now - marketplaceIntervalMs;
-
-    // Marketplace apps and standard apps use independent config-driven schedules.
-    // Unchecked apps use the standard interval until classification succeeds.
-    const backups = await dbCli.execute(
-      `SELECT *
-       FROM automatic_backups
-       WHERE status != ?
-       AND (
-         (is_marketplace = 1 AND last_backup_timestamp < ?)
-         OR ((is_marketplace = 0 OR is_marketplace IS NULL) AND last_backup_timestamp < ?)
-       )
-       ORDER BY CASE
-         WHEN is_marketplace = 1 THEN last_backup_timestamp + ?
-         ELSE last_backup_timestamp + ?
-       END ASC
-       LIMIT 1`,
-      [
-        'cancelled',
-        marketplaceCutoff,
-        standardCutoff,
-        marketplaceIntervalMs,
-        standardIntervalMs,
-      ],
-    );
-
-    if (backups.length === 0) {
+    automaticBackup = await claimNextAutomaticBackup(dbCli, now);
+    if (!automaticBackup) {
       log.info('No automatic backups to process');
       return false;
     }
 
-    // eslint-disable-next-line prefer-destructuring
-    automaticBackup = backups[0];
     const {
       id, appname, components, is_marketplace: isMarketplace,
     } = automaticBackup;
+    automaticRunStartedAt = Date.now();
     const scheduleHours = Number(isMarketplace) === 1
       ? config.automaticBackupSchedule.marketplaceIntervalHours
       : config.automaticBackupSchedule.standardIntervalHours;
@@ -1390,8 +2262,10 @@ async function processAutomaticBackup() {
     if (isExpired === true) {
       log.info(`Automatic backup cancelled for ${appname}: app is expired`);
       await dbCli.execute(
-        'UPDATE automatic_backups SET status = ?, last_backup_timestamp = ?, expire_counter = expire_counter + 1 WHERE id = ?',
-        ['cancelled', Date.now(), id],
+        `UPDATE automatic_backups SET status = ?, last_backup_timestamp = ?,
+          expire_counter = expire_counter + 1, dispatch_token = NULL,
+          dispatch_lease_until = 0 WHERE id = ? AND dispatch_token = ?`,
+        ['cancelled', Date.now(), id, automaticBackup.dispatch_token],
       );
       return false;
     }
@@ -1428,13 +2302,6 @@ async function processAutomaticBackup() {
       componentList = [];
     }
 
-    // Set last_backup_timestamp to current time and reset failing status for retry
-    const currentTime = Date.now();
-    await dbCli.execute(
-      'UPDATE automatic_backups SET last_backup_timestamp = ?, status = ? WHERE id = ?',
-      [currentTime, 'pending', id],
-    );
-
     if (automaticBackup.status === 'failing') {
       log.info(`Retrying automatic backup for ${appname} after previous failure (${scheduleHours}-hour window elapsed)`);
     }
@@ -1443,37 +2310,62 @@ async function processAutomaticBackup() {
 
     // Retry loop for node operations
     while (retryCount < maxRetries) {
+      const attemptDiagnostics = [];
       try {
         // Get secondary node from HAProxy
-        const nodeAddress = await fluxOS.getSecondaryNodeFromHAProxy(appname);
+        const nodeSelection = await fluxOS.getSecondaryNodeSelection(appname, attemptedNodes);
+        attemptDiagnostics.push(...nodeSelection.diagnostics);
+        const nodeAddress = nodeSelection.node;
         if (!nodeAddress) {
-          throw new Error(`Failed to get secondary node for ${appname}`);
+          throw createBackupFailure(
+            nodeSelection.reason || `Failed to get secondary node for ${appname}`,
+            'node_selection',
+            [],
+            attemptDiagnostics,
+          );
         }
 
         const node = `http://${nodeAddress}`;
+        attemptedNodes.add(nodeAddress);
         log.info(`Using node: ${node}`);
 
         // Get zelidAuth from node
-        const zelidAuth = await fluxOS.verifyLogin(
-          await Vault.getKey('teamFluxID'),
-          await Vault.getKey('teamPK'),
-          node,
-        );
+        const loginResult = await fluxOS.verifyTeamLoginDetailed(node);
+        attemptDiagnostics.push(...loginResult.diagnostics);
 
-        if (!zelidAuth) {
-          throw new Error('Failed to authenticate with node');
+        if (!loginResult.zelidAuth) {
+          throw createBackupFailure(
+            loginResult.reason || `Failed to authenticate with ${node}`,
+            'node_auth',
+            [],
+            attemptDiagnostics,
+          );
         }
+        const { zelidAuth } = loginResult;
 
         // Get app owner
-        const owner = await fluxOS.getAppOwner(appname);
-        if (!owner) {
-          throw new Error(`Failed to get app owner for ${appname}`);
+        const ownerResult = await fluxOS.getAppOwnerDetailed(appname);
+        attemptDiagnostics.push(...ownerResult.diagnostics);
+        if (!ownerResult.owner) {
+          throw createBackupFailure(
+            `Failed to get app owner for ${appname}`,
+            'app_owner',
+            [],
+            attemptDiagnostics,
+          );
         }
+        const { owner } = ownerResult;
 
         // Create backup task on node
         const backupResult = await fluxOS.createBackupTaskOnNode(node, zelidAuth, appname, componentList);
-        if (!backupResult || !backupResult.components) {
-          throw new Error('Failed to create backup tasks on node');
+        attemptDiagnostics.push(...(backupResult?.diagnostics || []));
+        if (!backupResult || backupResult.status === 'failed' || !backupResult.components) {
+          throw createBackupFailure(
+            backupResult?.error || `Failed to create backup tasks on ${node}`,
+            'create_backup',
+            [],
+            attemptDiagnostics,
+          );
         }
 
         log.info(`Created backup tasks for ${backupResult.totalComponents} components`);
@@ -1536,11 +2428,25 @@ async function processAutomaticBackup() {
           }
         }
 
+        if (backupTimestamp) {
+          automaticRunBatchKey = `automatic:${appname}:${backupTimestamp}`;
+        }
+
+        registrationFailures.forEach((failure) => {
+          attemptDiagnostics.push({
+            check: `Backup registration (${failure.component})`,
+            outcome: 'failed',
+            node,
+            detail: failure.message,
+          });
+        });
+
         if (taskIds.length === 0) {
           throw createBackupFailure(
             summarizeRegistrationFailures(registrationFailures),
             'create_backup',
             registrationFailures,
+            attemptDiagnostics,
           );
         }
 
@@ -1552,6 +2458,7 @@ async function processAutomaticBackup() {
             summarizeRegistrationFailures(registrationFailures),
             'task_pipeline',
             registrationFailures,
+            attemptDiagnostics,
           );
         }
 
@@ -1582,13 +2489,46 @@ async function processAutomaticBackup() {
           log.info(`Remote file removal complete: ${remoteRemovalCount}/${taskIds.length} files removed from nodes`);
 
           // Update automatic_backups record with new task IDs and set status to 'done'
-          const backupTasksJson = JSON.stringify(taskIds);
-          await dbCli.execute(
-            'UPDATE automatic_backups SET backup_tasks = ?, status = ? WHERE id = ?',
-            [backupTasksJson, 'done', id],
+          const completionResult = await persistAutomaticBackupCompletion(
+            dbCli,
+            automaticBackup,
+            taskIds,
           );
+          const completedTaskIds = completionResult.canonicalTaskIds;
 
-          log.info(`Successfully processed automatic backup for ${appname}. Created ${taskIds.length} tasks.`);
+          if (completionResult.duplicateTaskIds.length > 0) {
+            try {
+              const duplicateCleanup = await cleanupIncompleteAutomaticBackupTasks(
+                completionResult.duplicateTaskIds,
+              );
+              log.warn(`Duplicate automatic backup rollback for ${appname}: ${duplicateCleanup.removed} removed, ${duplicateCleanup.failed} failed, ${duplicateCleanup.inProgress} still in progress`);
+            } catch (cleanupError) {
+              log.error(`Could not roll back duplicate automatic tasks for ${appname}; periodic cleanup will retry: ${getErrorMessage(cleanupError)}`);
+            }
+          }
+
+          let completedStats = null;
+          try {
+            [completedStats] = await dbCli.execute(
+              `SELECT COUNT(*) AS file_count, COALESCE(SUM(filesize), 0) AS total_size
+               FROM tasks WHERE taskId IN (${completedTaskIds.map(() => '?').join(', ')})`,
+              completedTaskIds,
+            );
+          } catch (statsError) {
+            log.error(`Automatic backup ${appname} is complete, but its activity statistics could not be loaded: ${getErrorMessage(statsError)}`);
+          }
+          await recordAutomaticRunActivity({
+            automaticBackup,
+            runStartedAt: automaticRunStartedAt,
+            batchKey: automaticRunBatchKey,
+            outcome: 'success',
+            fileCount: Number(completedStats?.file_count) || completedTaskIds.length,
+            filesize: Number(completedStats?.total_size) || 0,
+            stage: 'completed',
+            reason: 'All component tasks completed successfully',
+          });
+
+          log.info(`Successfully processed automatic backup for ${appname}. Stored ${completedTaskIds.length} canonical tasks.`);
           return true;
         }
 
@@ -1596,6 +2536,20 @@ async function processAutomaticBackup() {
           .map((failure) => `${failure.component}: ${failure.message}`)
           .join('; ');
         const rollbackResult = await cleanupIncompleteAutomaticBackupTasks(taskIds);
+        waitResult.failures.forEach((failure) => {
+          attemptDiagnostics.push({
+            check: failure.check || `Component pipeline (${failure.component})`,
+            outcome: 'failed',
+            node: failure.node || node,
+            endpoint: failure.endpoint || null,
+            httpStatus: failure.httpStatus || null,
+            errorCode: failure.errorCode || null,
+            fileSize: failure.fileSize || 0,
+            receivedSize: failure.receivedSize,
+            responseBody: failure.responseBody || null,
+            detail: failure.message,
+          });
+        });
         log.error(
           `New backup batch failed. Rolled back ${rollbackResult.removed} component artifacts; ${rollbackResult.failed} cleanup operations failed.`,
           taskFailureSummary,
@@ -1604,6 +2558,7 @@ async function processAutomaticBackup() {
           taskFailureSummary || 'New backup tasks failed to complete',
           'task_pipeline',
           waitResult.failures,
+          attemptDiagnostics,
         );
       } catch (error) {
         retryCount += 1;
@@ -1611,9 +2566,18 @@ async function processAutomaticBackup() {
           stage: inferFailureStage(error),
           reason: getErrorMessage(error),
           taskFailures: error.taskFailures || [],
+          diagnostics: error.diagnostics || attemptDiagnostics,
         };
+        failureAttempts.push({
+          attempt: retryCount,
+          ...lastFailure,
+        });
         if (lastFailure.stage === 'task_pipeline') {
           log.error(`Automatic backup ${appname} failed after component-level retries:`, lastFailure.reason);
+          break;
+        }
+        if (lastFailure.stage === 'completion_persistence') {
+          log.error(`Automatic backup ${appname} will not recreate uploaded files because completion is unconfirmed:`, lastFailure.reason);
           break;
         }
 
@@ -1626,18 +2590,49 @@ async function processAutomaticBackup() {
       }
     }
 
-    // If all retries failed, update status to 'failing'
-    await dbCli.execute(
-      'UPDATE automatic_backups SET status = ? WHERE id = ?',
-      ['failing', id],
-    );
+    let failureStatusPersisted = true;
+    // Preserve the actual backup failure if persisting the final status also times out.
+    try {
+      await dbCli.execute(
+        `UPDATE automatic_backups SET status = ?, dispatch_token = NULL,
+          dispatch_lease_until = 0 WHERE id = ? AND dispatch_token = ?`,
+        ['failing', id, automaticBackup.dispatch_token],
+      );
+    } catch (statusError) {
+      failureStatusPersisted = false;
+      log.error(`Failed to persist automatic backup failure status for ${appname}: ${getErrorMessage(statusError)}`);
+      lastFailure.diagnostics = [
+        ...(lastFailure.diagnostics || []),
+        {
+          check: 'Persist automatic backup failure status',
+          outcome: 'failed',
+          errorCode: statusError.code || null,
+          detail: getErrorMessage(statusError),
+        },
+      ];
+      if (failureAttempts.length > 0) {
+        failureAttempts[failureAttempts.length - 1].diagnostics = lastFailure.diagnostics;
+      }
+    }
 
-    log.error(`All retries failed for automatic backup ${appname}. Status set to failing.`, lastFailure?.reason);
-    await discordNotifier.notifyAutomaticBackupFailure({
+    log.error(
+      `All retries failed for automatic backup ${appname}. Status ${failureStatusPersisted ? 'set to failing' : 'update failed and remains protected by its dispatch lease'}.`,
+      lastFailure?.reason,
+    );
+    await recordAutomaticRunActivity({
+      automaticBackup,
+      runStartedAt: automaticRunStartedAt,
+      batchKey: automaticRunBatchKey,
+      outcome: 'failed',
+      stage: lastFailure?.stage || 'automatic_backup',
+      reason: lastFailure?.reason || 'All retries exhausted',
+    });
+    await notifyAutomaticBackupFailureOnce(automaticBackup, {
       appname,
       stage: lastFailure?.stage || 'automatic_backup',
       reason: lastFailure?.reason || 'All retries exhausted',
       taskFailures: lastFailure?.taskFailures || [],
+      failureAttempts,
       retryCount,
       maxRetries,
     });
@@ -1649,18 +2644,34 @@ async function processAutomaticBackup() {
     if (automaticBackup) {
       try {
         await dbCli.execute(
-          'UPDATE automatic_backups SET status = ? WHERE id = ?',
-          ['failing', automaticBackup.id],
+          `UPDATE automatic_backups SET status = ?, dispatch_token = NULL,
+            dispatch_lease_until = 0 WHERE id = ? AND dispatch_token = ?`,
+          ['failing', automaticBackup.id, automaticBackup.dispatch_token],
         );
       } catch (updateError) {
         log.error('Failed to update status to failing:', updateError.message);
       }
 
-      await discordNotifier.notifyAutomaticBackupFailure({
+      await recordAutomaticRunActivity({
+        automaticBackup,
+        runStartedAt: automaticRunStartedAt || Date.now(),
+        batchKey: automaticRunBatchKey,
+        outcome: 'failed',
+        stage: inferFailureStage(error),
+        reason: getErrorMessage(error),
+      });
+
+      await notifyAutomaticBackupFailureOnce(automaticBackup, {
         appname: automaticBackup.appname,
         stage: inferFailureStage(error),
         reason: getErrorMessage(error),
         taskFailures: error.taskFailures || lastFailure?.taskFailures || [],
+        failureAttempts: failureAttempts.length > 0 ? failureAttempts : [{
+          attempt: retryCount || 1,
+          stage: inferFailureStage(error),
+          reason: getErrorMessage(error),
+          diagnostics: error.diagnostics || [],
+        }],
         retryCount,
         maxRetries,
       });
@@ -1668,6 +2679,27 @@ async function processAutomaticBackup() {
 
     return false;
   }
+}
+
+async function runAutomaticBackupDispatcher(
+  operation,
+  maxConcurrent = config.automaticBackupSchedule.maxConcurrentAutomaticBackups,
+) {
+  const concurrencyLimit = Math.max(1, Number(maxConcurrent) || 1);
+  if (activeAutomaticBackupDispatchers >= concurrencyLimit) {
+    log.warn(`Skipping automatic backup dispatcher tick because all ${concurrencyLimit} slots are active`);
+    return false;
+  }
+  activeAutomaticBackupDispatchers += 1;
+  try {
+    return await operation();
+  } finally {
+    activeAutomaticBackupDispatchers -= 1;
+  }
+}
+
+async function processAutomaticBackup() {
+  return runAutomaticBackupDispatcher(processAutomaticBackupInternal);
 }
 
 /**
@@ -1680,32 +2712,50 @@ async function init() {
   dbCli = await DBClient.createClient();
   await dbCli.checkSchema();
   await logFluxDriveStoredSize();
-  setTimeout(async () => {
-    await reconcileFluxDriveInventory();
+  setTimeout(() => {
+    launchScheduledJob('fluxdrive-reconciliation', reconcileFluxDriveInventory);
   }, 30 * 1000);
-  setInterval(async () => {
-    await updateQueue();
+  setInterval(() => {
+    launchScheduledJob('task-queue-update', updateQueue);
   }, 20 * 1000);
   await dbCli.checkSchema();
-  setInterval(async () => {
-    await checkExpiredApps();
+  setInterval(() => {
+    launchScheduledJob('expired-app-cleanup', checkExpiredApps);
   }, 60 * 60 * 1000);
   // Sync Syncthing apps periodically
-  setInterval(async () => {
-    await syncSyncthingApps();
+  setInterval(() => {
+    launchScheduledJob('syncthing-app-sync', syncSyncthingApps);
   }, 24 * 60 * 60 * 1000); // Run every 24 hours
-  // Run initial sync
-  await syncSyncthingApps();
+  log.info('Syncthing app sync scheduled every 24 hours; startup sync skipped');
+
+  setTimeout(() => {
+    launchScheduledJob('startup-daily-backup-report', async () => {
+      const period = dailyBackupReport.getPreviousUtcPeriod();
+      const sent = await sendDailyBackupReport(period);
+      if (sent === false) {
+        setTimeout(() => {
+          launchScheduledJob(
+            `daily-backup-report-retry-${period.reportDate}`,
+            () => sendDailyBackupReport(period),
+          );
+        }, 60 * 60 * 1000);
+      }
+    });
+  }, config.dailyBackupReport.startupDelaySeconds * 1000);
+  scheduleNextDailyBackupReport();
+  log.info(`Daily Discord backup report scheduled for ${String(config.dailyBackupReport.hourUtc).padStart(2, '0')}:${String(config.dailyBackupReport.minuteUtc).padStart(2, '0')} UTC`);
 
   // Start the next due automatic backup at the configured dispatcher interval.
-  setInterval(async () => {
-    await processAutomaticBackup();
+  setInterval(() => {
+    launchScheduledJob('automatic-backup-dispatch', processAutomaticBackup, false);
   }, config.automaticBackupSchedule.dispatcherIntervalMinutes * 60 * 1000);
 
   // Periodic cleanup of incomplete automatic-backup artifacts
-  setInterval(async () => {
-    await cleanupOldAutomaticBackups();
-    await reconcileFluxDriveInventory();
+  setInterval(() => {
+    launchScheduledJob('automatic-backup-cleanup', async () => {
+      await cleanupOldAutomaticBackups();
+      await reconcileFluxDriveInventory();
+    });
   }, 24 * 60 * 60 * 1000); // Run every 24 hours
 }
 
@@ -1720,4 +2770,21 @@ module.exports = {
   waitForTasksToComplete,
   cleanupOldAutomaticBackups,
   reconcileFluxDriveInventory,
+  sendDailyBackupReport,
+  getDailyBackupReport,
+  forceSendDailyBackupReport,
+  testHooks: {
+    claimNextAutomaticBackup,
+    persistAutomaticBackupCompletion,
+    runAutomaticBackupDispatcher,
+    inferFailureStage,
+    buildAutomaticFailureFingerprint,
+    notifyAutomaticBackupFailureOnce,
+    getTaskOutcome,
+    buildTaskFailure,
+    normalizeAppName,
+    upsertAutomaticBackupApp,
+    launchScheduledJob,
+    setDatabaseForTests: (database) => { dbCli = database; },
+  },
 };

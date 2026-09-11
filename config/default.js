@@ -1,3 +1,5 @@
+const path = require('path');
+
 require('dotenv').config();
 
 module.exports = {
@@ -16,12 +18,25 @@ module.exports = {
     standardIntervalHours: 7 * 24,
     marketplaceIntervalHours: 24,
     dispatcherIntervalMinutes: 2,
+    maxConcurrentAutomaticBackups: 4,
+    dispatcherLeaseMinutes: 6 * 60,
+    discordFailureCooldownMinutes: 60,
+  },
+  dailyBackupReport: {
+    hourUtc: 0,
+    minuteUtc: 5,
+    startupDelaySeconds: 60,
   },
   marketplaceCatalog: {
     url: 'https://api.marketplace.runonflux.io/api/v1/marketplace/apps',
     cacheHours: 24,
   },
-  storagePath: './tmp/',
+  // Keep transient backup files in a deterministic location regardless of the
+  // process working directory used by PM2.
+  storagePath: process.env.BACKUP_STORAGE_PATH || path.resolve(__dirname, '../tmp'),
+  fluxDriveMaxFileSizeMb: 5120,
+  fluxDriveUploadInactivityTimeoutMs: 5 * 60 * 1000,
+  storageMinimumFreeGb: 10,
   hostAPIPath: '/',
   fluxTeamZelId: '1hjy4bCYBJr4mny4zCE85J94RXa8W6q37',
   HCPEndpointURL: process.env.HCP_ENDPOINT_URL,
