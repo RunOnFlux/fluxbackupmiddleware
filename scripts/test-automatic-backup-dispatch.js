@@ -219,6 +219,45 @@ async function main() {
   concurrentReleases.forEach((release) => { release(true); });
   assert.deepStrictEqual(await Promise.all(concurrentRuns), [true, true, true]);
 
+  let releaseScheduledJob;
+  let scheduledRuns = 0;
+  const activeScheduledJob = testHooks.launchScheduledJob(
+    'test-non-overlapping-job',
+    async () => {
+      scheduledRuns += 1;
+      await new Promise((resolve) => { releaseScheduledJob = resolve; });
+      return true;
+    },
+  );
+  await new Promise((resolve) => { setImmediate(resolve); });
+  assert.strictEqual(
+    await testHooks.launchScheduledJob('test-non-overlapping-job', async () => true),
+    false,
+  );
+  assert.strictEqual(scheduledRuns, 1);
+  releaseScheduledJob();
+  assert.strictEqual(await activeScheduledJob, true);
+  assert.strictEqual(
+    await testHooks.launchScheduledJob('test-failing-job', async () => {
+      throw new Error('scheduled failure');
+    }),
+    false,
+  );
+  assert.strictEqual(
+    await testHooks.launchScheduledJob('test-failing-job', async () => true),
+    true,
+  );
+  let overlappingScheduledRuns = 0;
+  await Promise.all([
+    testHooks.launchScheduledJob('test-overlapping-job', async () => {
+      overlappingScheduledRuns += 1;
+    }, false),
+    testHooks.launchScheduledJob('test-overlapping-job', async () => {
+      overlappingScheduledRuns += 1;
+    }, false),
+  ]);
+  assert.strictEqual(overlappingScheduledRuns, 2);
+
   assert.strictEqual(testHooks.inferFailureStage(timeout), 'database');
   assert.strictEqual(
     testHooks.inferFailureStage(new Error('Database operation timed out after 20000ms')),

@@ -33,6 +33,7 @@ const TASK_MAX_FAILURES = 4;
 let fluxDriveReconciliationRunning = false;
 let activeAutomaticBackupDispatchers = 0;
 const automaticFailureNotifications = new Map();
+const activeScheduledJobs = new Set();
 
 function getErrorMessage(error) {
   if (error instanceof Error) return error.message;
@@ -49,6 +50,23 @@ function getErrorMessage(error) {
     }
   }
   return String(error);
+}
+
+function launchScheduledJob(name, operation, preventOverlap = true) {
+  if (preventOverlap && activeScheduledJobs.has(name)) {
+    log.warn(`Skipping scheduled job ${name}: previous run is still active`);
+    return Promise.resolve(false);
+  }
+  if (preventOverlap) activeScheduledJobs.add(name);
+  return Promise.resolve()
+    .then(operation)
+    .catch((error) => {
+      log.error(`Scheduled job ${name} failed: ${getErrorMessage(error)}`);
+      return false;
+    })
+    .finally(() => {
+      if (preventOverlap) activeScheduledJobs.delete(name);
+    });
 }
 
 async function recordBackupActivity(event) {
@@ -396,15 +414,23 @@ function scheduleNextDailyBackupReport() {
     reportConfig.hourUtc,
     reportConfig.minuteUtc,
   );
-  setTimeout(async () => {
-    const period = dailyBackupReport.getPreviousUtcPeriod();
-    const sent = await sendDailyBackupReport(period);
-    if (sent === false) {
-      setTimeout(async () => {
-        await sendDailyBackupReport(period);
-      }, 60 * 60 * 1000);
-    }
-    scheduleNextDailyBackupReport();
+  setTimeout(() => {
+    launchScheduledJob('daily-backup-report', async () => {
+      try {
+        const period = dailyBackupReport.getPreviousUtcPeriod();
+        const sent = await sendDailyBackupReport(period);
+        if (sent === false) {
+          setTimeout(() => {
+            launchScheduledJob(
+              `daily-backup-report-retry-${period.reportDate}`,
+              () => sendDailyBackupReport(period),
+            );
+          }, 60 * 60 * 1000);
+        }
+      } finally {
+        scheduleNextDailyBackupReport();
+      }
+    });
   }, delay);
 }
 
@@ -1054,9 +1080,7 @@ async function checkExpiredApps() {
   }
 }
 
-function normalizeAppName(appName) {
-  return String(appName || '').trim().toLowerCase();
-}
+const { normalizeAppName } = enterpriseDiscoveryCache;
 
 const AUTOMATIC_BACKUP_UPSERT_SQL = `INSERT INTO automatic_backups (
   appname, components, status, expire_counter, last_backup_timestamp, is_marketplace
@@ -1119,37 +1143,48 @@ async function syncSyncthingApps() {
     });
     const syncthingApps = Array.from(syncthingAppsByName.values());
 
+    let cacheUpdateFailures = 0;
     for (let i = 0; i < discovery.cacheUpdates.length; i += 1) {
       const update = discovery.cacheUpdates[i];
-      await dbCli.execute(`
-        INSERT INTO enterprise_app_discovery (
-          appname, spec_hash, has_syncthing, components, repotags, checked_at
-        ) VALUES (?, ?, ?, ?, ?, ?)
-        ON DUPLICATE KEY UPDATE
-          spec_hash = VALUES(spec_hash),
-          has_syncthing = VALUES(has_syncthing),
-          components = VALUES(components),
-          repotags = VALUES(repotags),
-          checked_at = VALUES(checked_at)
-      `, [
-        update.appname,
-        update.specHash,
-        Number(update.hasSyncthing),
-        JSON.stringify(update.componentNames),
-        JSON.stringify(update.repotags),
-        Date.now(),
-      ]);
+      try {
+        await dbCli.execute(`
+          INSERT INTO enterprise_app_discovery (
+            appname, spec_hash, has_syncthing, components, repotags, checked_at
+          ) VALUES (?, ?, ?, ?, ?, ?)
+          ON DUPLICATE KEY UPDATE
+            spec_hash = VALUES(spec_hash),
+            has_syncthing = VALUES(has_syncthing),
+            components = VALUES(components),
+            repotags = VALUES(repotags),
+            checked_at = VALUES(checked_at)
+        `, [
+          update.appname,
+          update.specHash,
+          Number(update.hasSyncthing),
+          JSON.stringify(update.componentNames),
+          JSON.stringify(update.repotags),
+          Date.now(),
+        ]);
+      } catch (error) {
+        cacheUpdateFailures += 1;
+        log.error(`Failed to cache Syncthing discovery for ${update.appname}; continuing: ${getErrorMessage(error)}`);
+      }
     }
 
     const currentEnterpriseNames = discovery.currentEnterpriseAppNames.filter(Boolean);
-    if (currentEnterpriseNames.length === 0) {
-      await dbCli.execute('DELETE FROM enterprise_app_discovery');
-    } else {
-      const placeholders = currentEnterpriseNames.map(() => '?').join(', ');
-      await dbCli.execute(
-        `DELETE FROM enterprise_app_discovery WHERE appname NOT IN (${placeholders})`,
-        currentEnterpriseNames,
-      );
+    try {
+      if (currentEnterpriseNames.length === 0) {
+        await dbCli.execute('DELETE FROM enterprise_app_discovery');
+      } else {
+        const placeholders = currentEnterpriseNames.map(() => '?').join(', ');
+        await dbCli.execute(
+          `DELETE FROM enterprise_app_discovery WHERE appname NOT IN (${placeholders})`,
+          currentEnterpriseNames,
+        );
+      }
+    } catch (error) {
+      cacheUpdateFailures += 1;
+      log.error(`Failed to remove stale enterprise discovery cache rows; continuing: ${getErrorMessage(error)}`);
     }
 
     const marketplaceTemplates = await marketplaceService.getMarketplaceTemplates();
@@ -1190,6 +1225,7 @@ async function syncSyncthingApps() {
     }
 
     let classifiedExistingApps = 0;
+    let classificationFailures = 0;
     if (marketplaceClassificationAvailable) {
       for (let i = 0; i < syncthingApps.length; i += 1) {
         const app = syncthingApps[i];
@@ -1204,13 +1240,18 @@ async function syncSyncthingApps() {
             matchesMarketplace,
           );
           if (isMarketplace !== null) {
-            await dbCli.execute(
-              `UPDATE automatic_backups SET is_marketplace = ?
-               WHERE appname = ? AND (is_marketplace IS NULL OR is_marketplace = 0)`,
-              [isMarketplace, app.appName],
-            );
-            classifiedExistingApps += 1;
-            log.info(`Classified existing app ${app.appName} as marketplace=${Boolean(isMarketplace)}`);
+            try {
+              await dbCli.execute(
+                `UPDATE automatic_backups SET is_marketplace = ?
+                 WHERE appname = ? AND (is_marketplace IS NULL OR is_marketplace = 0)`,
+                [isMarketplace, app.appName],
+              );
+              classifiedExistingApps += 1;
+              log.info(`Classified existing app ${app.appName} as marketplace=${Boolean(isMarketplace)}`);
+            } catch (error) {
+              classificationFailures += 1;
+              log.error(`Failed to classify Syncthing app ${app.appName}; continuing: ${getErrorMessage(error)}`);
+            }
           }
         }
       }
@@ -1233,14 +1274,27 @@ async function syncSyncthingApps() {
     });
 
     // Increment expire_counter for expired apps
+    let expirationUpdateFailures = 0;
     for (let i = 0; i < expiredApps.length; i += 1) {
       const appName = expiredApps[i];
       const query = 'UPDATE automatic_backups SET expire_counter = expire_counter + 1 WHERE appname = ?';
-      await dbCli.execute(query, [appName]);
-      log.info(`Incremented expire_counter for expired app ${appName}`);
+      try {
+        await dbCli.execute(query, [appName]);
+        log.info(`Incremented expire_counter for expired app ${appName}`);
+      } catch (error) {
+        expirationUpdateFailures += 1;
+        log.error(`Failed to update expiration counter for ${appName}; continuing: ${getErrorMessage(error)}`);
+      }
     }
 
-    log.info(`Sync complete. Added ${addedApps} new apps, ${insertFailures} inserts failed, classified ${classifiedExistingApps} existing apps, marked ${expiredApps.length} as expired.`);
+    const syncSummary = [
+      `Added ${addedApps} new apps, ${insertFailures} inserts failed`,
+      `classified ${classifiedExistingApps} existing apps (${classificationFailures} failed)`,
+      `marked ${expiredApps.length - expirationUpdateFailures} as expired`,
+      `(${expirationUpdateFailures} expiration updates failed)`,
+      `cache failures=${cacheUpdateFailures}`,
+    ].join(', ');
+    log.info(`Sync complete. ${syncSummary}.`);
   } catch (error) {
     log.error('Error syncing Syncthing apps:', error);
   }
@@ -1294,18 +1348,20 @@ async function registerBackupTask(req, res, taskObj = null) {
     // Default to 'manual' if not specified in taskObj
     backupType = backupType || 'manual';
   } else {
-    ({ appname } = req.body);
-    appname = appname || req.query.appname;
-    ({ component } = req.body);
-    component = component || req.query.component;
-    ({ filename } = req.body);
-    filename = filename || req.query.filename;
-    ({ timestamp } = req.body);
-    timestamp = timestamp || req.query.timestamp;
-    ({ host } = req.body);
-    host = host || req.query.host;
-    ({ filesize } = req.body);
-    filesize = filesize || req.query.filesize;
+    const body = req.body || {};
+    const query = req.query || {};
+    ({ appname } = body);
+    appname = appname || query.appname;
+    ({ component } = body);
+    component = component || query.component;
+    ({ filename } = body);
+    filename = filename || query.filename;
+    ({ timestamp } = body);
+    timestamp = timestamp || query.timestamp;
+    ({ host } = body);
+    host = host || query.host;
+    ({ filesize } = body);
+    filesize = filesize || query.filesize;
     // Manual backups from API requests default to 'manual'
     backupType = 'manual';
   }
@@ -1422,8 +1478,8 @@ async function registerBackupTask(req, res, taskObj = null) {
  * @throws Will throw an error if the user session is invalid, application name is invalid, or database operation fails.
  */
 async function getBackupList(req, res) {
-  let { appname } = req.body;
-  appname = appname || req.query.appname;
+  let { appname } = req.body || {};
+  appname = appname || (req.query || {}).appname;
   const requestStartedAt = Date.now();
   const suppliedRequestId = String(req.headers['x-request-id'] || '');
   const requestId = /^[A-Za-z0-9._-]{1,80}$/.test(suppliedRequestId)
@@ -1503,8 +1559,8 @@ async function getBackupList(req, res) {
  * @throws Will throw an error if the user session is invalid, taskId is invalid, or database operation fails.
  */
 async function getTaskStatus(req, res) {
-  let { taskId } = req.body;
-  taskId = taskId || req.query.taskId;
+  let { taskId } = req.body || {};
+  taskId = taskId || (req.query || {}).taskId;
 
   try {
     // validate session
@@ -1542,10 +1598,10 @@ async function getTaskStatus(req, res) {
  * @throws Will throw an error if the user session is invalid, taskId is invalid, or database operation fails.
  */
 async function removeCheckpoint(req, res) {
-  let { timestamp } = req.body;
-  timestamp = timestamp || req.query.timestamp;
-  let { appname } = req.body;
-  appname = appname || req.query.appname;
+  let { timestamp } = req.body || {};
+  timestamp = timestamp || (req.query || {}).timestamp;
+  let { appname } = req.body || {};
+  appname = appname || (req.query || {}).appname;
 
   try {
     // validate session
@@ -2656,43 +2712,50 @@ async function init() {
   dbCli = await DBClient.createClient();
   await dbCli.checkSchema();
   await logFluxDriveStoredSize();
-  setTimeout(async () => {
-    await reconcileFluxDriveInventory();
+  setTimeout(() => {
+    launchScheduledJob('fluxdrive-reconciliation', reconcileFluxDriveInventory);
   }, 30 * 1000);
-  setInterval(async () => {
-    await updateQueue();
+  setInterval(() => {
+    launchScheduledJob('task-queue-update', updateQueue);
   }, 20 * 1000);
   await dbCli.checkSchema();
-  setInterval(async () => {
-    await checkExpiredApps();
+  setInterval(() => {
+    launchScheduledJob('expired-app-cleanup', checkExpiredApps);
   }, 60 * 60 * 1000);
   // Sync Syncthing apps periodically
-  setInterval(async () => {
-    await syncSyncthingApps();
+  setInterval(() => {
+    launchScheduledJob('syncthing-app-sync', syncSyncthingApps);
   }, 24 * 60 * 60 * 1000); // Run every 24 hours
   log.info('Syncthing app sync scheduled every 24 hours; startup sync skipped');
 
-  setTimeout(async () => {
-    const period = dailyBackupReport.getPreviousUtcPeriod();
-    const sent = await sendDailyBackupReport(period);
-    if (sent === false) {
-      setTimeout(async () => {
-        await sendDailyBackupReport(period);
-      }, 60 * 60 * 1000);
-    }
+  setTimeout(() => {
+    launchScheduledJob('startup-daily-backup-report', async () => {
+      const period = dailyBackupReport.getPreviousUtcPeriod();
+      const sent = await sendDailyBackupReport(period);
+      if (sent === false) {
+        setTimeout(() => {
+          launchScheduledJob(
+            `daily-backup-report-retry-${period.reportDate}`,
+            () => sendDailyBackupReport(period),
+          );
+        }, 60 * 60 * 1000);
+      }
+    });
   }, config.dailyBackupReport.startupDelaySeconds * 1000);
   scheduleNextDailyBackupReport();
   log.info(`Daily Discord backup report scheduled for ${String(config.dailyBackupReport.hourUtc).padStart(2, '0')}:${String(config.dailyBackupReport.minuteUtc).padStart(2, '0')} UTC`);
 
   // Start the next due automatic backup at the configured dispatcher interval.
-  setInterval(async () => {
-    await processAutomaticBackup();
+  setInterval(() => {
+    launchScheduledJob('automatic-backup-dispatch', processAutomaticBackup, false);
   }, config.automaticBackupSchedule.dispatcherIntervalMinutes * 60 * 1000);
 
   // Periodic cleanup of incomplete automatic-backup artifacts
-  setInterval(async () => {
-    await cleanupOldAutomaticBackups();
-    await reconcileFluxDriveInventory();
+  setInterval(() => {
+    launchScheduledJob('automatic-backup-cleanup', async () => {
+      await cleanupOldAutomaticBackups();
+      await reconcileFluxDriveInventory();
+    });
   }, 24 * 60 * 60 * 1000); // Run every 24 hours
 }
 
@@ -2721,5 +2784,7 @@ module.exports = {
     buildTaskFailure,
     normalizeAppName,
     upsertAutomaticBackupApp,
+    launchScheduledJob,
+    setDatabaseForTests: (database) => { dbCli = database; },
   },
 };

@@ -19,6 +19,19 @@ assert.strictEqual(cached.source, 'cache');
 assert.deepStrictEqual(cached.entry.componentNames, ['database', 'web']);
 assert.deepStrictEqual(cached.entry.repotags, ['mysql:8', 'wordpress:latest']);
 
+const mixedCaseSpec = { name: 'Enterprise-App', hash: appSpec.hash };
+const mixedCaseCache = normalizeCacheRows([{
+  appname: 'enterprise-app',
+  spec_hash: appSpec.hash,
+  has_syncthing: 1,
+  components: '["database"]',
+  repotags: '["mysql:8"]',
+}]);
+assert.strictEqual(
+  getReusableDiscovery(mixedCaseSpec, mixedCaseCache, new Map()).source,
+  'cache',
+);
+
 const negativeCache = normalizeCacheRows([{
   appname: appSpec.name,
   spec_hash: appSpec.hash,
@@ -40,6 +53,16 @@ const bootstrapped = getReusableDiscovery(appSpec, new Map(), knownApps);
 assert.strictEqual(bootstrapped.source, 'bootstrap');
 assert.deepStrictEqual(bootstrapped.entry.componentNames, ['database']);
 assert.strictEqual(bootstrapped.cacheUpdate.specHash, appSpec.hash);
+
+const normalizedKnownApps = new Map([['enterprise-app', {
+  appname: 'enterprise-app',
+  components: '["database"]',
+  is_marketplace: 1,
+}]]);
+assert.strictEqual(
+  getReusableDiscovery(mixedCaseSpec, new Map(), normalizedKnownApps).source,
+  'bootstrap',
+);
 
 const unclassifiedApps = new Map([[appSpec.name, {
   appname: appSpec.name,

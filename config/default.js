@@ -35,6 +35,7 @@ module.exports = {
   // process working directory used by PM2.
   storagePath: process.env.BACKUP_STORAGE_PATH || path.resolve(__dirname, '../tmp'),
   fluxDriveMaxFileSizeMb: 5120,
+  fluxDriveUploadInactivityTimeoutMs: 5 * 60 * 1000,
   storageMinimumFreeGb: 10,
   hostAPIPath: '/',
   fluxTeamZelId: '1hjy4bCYBJr4mny4zCE85J94RXa8W6q37',

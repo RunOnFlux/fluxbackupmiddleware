@@ -5,7 +5,9 @@ const https = require('https');
 const FormData = require('form-data');
 const { URL } = require('url');
 const fs = require('fs');
+const { pipeline } = require('stream/promises');
 const log = require('../lib/log');
+const config = require('../../config/default');
 const Vault = require('./Vault');
 const taskFileStorage = require('./utils/taskFileStorage');
 
@@ -67,6 +69,7 @@ function createUploadError(
   responseBody = null,
 ) {
   const error = new Error(reason);
+  if (errorCode) error.code = errorCode;
   error.diagnostic = {
     check: 'FluxDrive upload',
     outcome: 'failed',
@@ -169,10 +172,10 @@ function parseFileInventory(response) {
  * @returns {Promise<Object|null>} - A promise that resolves to the status data if the request is successful, or null if the request fails.
  */
 async function getStatus() {
-  const ZELID = await Vault.getKey('zelid');
-  const API_KEY = await Vault.getKey('apikey');
-  const FD_SERVER = await Vault.getKey('fluxDriveServer');
   try {
+    const ZELID = await Vault.getKey('zelid');
+    const API_KEY = await Vault.getKey('apikey');
+    const FD_SERVER = await Vault.getKey('fluxDriveServer');
     const result = await axios({
       method: 'post',
       url: buildFluxDriveUrl(FD_SERVER, '/api/v0/status'),
@@ -193,10 +196,10 @@ async function getStatus() {
  * @returns {Promise<Object|null>} - A promise that resolves to the status data if the request is successful, or null if the request fails.
  */
 async function removeFile(hash) {
-  const ZELID = await Vault.getKey('zelid');
-  const API_KEY = await Vault.getKey('apikey');
-  const FD_SERVER = await Vault.getKey('fluxDriveServer');
   try {
+    const ZELID = await Vault.getKey('zelid');
+    const API_KEY = await Vault.getKey('apikey');
+    const FD_SERVER = await Vault.getKey('fluxDriveServer');
     const result = await axios({
       method: 'post',
       url: buildFluxDriveUrl(FD_SERVER, '/api/v0/rm'),
@@ -224,10 +227,10 @@ async function removeFile(hash) {
  * @returns {Promise<Object|null>} - A promise that resolves to the file list if the request is successful, or null if the request fails.
  */
 async function getFileList() {
-  const ZELID = await Vault.getKey('zelid');
-  const API_KEY = await Vault.getKey('apikey');
-  const FD_SERVER = await Vault.getKey('fluxDriveServer');
   try {
+    const ZELID = await Vault.getKey('zelid');
+    const API_KEY = await Vault.getKey('apikey');
+    const FD_SERVER = await Vault.getKey('fluxDriveServer');
     const result = await axios({
       method: 'post',
       url: buildFluxDriveUrl(FD_SERVER, '/api/v0/ls'),
@@ -302,7 +305,26 @@ async function uploadFile(file) {
     // console.log(file.status);
   });
   return new Promise((resolve, reject) => {
-    const req = httpModule.request(options, (res) => {
+    let settled = false;
+    let req;
+    const failUpload = (error, statusCode = null, responseBody = null) => {
+      if (settled) return;
+      settled = true;
+      const reason = error.message || 'FluxDrive request failed';
+      logUploadFailure(file, fileName, fileSize, reason, statusCode);
+      file.status = { state: 'failed', message: reason, progress: 0 };
+      if (req && !req.destroyed) req.destroy();
+      reject(createUploadError(
+        reason,
+        fullUrl,
+        fileSize,
+        statusCode,
+        error.code || null,
+        responseBody,
+      ));
+    };
+
+    req = httpModule.request(options, (res) => {
       let data = '';
 
       res.on('data', (chunk) => {
@@ -310,18 +332,21 @@ async function uploadFile(file) {
       });
 
       res.on('end', () => {
+        if (settled) return;
         let result;
         try {
           result = JSON.parse(data);
         } catch (error) {
-          const reason = `Invalid FluxDrive response: ${error.message}`;
-          logUploadFailure(file, fileName, fileSize, reason, res.statusCode);
-          file.status = { state: 'failed', message: reason, progress: 0 };
-          reject(createUploadError(reason, fullUrl, fileSize, res.statusCode, null, data));
+          failUpload(
+            new Error(`Invalid FluxDrive response: ${error.message}`),
+            res.statusCode,
+            data,
+          );
           return;
         }
         // console.log(result);
         if (res.statusCode >= 200 && res.statusCode < 300 && result?.hash) {
+          settled = true;
           console.log(`${fileName} uploaded successfully!`);
           file.uploaded = true;
           file.hash = result.hash;
@@ -329,32 +354,43 @@ async function uploadFile(file) {
           resolve(result);
         } else {
           const reason = getUploadFailureReason(result, 'FluxDrive did not return an upload hash');
-          logUploadFailure(file, fileName, fileSize, reason, res.statusCode);
-          file.status = { state: 'failed', message: reason, progress: 0 };
-          reject(createUploadError(reason, fullUrl, fileSize, res.statusCode, null, result));
+          failUpload(new Error(reason), res.statusCode, result);
         }
       });
+
+      res.on('aborted', () => {
+        failUpload(new Error('FluxDrive upload response was aborted'), res.statusCode, data);
+      });
+      res.on('error', (error) => failUpload(error, res.statusCode, data));
     });
 
-    req.on('error', (error) => {
-      const reason = error.message || 'FluxDrive request failed';
-      logUploadFailure(file, fileName, fileSize, reason);
-      file.status = { state: 'failed', message: reason, progress: 0 };
-      reject(createUploadError(reason, fullUrl, fileSize, null, error.code || null));
+    req.on('error', (error) => failUpload(error));
+    req.setTimeout(config.fluxDriveUploadInactivityTimeoutMs, () => {
+      const timeoutError = new Error(
+        `FluxDrive upload timed out after ${config.fluxDriveUploadInactivityTimeoutMs}ms of inactivity`,
+      );
+      timeoutError.code = 'FLUXDRIVE_UPLOAD_TIMEOUT';
+      failUpload(timeoutError);
     });
+    fileStream.on('error', (error) => failUpload(error));
+    form.on('error', (error) => failUpload(error));
 
     form.pipe(req);
   });
 }
 
 async function getFile(req, res) {
-  const ZELID = await Vault.getKey('zelid');
-  const API_KEY = await Vault.getKey('apikey');
-  const FD_SERVER = await Vault.getKey('fluxDriveServer');
-  let { filename } = req.params;
-  filename = filename || req.query.filename;
   try {
-    axios({
+    const ZELID = await Vault.getKey('zelid');
+    const API_KEY = await Vault.getKey('apikey');
+    const FD_SERVER = await Vault.getKey('fluxDriveServer');
+    let { filename } = req.params || {};
+    filename = filename || (req.query || {}).filename;
+    if (!filename) {
+      res.status(400).json({ status: 'error', data: { message: 'filename is required' } });
+      return;
+    }
+    const response = await axios({
       method: 'post',
       url: buildFluxDriveUrl(FD_SERVER, '/api/v0/cat'),
       data: { hash: filename },
@@ -363,28 +399,23 @@ async function getFile(req, res) {
       headers: {
         Authorization: `Basic ${Buffer.from(`${ZELID}:${API_KEY}`).toString('base64')}`,
       },
-    }).then((response) => {
-      if ('content-type' in response.data.headers) {
-        res.setHeader('Content-Type', response.data.headers['content-type']);
-      } else {
-        res.setHeader('Content-Type', 'application/x-tar');
-      }
-      res.set('Content-Disposition', `attachment; filename=${filename}`); // Set the file name for download
-      response.data.pipe(res); // Pipe the file stream to the response
-    }).catch((error) => {
-      log.error(error);
-      res.status(500).send('Error fetching the file');
     });
+    res.setHeader('Content-Type', response.headers['content-type'] || 'application/x-tar');
+    res.set('Content-Disposition', `attachment; filename=${filename}`);
+    await pipeline(response.data, res);
   } catch (e) {
-    log.error(e);
-    return null;
+    log.error(`FluxDrive file retrieval failed: ${e.stack || e.message || e}`);
+    if (!res.headersSent) {
+      res.status(502).json({ status: 'error', data: { message: 'Error fetching the file' } });
+    } else if (!res.destroyed) {
+      res.destroy(e);
+    }
   }
-  return null;
 }
 
 async function getUsedStorage() {
   const result = await getStatus();
-  return result.result?.storage_used;
+  return result?.result?.storage_used;
 }
 
 module.exports = {

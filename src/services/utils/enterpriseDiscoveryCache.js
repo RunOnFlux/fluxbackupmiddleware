@@ -9,8 +9,12 @@ function parseJsonArray(value) {
   }
 }
 
+function normalizeAppName(appName) {
+  return String(appName || '').trim().toLowerCase();
+}
+
 function normalizeCacheRows(rows) {
-  return new Map((rows || []).map((row) => [row.appname, {
+  return new Map((rows || []).map((row) => [normalizeAppName(row.appname), {
     appname: row.appname,
     specHash: row.spec_hash,
     hasSyncthing: Boolean(row.has_syncthing),
@@ -33,7 +37,8 @@ function buildCacheUpdate(spec, entry) {
 function getReusableDiscovery(spec, cacheByName, knownAppsByName) {
   if (!spec?.name || !spec.hash) return null;
 
-  const cached = cacheByName.get(spec.name);
+  const normalizedName = normalizeAppName(spec.name);
+  const cached = cacheByName.get(normalizedName);
   if (cached?.specHash === spec.hash) {
     return {
       source: 'cache',
@@ -46,7 +51,7 @@ function getReusableDiscovery(spec, cacheByName, knownAppsByName) {
     };
   }
 
-  const knownApp = knownAppsByName.get(spec.name);
+  const knownApp = knownAppsByName.get(normalizedName);
   if (!cached && knownApp && knownApp.is_marketplace !== null) {
     const entry = {
       appName: spec.name,
@@ -68,4 +73,5 @@ module.exports = {
   normalizeCacheRows,
   buildCacheUpdate,
   getReusableDiscovery,
+  normalizeAppName,
 };

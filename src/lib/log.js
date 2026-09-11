@@ -2,34 +2,60 @@ const fs = require('fs');
 const path = require('path');
 
 const logsDirPath = path.join(__dirname, '../../logs/');
+const maxLogSizeBytes = 25 * 1024 * 1024;
+const writeQueues = new Map();
 
-function getFilesizeInBytes(filename) {
+function writeFallback(message) {
   try {
-    const stats = fs.statSync(filename);
-    const fileSizeInBytes = stats.size;
-    return fileSizeInBytes;
-  } catch (e) {
-    console.log(e);
-    return 0;
+    process.stderr.write(`${message}\n`);
+  } catch (stderrError) {
+    // There is no safer destination left if stderr itself is unavailable.
   }
 }
 
 function ensureString(parameter) {
-  return typeof parameter === 'string' ? parameter : JSON.stringify(parameter);
+  if (typeof parameter === 'string') return parameter;
+  try {
+    const serialized = JSON.stringify(parameter);
+    return typeof serialized === 'string' ? serialized : String(parameter);
+  } catch (serializationError) {
+    return String(parameter);
+  }
 }
 
 function writeToFile(filepath, args) {
-  const size = getFilesizeInBytes(filepath);
-  let flag = 'a+';
-  if (size > (25 * 1024 * 1024)) { // 25MB
-    flag = 'w'; // rewrite file
+  let entry = `${new Date().toISOString()}          ${ensureString(args?.message || args)}\n`;
+  if (args?.stack && typeof args.stack === 'string') {
+    entry += `${args.stack}\n`;
   }
-  const stream = fs.createWriteStream(filepath, { flags: flag });
-  stream.write(`${new Date().toISOString()}          ${ensureString(args.message || args)}\n`);
-  if (args.stack && typeof args.stack === 'string') {
-    stream.write(`${args.stack}\n`);
-  }
-  stream.end();
+  const previousWrite = writeQueues.get(filepath) || Promise.resolve();
+  const queuedWrite = previousWrite
+    .then(async () => {
+      await fs.promises.mkdir(path.dirname(filepath), { recursive: true });
+      let size = 0;
+      try {
+        size = (await fs.promises.stat(filepath)).size;
+      } catch (statError) {
+        if (statError.code !== 'ENOENT') throw statError;
+      }
+      if (size > maxLogSizeBytes) {
+        await fs.promises.writeFile(filepath, entry, 'utf8');
+      } else {
+        await fs.promises.appendFile(filepath, entry, 'utf8');
+      }
+    })
+    .catch((writeError) => {
+      writeFallback(`Log write failed for ${filepath}: ${writeError.stack || writeError.message || writeError}`);
+    })
+    .finally(() => {
+      if (writeQueues.get(filepath) === queuedWrite) writeQueues.delete(filepath);
+    });
+  writeQueues.set(filepath, queuedWrite);
+  return queuedWrite;
+}
+
+async function flush() {
+  await Promise.all(Array.from(writeQueues.values()));
 }
 
 function debug(args) {
@@ -157,4 +183,9 @@ module.exports = {
   bugtrack,
   bugtrackB,
   bugtrackC,
+  flush,
+  testHooks: {
+    ensureString,
+    writeToFile,
+  },
 };

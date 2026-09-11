@@ -4,34 +4,68 @@ const backupService = require('./src/services/backupService');
 const app = require('./src/lib/server');
 const log = require('./src/lib/log');
 
-// Global error handlers to prevent app crashes
+let server = null;
+let shuttingDown = false;
+
+function getErrorDetails(error) {
+  if (error instanceof Error) return error.stack || error.message;
+  try {
+    return JSON.stringify(error);
+  } catch (serializationError) {
+    return String(error);
+  }
+}
+
+function shutdown(exitCode) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  const forceExit = setTimeout(() => process.exit(exitCode), 5000);
+  const exitAfterLogsFlush = () => {
+    Promise.resolve(typeof log.flush === 'function' ? log.flush() : null)
+      .catch((error) => {
+        process.stderr.write(`Failed to flush logs during shutdown: ${getErrorDetails(error)}\n`);
+      })
+      .finally(() => {
+        clearTimeout(forceExit);
+        process.exit(exitCode);
+      });
+  };
+  if (server?.listening) {
+    server.close(exitAfterLogsFlush);
+  } else {
+    exitAfterLogsFlush();
+  }
+}
+
+function handleFatalError(kind, error) {
+  const details = getErrorDetails(error);
+  // stderr is the fallback when the file logger itself caused the failure.
+  process.stderr.write(`${kind}: ${details}\n`);
+  log.error(`${kind}:`, error);
+  shutdown(1);
+}
+
 process.on('uncaughtException', (error) => {
-  log.error('UNCAUGHT EXCEPTION - Process will continue:', error);
-  log.error('Stack trace:', error.stack);
-  // In production, you might want to exit gracefully after logging
-  // process.exit(1);
+  handleFatalError('UNCAUGHT EXCEPTION', error);
 });
 
-process.on('unhandledRejection', (reason, promise) => {
-  log.error('UNHANDLED PROMISE REJECTION at:', promise);
-  log.error('Rejection reason:', reason);
-  // Optionally convert to exception
-  // throw reason;
+process.on('unhandledRejection', (reason) => {
+  handleFatalError('UNHANDLED PROMISE REJECTION', reason);
 });
 
 // Handle SIGTERM and SIGINT for graceful shutdown
 process.on('SIGTERM', () => {
   log.info('SIGTERM signal received: closing HTTP server');
-  process.exit(0);
+  shutdown(0);
 });
 
 process.on('SIGINT', () => {
   log.info('SIGINT signal received: closing HTTP server');
-  process.exit(0);
+  shutdown(0);
 });
 
 async function init() {
-  const server = http.createServer(app);
+  server = http.createServer(app);
 
   log.info('Starting Flux Backup/Restore Middleware Service');
   await backupService.init();
@@ -39,4 +73,6 @@ async function init() {
     log.info(`App listening on port ${config.serverPort}`);
   });
 }
-init();
+init().catch((error) => {
+  handleFatalError('STARTUP FAILURE', error);
+});
