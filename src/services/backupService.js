@@ -2329,20 +2329,6 @@ async function processAutomaticBackupInternal() {
         attemptedNodes.add(nodeAddress);
         log.info(`Using node: ${node}`);
 
-        // Get zelidAuth from node
-        const loginResult = await fluxOS.verifyTeamLoginDetailed(node);
-        attemptDiagnostics.push(...loginResult.diagnostics);
-
-        if (!loginResult.zelidAuth) {
-          throw createBackupFailure(
-            loginResult.reason || `Failed to authenticate with ${node}`,
-            'node_auth',
-            [],
-            attemptDiagnostics,
-          );
-        }
-        const { zelidAuth } = loginResult;
-
         // Get app owner
         const ownerResult = await fluxOS.getAppOwnerDetailed(appname);
         attemptDiagnostics.push(...ownerResult.diagnostics);
@@ -2357,12 +2343,16 @@ async function processAutomaticBackupInternal() {
         const { owner } = ownerResult;
 
         // Create backup task on node
-        const backupResult = await fluxOS.createBackupTaskOnNode(node, zelidAuth, appname, componentList);
+        const backupResult = await fluxOS.createBackupTaskWithTeamCredentials(
+          node,
+          appname,
+          componentList,
+        );
         attemptDiagnostics.push(...(backupResult?.diagnostics || []));
         if (!backupResult || backupResult.status === 'failed' || !backupResult.components) {
           throw createBackupFailure(
             backupResult?.error || `Failed to create backup tasks on ${node}`,
-            'create_backup',
+            backupResult?.failureStage || 'create_backup',
             [],
             attemptDiagnostics,
           );

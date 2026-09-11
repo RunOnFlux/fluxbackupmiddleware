@@ -713,6 +713,19 @@ function reachedCredentialVerification(result) {
   ));
 }
 
+function isExplicitAuthorizationFailure(result) {
+  const diagnostics = result?.diagnostics || [];
+  if (diagnostics.some((diagnostic) => (
+    diagnostic.httpStatus === 401 || diagnostic.httpStatus === 403
+  ))) return true;
+
+  const details = [
+    result?.error,
+    ...diagnostics.map((diagnostic) => diagnostic.detail),
+  ].filter(Boolean).join(' ');
+  return /unauthori[sz]ed|access denied|forbidden|session expired/i.test(details);
+}
+
 async function verifyTeamLoginDetailed(node, verifier = verifyLoginDetailed) {
   const credentials = await getTeamCredentials();
   if (credentials.length === 0) {
@@ -1280,6 +1293,92 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList) {
   }
 }
 
+async function createBackupTaskWithTeamCredentials(
+  node,
+  appname,
+  componentList,
+  verifier = verifyLoginDetailed,
+  backupCreator = createBackupTaskOnNode,
+) {
+  const credentials = await getTeamCredentials();
+  if (credentials.length === 0) {
+    return {
+      appname,
+      status: 'failed',
+      components: [],
+      error: 'No complete team Flux credentials are configured',
+      failureStage: 'node_auth',
+      diagnostics: [{
+        check: 'Team Flux credentials',
+        outcome: 'failed',
+        node,
+        detail: 'Configure teamFluxID/teamPK or teamFluxID2/teamPK2',
+      }],
+    };
+  }
+
+  const diagnostics = [];
+  let lastResult = null;
+  let failureStage = 'node_auth';
+
+  for (let index = 0; index < credentials.length; index += 1) {
+    const credential = credentials[index];
+    // eslint-disable-next-line no-await-in-loop
+    const loginResult = await verifier(credential.zelid, credential.privateKey, node);
+    diagnostics.push(...labelLoginDiagnostics(loginResult.diagnostics, credential.label));
+
+    if (!loginResult.zelidAuth) {
+      lastResult = {
+        appname,
+        status: 'failed',
+        components: [],
+        error: loginResult.reason || `Failed to authenticate with ${node}`,
+      };
+      const hasAnotherCredential = index + 1 < credentials.length;
+      if (!hasAnotherCredential || !reachedCredentialVerification(loginResult)) break;
+      log.warn(`Team authentication with ${credential.label} credentials was rejected by ${node}; trying the next credentials`);
+      // eslint-disable-next-line no-continue
+      continue;
+    }
+
+    // eslint-disable-next-line no-await-in-loop
+    const backupResult = await backupCreator(
+      node,
+      loginResult.zelidAuth,
+      appname,
+      componentList,
+    );
+    lastResult = backupResult;
+    failureStage = 'create_backup';
+    diagnostics.push(...labelLoginDiagnostics(backupResult?.diagnostics, credential.label));
+
+    if (backupResult && backupResult.status !== 'failed' && backupResult.components) {
+      if (credential.label === 'secondary') {
+        log.info(`Backup creation for ${appname} authorized with secondary team credentials`);
+      }
+      return {
+        ...backupResult,
+        diagnostics,
+        credential: credential.label,
+      };
+    }
+
+    const hasAnotherCredential = index + 1 < credentials.length;
+    if (!hasAnotherCredential || !isExplicitAuthorizationFailure(backupResult)) break;
+    log.warn(`Backup creation for ${appname} was denied with ${credential.label} credentials; trying the next credentials`);
+  }
+
+  return {
+    appname,
+    status: 'failed',
+    components: [],
+    error: lastResult?.error || `Failed to create backup tasks on ${node}`,
+    failureStage,
+    diagnostics,
+    credential: null,
+  };
+}
+
 module.exports = {
   getAppSpecs,
   getBlockHeight,
@@ -1301,4 +1400,6 @@ module.exports = {
   getSecondaryNodeSelection,
   getSecondaryNodeFromHAProxy,
   createBackupTaskOnNode,
+  createBackupTaskWithTeamCredentials,
+  isExplicitAuthorizationFailure,
 };
