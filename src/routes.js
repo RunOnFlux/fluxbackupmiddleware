@@ -19,6 +19,7 @@ function registerRoutes(app) {
   app.get('/getfile', asyncRoute(fluxDrive.getFile));
   app.get('/dailybackupreport', asyncRoute(backupService.getDailyBackupReport));
   app.post('/dailybackupreport/send', asyncRoute(backupService.forceSendDailyBackupReport));
+  app.post('/internal/syncthing-discovery', asyncRoute(backupService.forceSyncSyncthingApps));
 
   app.use((error, req, res, next) => {
     log.error(`[http] ${req.method} ${req.originalUrl} failed unexpectedly: ${error.stack || error.message || error}`);

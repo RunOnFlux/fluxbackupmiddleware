@@ -145,9 +145,40 @@ async function testPerRecordFailureIsolation() {
   }
 }
 
+async function testManualSyncOverlapProtection() {
+  let releaseFirstRun;
+  const firstRunGate = new Promise((resolve) => { releaseFirstRun = resolve; });
+  const firstRun = testHooks.runSyncthingSyncNow(async () => {
+    await firstRunGate;
+    return { success: true, discoveredApps: 1 };
+  });
+
+  const overlappingRun = await testHooks.runSyncthingSyncNow(async () => ({
+    success: true,
+  }));
+  assert.deepStrictEqual(overlappingRun, {
+    started: false,
+    reason: 'Syncthing discovery is already running',
+  });
+
+  releaseFirstRun();
+  assert.deepStrictEqual(await firstRun, {
+    started: true,
+    result: { success: true, discoveredApps: 1 },
+  });
+
+  await assert.rejects(
+    testHooks.runSyncthingSyncNow(async () => { throw new Error('forced failure'); }),
+    /forced failure/,
+  );
+  const runAfterFailure = await testHooks.runSyncthingSyncNow(async () => ({ success: true }));
+  assert.strictEqual(runAfterFailure.started, true);
+}
+
 Promise.all([
   testIdempotentUpsert(),
   testPerRecordFailureIsolation(),
+  testManualSyncOverlapProtection(),
 ]).then(() => {
   console.log('Syncthing app sync normalization and idempotency tests passed');
 }).catch((error) => {

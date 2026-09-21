@@ -1128,7 +1128,7 @@ async function syncSyncthingApps() {
 
     if (!discovery) {
       log.error('Failed to fetch apps with Syncthing');
-      return;
+      return { success: false, error: 'Failed to fetch apps with Syncthing' };
     }
     // MySQL's appname key uses a case-insensitive collation, while Map keys are
     // case-sensitive. Canonicalize and de-duplicate the discovery response so
@@ -1295,8 +1295,61 @@ async function syncSyncthingApps() {
       `cache failures=${cacheUpdateFailures}`,
     ].join(', ');
     log.info(`Sync complete. ${syncSummary}.`);
+    return {
+      success: true,
+      discoveredApps: syncthingApps.length,
+      addedApps,
+      insertFailures,
+      classifiedExistingApps,
+      classificationFailures,
+      expiredApps: expiredApps.length - expirationUpdateFailures,
+      expirationUpdateFailures,
+      cacheUpdateFailures,
+    };
   } catch (error) {
     log.error('Error syncing Syncthing apps:', error);
+    return { success: false, error: getErrorMessage(error) };
+  }
+}
+
+async function runSyncthingSyncNow(operation = syncSyncthingApps) {
+  const jobName = 'syncthing-app-sync';
+  if (activeScheduledJobs.has(jobName)) {
+    return { started: false, reason: 'Syncthing discovery is already running' };
+  }
+
+  activeScheduledJobs.add(jobName);
+  try {
+    const result = await operation();
+    return { started: true, result };
+  } finally {
+    activeScheduledJobs.delete(jobName);
+  }
+}
+
+async function forceSyncSyncthingApps(req, res) {
+  if (!isLocalReportRequest(req)) {
+    res.status(403).json({ error: 'This endpoint is available only through localhost' });
+    return;
+  }
+
+  try {
+    const syncRun = await runSyncthingSyncNow();
+    if (!syncRun.started) {
+      res.status(409).json({ status: 'busy', message: syncRun.reason });
+      return;
+    }
+    if (!syncRun.result?.success) {
+      res.status(500).json({
+        status: 'error',
+        message: syncRun.result?.error || 'Syncthing discovery failed',
+      });
+      return;
+    }
+    res.json({ status: 'success', ...syncRun.result });
+  } catch (error) {
+    log.error(`Forced Syncthing discovery failed: ${getErrorMessage(error)}`);
+    res.status(500).json({ status: 'error', message: getErrorMessage(error) });
   }
 }
 
@@ -2763,6 +2816,7 @@ module.exports = {
   sendDailyBackupReport,
   getDailyBackupReport,
   forceSendDailyBackupReport,
+  forceSyncSyncthingApps,
   testHooks: {
     claimNextAutomaticBackup,
     persistAutomaticBackupCompletion,
@@ -2775,6 +2829,7 @@ module.exports = {
     normalizeAppName,
     upsertAutomaticBackupApp,
     launchScheduledJob,
+    runSyncthingSyncNow,
     setDatabaseForTests: (database) => { dbCli = database; },
   },
 };
