@@ -100,14 +100,6 @@ async function main() {
   assert.strictEqual(await fluxOS.isTeamFluxId('secondary-id'), true);
   assert.strictEqual(await fluxOS.isTeamFluxId('someone-else'), false);
 
-  attempts.length = 0;
-  const arcaneSessions = await fluxOS.createTeamArcaneNodeSessions(async (zelid) => {
-    attempts.push(zelid);
-    return zelid === 'secondary-id' ? [{ nodeBase: 'secondary-node' }] : [];
-  });
-  assert.deepStrictEqual(attempts, ['primary-id', 'secondary-id']);
-  assert.deepStrictEqual(arcaneSessions, [{ nodeBase: 'secondary-node' }]);
-
   const creationLogins = [];
   const creationAttempts = [];
   const fallbackCreation = await fluxOS.createBackupTaskWithTeamCredentials(

@@ -11,6 +11,7 @@
     "test:daily-backup-report": "node scripts/test-daily-backup-report.js",
     "test:discord-failure-diagnostics": "node scripts/test-discord-failure-diagnostics.js",
     "test:enterprise-syncthing": "node scripts/test-enterprise-syncthing.js",
+    "test:enterprise-sas": "node scripts/test-enterprise-sas.js",
     "test:enterprise-discovery-cache": "node scripts/test-enterprise-discovery-cache.js",
     "test:syncthing-app-sync": "node scripts/test-syncthing-app-sync.js",
     "test:fluxdrive-inventory": "node scripts/test-fluxdrive-inventory.js",

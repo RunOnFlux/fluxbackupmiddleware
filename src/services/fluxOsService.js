@@ -778,36 +778,6 @@ async function verifyTeamLogin(node) {
   return result.zelidAuth || false;
 }
 
-async function createTeamArcaneNodeSessions(
-  sessionFactory = enterpriseCrypto.createArcaneNodeSessions,
-) {
-  const credentials = await getTeamCredentials();
-  for (let index = 0; index < credentials.length; index += 1) {
-    const credential = credentials[index];
-    let sessions = [];
-    try {
-      // eslint-disable-next-line no-await-in-loop
-      sessions = await sessionFactory(
-        credential.zelid,
-        credential.privateKey,
-        enterpriseCrypto.ARCANE_NODE_RETRY_COUNT,
-      );
-    } catch (error) {
-      log.error(`Failed to prepare ArcaneOS sessions with ${credential.label} credentials:`, error.message);
-    }
-    if (sessions.length > 0) {
-      if (credential.label === 'secondary') {
-        log.info('Using secondary team credentials for enterprise decryption');
-      }
-      return sessions;
-    }
-    if (index + 1 < credentials.length) {
-      log.warn('Primary team credentials produced no ArcaneOS sessions; trying secondary credentials');
-    }
-  }
-  return [];
-}
-
 /**
  * Checks whether an app is expired via global app specifications.
  * Expired apps return success with an empty data array.
@@ -838,8 +808,9 @@ async function isAppExpiredInGlobalSpecs(appname) {
 
 /**
  * Retrieves all global app specifications and filters for apps with Syncthing components.
- * Plain apps are checked directly. Enterprise apps (encrypted compose) are decrypted
- * on ArcaneOS nodes before checking containerData prefixes s:, r:, or g:.
+ * Plain apps are checked directly. Enterprise apps (encrypted compose) have their
+ * AES key unwrapped by SAS over mTLS, then are decrypted locally before checking
+ * containerData prefixes s:, r:, or g:.
  *
  * @async
  * @returns {Promise<Object|false>} Discovery results and cache changes, or false on fetch failure.
@@ -898,43 +869,33 @@ async function discoverAppsWithSyncthing(
     });
 
     if (enterpriseAppsToDecrypt.length > 0) {
-      const teamCredentials = await getTeamCredentials();
-      if (teamCredentials.length === 0) {
-        log.error('Complete team Flux credentials are required to decrypt enterprise apps');
+      try {
+        await enterpriseCrypto.assertSasConfigured();
+      } catch (error) {
+        log.error(`SAS enterprise decryption is unavailable: ${error.message}`);
         enterpriseAppsToDecrypt.forEach((app) => unresolvedEnterpriseAppNames.add(app.name));
         decryptFailures = enterpriseAppsToDecrypt.length;
-      } else {
-        const arcaneSessions = await createTeamArcaneNodeSessions();
+      }
 
-        if (arcaneSessions.length === 0) {
-          enterpriseAppsToDecrypt.forEach((app) => unresolvedEnterpriseAppNames.add(app.name));
-          decryptFailures = enterpriseAppsToDecrypt.length;
-        } else {
-          log.info(`Decrypting ${enterpriseAppsToDecrypt.length} new or changed enterprise apps`);
-        }
-
-        if (arcaneSessions.length > 0) {
-          for (let i = 0; i < enterpriseAppsToDecrypt.length; i += 1) {
-            const app = enterpriseAppsToDecrypt[i];
-            try {
-              const decryptedFields = await enterpriseCrypto.decryptEnterpriseSpecWithRetry(
-                app,
-                arcaneSessions,
-              );
-              const decryptedSpec = {
-                ...app,
-                compose: decryptedFields.compose || [],
-                contacts: decryptedFields.contacts || [],
-              };
-              const entry = enterpriseCrypto.buildSyncthingAppEntry(decryptedSpec);
-              if (entry) appsWithSyncthing.push(entry);
-              const cacheUpdate = enterpriseDiscoveryCache.buildCacheUpdate(app, entry);
-              if (cacheUpdate) cacheUpdates.push(cacheUpdate);
-            } catch (error) {
-              decryptFailures += 1;
-              unresolvedEnterpriseAppNames.add(app.name);
-              log.warn(`Failed to decrypt enterprise app ${app.name} after ArcaneOS retries: ${error.message}`);
-            }
+      if (decryptFailures === 0) {
+        log.info(`Decrypting ${enterpriseAppsToDecrypt.length} new or changed enterprise apps through SAS`);
+        for (let i = 0; i < enterpriseAppsToDecrypt.length; i += 1) {
+          const app = enterpriseAppsToDecrypt[i];
+          try {
+            const decryptedFields = await enterpriseCrypto.decryptEnterpriseSpecWithSas(app);
+            const decryptedSpec = {
+              ...app,
+              compose: decryptedFields.compose || [],
+              contacts: decryptedFields.contacts || [],
+            };
+            const entry = enterpriseCrypto.buildSyncthingAppEntry(decryptedSpec);
+            if (entry) appsWithSyncthing.push(entry);
+            const cacheUpdate = enterpriseDiscoveryCache.buildCacheUpdate(app, entry);
+            if (cacheUpdate) cacheUpdates.push(cacheUpdate);
+          } catch (error) {
+            decryptFailures += 1;
+            unresolvedEnterpriseAppNames.add(app.name);
+            log.warn(`Failed to decrypt enterprise app ${app.name} through SAS: ${error.message}`);
           }
         }
       }
@@ -1393,7 +1354,6 @@ module.exports = {
   isTeamFluxId,
   verifyTeamLoginDetailed,
   verifyTeamLogin,
-  createTeamArcaneNodeSessions,
   discoverAppsWithSyncthing,
   getAppsWithSyncthing,
   isAppExpiredInGlobalSpecs,

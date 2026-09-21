@@ -2,11 +2,12 @@
 /* eslint-disable no-await-in-loop */
 /**
  * Test script: discover Syncthing apps from globalappsspecifications,
- * including enterprise apps that require decryption on an ArcaneOS node.
+ * including enterprise apps that require SAS-assisted local decryption.
  *
  * Usage:
  *   node scripts/test-enterprise-syncthing.js
  *   TEST_ENTERPRISE_LIMIT=20 node scripts/test-enterprise-syncthing.js
+ *   TEST_ENTERPRISE_APP=valheim123 node scripts/test-enterprise-syncthing.js
  */
 
 const axios = require('axios');
@@ -16,6 +17,8 @@ const enterpriseCrypto = require('../src/services/enterpriseCrypto');
 
 const httpsAgent = new https.Agent({ rejectUnauthorized: false });
 const ENTERPRISE_LIMIT = Number(process.env.TEST_ENTERPRISE_LIMIT || 10);
+const ENTERPRISE_APP = process.env.TEST_ENTERPRISE_APP;
+const RUN_FULL_DISCOVERY = process.env.TEST_ENTERPRISE_FULL_DISCOVERY === 'true';
 
 function log(message) {
   // eslint-disable-next-line no-console
@@ -40,9 +43,8 @@ async function fetchGlobalAppSpecs() {
 }
 
 async function inspectEnterpriseApps(enterpriseApps) {
-  const arcaneSessions = await fluxOS.createTeamArcaneNodeSessions();
-
-  log(`ArcaneOS nodes: ${arcaneSessions.map((session) => session.nodeBase).join(', ')}`);
+  await enterpriseCrypto.assertSasConfigured();
+  log('SAS mTLS configuration loaded successfully');
 
   const results = [];
   const sample = enterpriseApps.slice(0, ENTERPRISE_LIMIT);
@@ -50,10 +52,7 @@ async function inspectEnterpriseApps(enterpriseApps) {
   for (let i = 0; i < sample.length; i += 1) {
     const app = sample[i];
     try {
-      const decryptedFields = await enterpriseCrypto.decryptEnterpriseSpecWithRetry(
-        app,
-        arcaneSessions,
-      );
+      const decryptedFields = await enterpriseCrypto.decryptEnterpriseSpecWithSas(app);
       const mergedSpec = {
         ...app,
         compose: decryptedFields.compose || [],
@@ -87,6 +86,13 @@ async function main() {
 
   const plainApps = allApps.filter((app) => !enterpriseCrypto.isEnterpriseApp(app));
   const enterpriseApps = allApps.filter((app) => enterpriseCrypto.isEnterpriseApp(app));
+  const enterpriseAppsToTest = ENTERPRISE_APP
+    ? enterpriseApps.filter((app) => app.name === ENTERPRISE_APP)
+    : enterpriseApps;
+
+  if (ENTERPRISE_APP && enterpriseAppsToTest.length === 0) {
+    throw new Error(`Enterprise app ${ENTERPRISE_APP} was not found in global specifications`);
+  }
 
   log(`Plain apps: ${plainApps.length}`);
   log(`Enterprise apps (version >= 8 with enterprise blob): ${enterpriseApps.length}`);
@@ -103,22 +109,27 @@ async function main() {
     log(`  ... and ${plainSyncthingApps.length - 20} more`);
   }
 
-  log(`\nDecrypting up to ${ENTERPRISE_LIMIT} enterprise apps on ArcaneOS nodes...`);
-  const enterpriseResults = await inspectEnterpriseApps(enterpriseApps);
+  log(`\nDecrypting up to ${ENTERPRISE_LIMIT} enterprise apps through SAS...`);
+  const enterpriseResults = await inspectEnterpriseApps(enterpriseAppsToTest);
 
   const enterpriseSyncthingApps = enterpriseResults.filter((result) => result.hasSyncthing);
   const enterpriseDecryptFailures = enterpriseResults.filter((result) => !result.decrypted);
 
-  log('\nRunning getAppsWithSyncthing() integration check...');
-  const integratedApps = await fluxOS.getAppsWithSyncthing();
-  log(`getAppsWithSyncthing returned ${integratedApps?.length || 0} apps`);
+  let integratedApps = null;
+  if (RUN_FULL_DISCOVERY) {
+    log('\nRunning getAppsWithSyncthing() full integration check...');
+    integratedApps = await fluxOS.getAppsWithSyncthing();
+    log(`getAppsWithSyncthing returned ${integratedApps?.length || 0} apps`);
+  }
 
   log('\n=== Summary ===');
   log(`Plain Syncthing apps: ${plainSyncthingApps.length}`);
   log(`Enterprise apps tested: ${enterpriseResults.length}`);
   log(`Enterprise decrypt failures: ${enterpriseDecryptFailures.length}`);
   log(`Enterprise Syncthing apps (from sample): ${enterpriseSyncthingApps.length}`);
-  log(`Integrated Syncthing apps: ${integratedApps?.length || 0}`);
+  if (RUN_FULL_DISCOVERY) {
+    log(`Integrated Syncthing apps: ${integratedApps?.length || 0}`);
+  }
 
   if (enterpriseDecryptFailures.length > 0) {
     log('\nEnterprise decrypt failures:');

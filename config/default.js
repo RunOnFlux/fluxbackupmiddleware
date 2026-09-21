@@ -31,6 +31,15 @@ module.exports = {
     url: 'https://api.marketplace.runonflux.io/api/v1/marketplace/apps',
     cacheHours: 24,
   },
+  sasApi: {
+    baseUrl: process.env.SAS_API_BASE_URL,
+    keyPath: process.env.SAS_API_KEY_PATH,
+    certPath: process.env.SAS_API_CERT_PATH,
+    caPath: process.env.SAS_API_CA_PATH,
+    timeoutMs: Number(process.env.SAS_API_TIMEOUT_MS || 10000),
+    retryAttempts: Number(process.env.SAS_API_RETRY_ATTEMPTS || 4),
+    retryDelayMs: Number(process.env.SAS_API_RETRY_DELAY_MS || 16000),
+  },
   // Keep transient backup files in a deterministic location regardless of the
   // process working directory used by PM2.
   storagePath: process.env.BACKUP_STORAGE_PATH || path.resolve(__dirname, '../tmp'),
