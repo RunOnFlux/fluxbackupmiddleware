@@ -85,7 +85,12 @@ async function run() {
   });
   try {
     assert.strictEqual((await get('/admin/api/dashboard')).status, 401);
-    assert.strictEqual((await get('/admin/')).status, 302);
+    const bareAdmin = await get('/admin');
+    assert.strictEqual(bareAdmin.status, 302);
+    assert.strictEqual(bareAdmin.headers.get('location'), '/admin/login.html');
+    const slashAdmin = await get('/admin/');
+    assert.strictEqual(slashAdmin.status, 302);
+    assert.strictEqual(slashAdmin.headers.get('location'), '/admin/login.html');
     assert.strictEqual((await post('/admin/api/challenge', {}, null, base)).status, 403);
     const challenge = await (await post('/admin/api/challenge', {})).json();
     assert(challenge.message.includes(challenge.id));
@@ -100,6 +105,8 @@ async function run() {
     assert(login.headers.get('set-cookie').includes('SameSite=Strict'));
     assert.strictEqual((await post('/admin/api/login', { id: challenge.id, address, signature })).status, 401);
     assert.strictEqual((await get('/admin/api/dashboard', cookie)).status, 200);
+    assert.strictEqual((await get('/admin', cookie)).status, 200);
+    assert.strictEqual((await get('/admin/', cookie)).status, 200);
     const apps = await (await get('/admin/api/apps?q=sample&category=marketplace', cookie)).json();
     assert.strictEqual(apps.rows[0].name, 'sampleapp');
     const backups = await (await get('/admin/api/backups?appname=sampleapp', cookie)).json();

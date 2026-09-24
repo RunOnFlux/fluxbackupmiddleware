@@ -27,8 +27,7 @@ function asyncRoute(handler) {
 
 function registerRoutes(app) {
   app.get('/admin/login.html', adminPage('login.html'));
-  app.get('/admin', (req, res) => res.redirect('/admin/'));
-  app.get('/admin/', adminAuth.requireAdminPage, adminPage('admin.html'));
+  app.get(['/admin', '/admin/'], adminAuth.requireAdminPage, adminPage('admin.html'));
   app.post('/admin/api/challenge', adminAuth.loginLimiter, adminAuth.requireOrigin, adminAuth.issueChallenge);
   app.post('/admin/api/login', adminAuth.loginLimiter, adminAuth.requireOrigin, adminAuth.login);
   app.post('/admin/api/wallet-callback', adminAuth.loginLimiter, adminAuth.walletCallback);
