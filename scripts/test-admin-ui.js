@@ -5,7 +5,6 @@ const crypto = require('crypto');
 const bitcoinMessage = require('bitcoinjs-message');
 const ethereumSigner = require('nano-ethereum-signer');
 
-process.env.ADMIN_COOKIE_SECURE = 'false';
 const secrets = require('../secrets');
 const backupService = require('../src/services/backupService');
 const ethereumHelper = require('../src/services/utils/ethereumHelper');
@@ -78,7 +77,7 @@ async function run() {
   await new Promise((resolve) => { server.listen(0, '127.0.0.1', resolve); });
   const base = `http://127.0.0.1:${server.address().port}`;
   const get = (path, cookie) => fetch(base + path, { headers: cookie ? { cookie } : {}, redirect: 'manual' });
-  const post = (path, body, cookie, origin = base) => fetch(base + path, {
+  const post = (path, body, cookie, origin = base.replace('http:', 'https:')) => fetch(base + path, {
     method: 'POST',
     headers: { 'content-type': 'application/json', origin, ...(cookie ? { cookie } : {}) },
     body: JSON.stringify(body),
@@ -87,14 +86,17 @@ async function run() {
   try {
     assert.strictEqual((await get('/admin/api/dashboard')).status, 401);
     assert.strictEqual((await get('/admin/')).status, 302);
-    const challenge = await (await get('/admin/api/challenge')).json();
+    assert.strictEqual((await post('/admin/api/challenge', {}, null, base)).status, 403);
+    const challenge = await (await post('/admin/api/challenge', {})).json();
     assert(challenge.message.includes(challenge.id));
     const signature = bitcoinMessage.sign(challenge.message, privateKey, true).toString('base64');
     assert.strictEqual((await post('/admin/api/login', { id: challenge.id, address, signature }, null, 'https://evil.example')).status, 403);
+    assert.strictEqual((await post('/admin/api/login', { id: challenge.id, address, signature }, null, base)).status, 403);
     const login = await post('/admin/api/login', { id: challenge.id, address, signature });
     assert.strictEqual(login.status, 200);
     const cookie = login.headers.get('set-cookie').split(';')[0];
     assert(login.headers.get('set-cookie').includes('HttpOnly'));
+    assert(login.headers.get('set-cookie').includes('Secure'));
     assert(login.headers.get('set-cookie').includes('SameSite=Strict'));
     assert.strictEqual((await post('/admin/api/login', { id: challenge.id, address, signature })).status, 401);
     assert.strictEqual((await get('/admin/api/dashboard', cookie)).status, 200);
@@ -103,15 +105,16 @@ async function run() {
     const backups = await (await get('/admin/api/backups?appname=sampleapp', cookie)).json();
     assert.strictEqual(backups.rows[0].bytes, 1024);
     assert(backups.rows[0].url.endsWith('/Qm123abc'));
-    const walletChallenge = await (await get('/admin/api/challenge')).json();
+    const walletChallenge = await (await post('/admin/api/challenge', {})).json();
     const walletSignature = bitcoinMessage.sign(walletChallenge.message, privateKey, true).toString('base64');
     assert.strictEqual((await post('/admin/api/wallet-callback', { message: walletChallenge.message, signature: walletSignature })).status, 200);
-    assert.strictEqual((await get(`/admin/api/wallet-status?id=${walletChallenge.id}&pollToken=bad`)).status, 401);
-    const redeemed = await get(`/admin/api/wallet-status?id=${walletChallenge.id}&pollToken=${walletChallenge.pollToken}`);
+    assert.strictEqual((await post('/admin/api/wallet-status', { id: walletChallenge.id, pollToken: 'bad' })).status, 401);
+    assert.strictEqual((await post('/admin/api/wallet-status', { id: walletChallenge.id, pollToken: walletChallenge.pollToken }, null, base)).status, 403);
+    const redeemed = await post('/admin/api/wallet-status', { id: walletChallenge.id, pollToken: walletChallenge.pollToken });
     assert.strictEqual(redeemed.status, 200);
     assert(redeemed.headers.get('set-cookie').includes('HttpOnly'));
-    assert.strictEqual((await get(`/admin/api/wallet-status?id=${walletChallenge.id}&pollToken=${walletChallenge.pollToken}`)).status, 401);
-    const ethereumChallenge = await (await get('/admin/api/challenge')).json();
+    assert.strictEqual((await post('/admin/api/wallet-status', { id: walletChallenge.id, pollToken: walletChallenge.pollToken })).status, 401);
+    const ethereumChallenge = await (await post('/admin/api/challenge', {})).json();
     const ethereumSignature = ethereumSigner.signMessage(ethereumHelper.hashMessage(ethereumChallenge.message), ethereumPrivateKey);
     assert.strictEqual((await post('/admin/api/login', {
       id: ethereumChallenge.id, address: ethereumAddress.toLowerCase(), signature: ethereumSignature,

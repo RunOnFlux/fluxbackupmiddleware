@@ -26,14 +26,13 @@ function asyncRoute(handler) {
 }
 
 function registerRoutes(app) {
-  app.use('/admin', adminAuth.requireTransport);
   app.get('/admin/login.html', adminPage('login.html'));
   app.get('/admin', (req, res) => res.redirect('/admin/'));
   app.get('/admin/', adminAuth.requireAdminPage, adminPage('admin.html'));
-  app.get('/admin/api/challenge', adminAuth.loginLimiter, adminAuth.issueChallenge);
+  app.post('/admin/api/challenge', adminAuth.loginLimiter, adminAuth.requireOrigin, adminAuth.issueChallenge);
   app.post('/admin/api/login', adminAuth.loginLimiter, adminAuth.requireOrigin, adminAuth.login);
   app.post('/admin/api/wallet-callback', adminAuth.loginLimiter, adminAuth.walletCallback);
-  app.get('/admin/api/wallet-status', adminAuth.walletStatusLimiter, adminAuth.walletStatus);
+  app.post('/admin/api/wallet-status', adminAuth.walletStatusLimiter, adminAuth.requireOrigin, adminAuth.walletStatus);
   app.post('/admin/api/logout', adminAuth.requireAdmin, adminAuth.requireOrigin, adminAuth.logout);
   app.get('/admin/api/session', adminAuth.requireAdmin, (req, res) => res.set('Cache-Control', 'no-store').json({ address: req.adminAddress }));
   app.get('/admin/api/dashboard', adminAuth.requireAdmin, asyncRoute(adminData.dashboard));

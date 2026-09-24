@@ -51,11 +51,6 @@ function requireOrigin(req, res, next) {
   return next();
 }
 
-function requireTransport(req, res, next) {
-  if (secureCookies && !req.secure) return res.status(403).json({ error: 'Admin UI requires HTTPS' });
-  return next();
-}
-
 function requireAdmin(req, res, next) {
   prune();
   const session = sessions.get(cookie(req));
@@ -136,7 +131,7 @@ function walletCallback(req, res) {
 
 function walletStatus(req, res) {
   prune();
-  const { id, pollToken } = req.query;
+  const { id, pollToken } = req.body || {};
   if (typeof id !== 'string' || typeof pollToken !== 'string') return res.status(400).json({ error: 'Invalid challenge' });
   const challenge = challenges.get(id);
   if (!challenge || challenge.pollToken !== pollToken) return res.status(401).json({ error: 'Challenge expired' });
@@ -162,7 +157,6 @@ module.exports = {
   requireAdmin,
   requireAdminPage,
   requireOrigin,
-  requireTransport,
   loginLimiter,
   walletStatusLimiter,
 };
