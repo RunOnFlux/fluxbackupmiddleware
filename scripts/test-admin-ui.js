@@ -33,20 +33,32 @@ for (let index = 0; index < addressBytes.length && addressBytes[index] === 0; in
 const ethereumPrivateKey = '0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
 const ethereumAddress = ethereumSigner.addressFromKey(ethereumPrivateKey);
 secrets.adminAddresses = [address, ethereumAddress];
+const appNames = Array.from({ length: 30 }, (_, index) => `app${String(index + 1).padStart(2, '0')}`);
+const appQueries = [];
 backupService.getDatabase = () => ({
-  execute: async (sql) => {
+  execute: async (sql, params = []) => {
     if (sql.includes('SUM(finishTime')) {
       return [{
         running: 2, completed7d: 7, storedBytes: 4096, addedBytes7d: 1024,
       }];
     }
     if (sql.includes('newMarketplace7d')) return [{ total: 3, marketplace: 2, newMarketplace7d: 1 }];
-    if (sql.includes('COUNT(*) AS total FROM (SELECT appname')) return [{ total: 1 }];
-    if (sql.includes('SELECT names.appname')) {
-      return [{
-        appname: 'sampleapp', is_marketplace: 1, status: 'active', last_backup_timestamp: Date.now(), files: 1, bytes: 1024,
-      }];
+    if (sql.includes('FROM automatic_backups WHERE (status')) {
+      appQueries.push({ sql, params });
+      assert(sql.includes('LIMIT 26'));
+      const names = [...appNames, 'sampleapp'];
+      return names.filter((name) => name.startsWith(params[0].replace('%', '')) && name > params[1])
+        .slice(0, 26).map((name) => ({
+          appname: name, is_marketplace: 1, status: 'active', last_backup_timestamp: Date.now(),
+        }));
     }
+    if (sql.includes('SELECT DISTINCT t.appname')) {
+      appQueries.push({ sql, params });
+      assert(sql.includes('LIMIT 26'));
+      return ['app15m'].filter((name) => name.startsWith(params[0].replace('%', '')) && name > params[1])
+        .map((name) => ({ appname: name }));
+    }
+    if (sql.includes('SELECT appname, COUNT(*) AS files')) return params.map((appname) => ({ appname, files: 1, bytes: 1024 }));
     if (sql.includes('COUNT(*) AS total FROM tasks')) return [{ total: 1 }];
     if (sql.includes('SELECT taskId, timestamp')) {
       return [{
@@ -109,6 +121,16 @@ async function run() {
     assert.strictEqual((await get('/admin/', cookie)).status, 200);
     const apps = await (await get('/admin/api/apps?q=sample&category=marketplace', cookie)).json();
     assert.strictEqual(apps.rows[0].name, 'sampleapp');
+    const appFirst = await (await get('/admin/api/apps?q=app&category=all&page=0', cookie)).json();
+    assert.strictEqual(appFirst.rows.length, 25);
+    assert.strictEqual(appFirst.hasMore, true);
+    assert(appFirst.nextCursor);
+    const appSecond = await (await get(`/admin/api/apps?q=app&category=all&page=1&cursor=${encodeURIComponent(appFirst.nextCursor)}`, cookie)).json();
+    assert.strictEqual(appSecond.rows.length, 6);
+    assert.strictEqual(appSecond.hasMore, false);
+    assert.strictEqual(new Set([...appFirst.rows, ...appSecond.rows].map((row) => row.name)).size, 31);
+    assert(appQueries.every(({ params }) => params.length === 2));
+    assert.strictEqual((await get('/admin/api/apps?cursor=bad', cookie)).status, 400);
     const backups = await (await get('/admin/api/backups?appname=sampleapp', cookie)).json();
     assert.strictEqual(backups.rows[0].bytes, 1024);
     assert(backups.rows[0].url.endsWith('/Qm123abc'));

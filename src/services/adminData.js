@@ -67,31 +67,73 @@ async function dashboard(req, res) {
 async function apps(req, res) {
   const q = String(req.query.q || '').trim().slice(0, 100);
   const category = ['all', 'marketplace', 'standard'].includes(req.query.category) ? req.query.category : 'all';
-  const offset = page(req.query.page) * pageSize;
-  const source = `(SELECT appname FROM automatic_backups WHERE status IS NULL OR status != 'cancelled'
-    UNION SELECT appname FROM tasks WHERE uploaded = 1 AND removedFromFluxdrive = 0) names
-    LEFT JOIN automatic_backups a ON a.appname = names.appname`;
-  const filter = `WHERE (? = '' OR names.appname LIKE ?)
-    AND (? = 'all' OR (? = 'marketplace' AND a.is_marketplace = 1)
-      OR (? = 'standard' AND (a.is_marketplace = 0 OR a.is_marketplace IS NULL)))`;
-  const params = [q, `%${q.replace(/[\\%_]/g, '\\$&')}%`, category, category, category];
-  const [count] = await db.execute(`SELECT COUNT(*) AS total FROM ${source} ${filter}`, params);
-  const rows = await db.execute(`
-    SELECT names.appname, a.is_marketplace, a.status, a.last_backup_timestamp,
-      (SELECT COUNT(*) FROM tasks t WHERE t.appname = names.appname AND t.uploaded = 1 AND t.removedFromFluxdrive = 0) AS files,
-      (SELECT COALESCE(SUM(t.filesize), 0) FROM tasks t WHERE t.appname = names.appname AND t.uploaded = 1 AND t.removedFromFluxdrive = 0) AS bytes
-    FROM ${source} ${filter} ORDER BY names.appname LIMIT ? OFFSET ?`, [...params, pageSize, offset]);
+  const currentPage = page(req.query.page);
+  let cursor = { a: '', m: '' };
+  if (req.query.cursor !== undefined) {
+    try {
+      if (typeof req.query.cursor !== 'string' || req.query.cursor.length > 512) throw new Error('Invalid cursor');
+      cursor = JSON.parse(req.query.cursor);
+      if (!cursor || typeof cursor.a !== 'string' || typeof cursor.m !== 'string'
+        || cursor.a.length > 128 || cursor.m.length > 128) throw new Error('Invalid cursor');
+    } catch (error) { return res.status(400).json({ error: 'Invalid app cursor' }); }
+  }
+  const pattern = `${q.replace(/[\\%_]/g, '\\$&')}%`;
+  let autoCategory = '';
+  if (category === 'marketplace') autoCategory = 'AND is_marketplace = 1';
+  if (category === 'standard') autoCategory = 'AND (is_marketplace = 0 OR is_marketplace IS NULL)';
+  const [automatic, manual] = await Promise.all([
+    db.execute(`SELECT appname, is_marketplace, status, last_backup_timestamp
+      FROM automatic_backups WHERE (status IS NULL OR status != 'cancelled')
+      AND appname LIKE ? AND appname > ? ${autoCategory} ORDER BY appname LIMIT 26`, [pattern, cursor.a]),
+    category === 'marketplace' ? Promise.resolve([]) : db.execute(`
+      SELECT DISTINCT t.appname FROM tasks t
+      WHERE t.appname LIKE ? AND t.appname > ? AND t.uploaded = 1 AND t.removedFromFluxdrive = 0
+      AND NOT EXISTS (SELECT 1 FROM automatic_backups a WHERE a.appname = t.appname
+        AND (a.status IS NULL OR a.status != 'cancelled'))
+      ORDER BY t.appname LIMIT 26`, [pattern, cursor.m]),
+  ]);
+  const rows = [];
+  let autoIndex = 0;
+  let manualIndex = 0;
+  let nextAuto = cursor.a;
+  let nextManual = cursor.m;
+  while (rows.length < pageSize && (autoIndex < automatic.length || manualIndex < manual.length)) {
+    const useAuto = manualIndex >= manual.length || (autoIndex < automatic.length
+      && automatic[autoIndex].appname <= manual[manualIndex].appname);
+    if (useAuto) {
+      rows.push(automatic[autoIndex]);
+      nextAuto = automatic[autoIndex].appname;
+      autoIndex += 1;
+    } else {
+      const name = manual[manualIndex].appname;
+      rows.push({
+        appname: name, is_marketplace: 0, status: 'Stored', last_backup_timestamp: 0,
+      });
+      nextManual = name;
+      manualIndex += 1;
+    }
+  }
+  const hasMore = autoIndex < automatic.length || manualIndex < manual.length;
+  let fileStats = [];
+  if (rows.length) {
+    const placeholders = rows.map(() => '?').join(', ');
+    fileStats = await db.execute(`SELECT appname, COUNT(*) AS files, COALESCE(SUM(filesize), 0) AS bytes,
+      MAX(finishTime) AS last_finished FROM tasks WHERE appname IN (${placeholders})
+      AND uploaded = 1 AND removedFromFluxdrive = 0 GROUP BY appname`, rows.map((row) => row.appname));
+  }
+  const filesByName = new Map(fileStats.map((row) => [row.appname, row]));
   return res.set('Cache-Control', 'no-store').json({
-    total: number(count.total),
-    page: page(req.query.page),
+    page: currentPage,
     pageSize,
+    hasMore,
+    nextCursor: hasMore ? JSON.stringify({ a: nextAuto, m: nextManual }) : null,
     rows: rows.map((row) => ({
       name: row.appname,
       category: row.is_marketplace ? 'Marketplace' : 'Standard',
       status: row.status || 'Unknown',
-      lastBackup: number(row.last_backup_timestamp),
-      files: number(row.files),
-      bytes: number(row.bytes),
+      lastBackup: number(row.last_backup_timestamp) || number(filesByName.get(row.appname)?.last_finished),
+      files: number(filesByName.get(row.appname)?.files),
+      bytes: number(filesByName.get(row.appname)?.bytes),
     })),
   });
 }
@@ -104,7 +146,7 @@ async function backups(req, res) {
     WHERE appname = ? AND uploaded = 1 AND removedFromFluxdrive = 0`, [appname]);
   const rows = await db.execute(`SELECT taskId, timestamp, component, filesize, hash, finishTime
     FROM tasks WHERE appname = ? AND uploaded = 1 AND removedFromFluxdrive = 0
-    ORDER BY taskId DESC LIMIT ? OFFSET ?`, [appname, pageSize, offset]);
+    ORDER BY taskId DESC LIMIT ${pageSize} OFFSET ${offset}`, [appname]);
   const gateway = config.ipfsGatewayUrl.replace(/\/+$/, '');
   return res.set('Cache-Control', 'no-store').json({
     total: number(count.total),
