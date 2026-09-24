@@ -35,14 +35,35 @@ const ethereumAddress = ethereumSigner.addressFromKey(ethereumPrivateKey);
 secrets.adminAddresses = [address, ethereumAddress];
 const appNames = Array.from({ length: 30 }, (_, index) => `app${String(index + 1).padStart(2, '0')}`);
 const appQueries = [];
+const nowSeconds = Math.floor(Date.now() / 1000);
 backupService.getDatabase = () => ({
   execute: async (sql, params = []) => {
     if (sql.includes('SUM(finishTime')) {
+      assert(params.every((time) => time < 10000000000));
       return [{
         running: 2, completed7d: 7, storedBytes: 4096, addedBytes7d: 1024,
       }];
     }
-    if (sql.includes('newMarketplace7d')) return [{ total: 3, marketplace: 2, newMarketplace7d: 1 }];
+    if (sql.includes('newMarketplace7d')) {
+      assert(params[0] > 1000000000000);
+      return [{ total: 3, marketplace: 2, newMarketplace7d: 1 }];
+    }
+    if (sql.includes('FLOOR(finishTime')) {
+      assert(sql.includes('finishTime / 86400'));
+      return [{ day: Math.floor(nowSeconds / 86400), count: 7 }];
+    }
+    if (sql.includes('FROM tasks ORDER BY taskId DESC LIMIT 8')) {
+      return [{
+        taskId: 42,
+        appname: 'sampleapp',
+        component: 'app',
+        filesize: 1024,
+        finishTime: nowSeconds,
+        uploaded: 1,
+        fails: 0,
+        status: '{}',
+      }];
+    }
     if (sql.includes('FROM automatic_backups WHERE (status')) {
       appQueries.push({ sql, params });
       assert(sql.includes('LIMIT 26'));
@@ -58,11 +79,15 @@ backupService.getDatabase = () => ({
       return ['app15m'].filter((name) => name.startsWith(params[0].replace('%', '')) && name > params[1])
         .map((name) => ({ appname: name }));
     }
-    if (sql.includes('SELECT appname, COUNT(*) AS files')) return params.map((appname) => ({ appname, files: 1, bytes: 1024 }));
+    if (sql.includes('SELECT appname, COUNT(*) AS files')) {
+      return params.map((appname) => ({
+        appname, files: 1, bytes: 1024, last_finished: nowSeconds,
+      }));
+    }
     if (sql.includes('COUNT(*) AS total FROM tasks')) return [{ total: 1 }];
     if (sql.includes('SELECT taskId, timestamp')) {
       return [{
-        taskId: 42, timestamp: Date.now(), component: 'app', filesize: 1024, hash: 'Qm123abc', finishTime: Date.now(),
+        taskId: 42, timestamp: nowSeconds, component: 'app', filesize: 1024, hash: 'Qm123abc', finishTime: nowSeconds,
       }];
     }
     return [];
@@ -116,7 +141,9 @@ async function run() {
     assert(login.headers.get('set-cookie').includes('Secure'));
     assert(login.headers.get('set-cookie').includes('SameSite=Strict'));
     assert.strictEqual((await post('/admin/api/login', { id: challenge.id, address, signature })).status, 401);
-    assert.strictEqual((await get('/admin/api/dashboard', cookie)).status, 200);
+    const dashboard = await (await get('/admin/api/dashboard', cookie)).json();
+    assert.strictEqual(dashboard.recent[0].time, nowSeconds * 1000);
+    assert.strictEqual(dashboard.daily[0].day, Math.floor(nowSeconds / 86400));
     assert.strictEqual((await get('/admin', cookie)).status, 200);
     assert.strictEqual((await get('/admin/', cookie)).status, 200);
     const apps = await (await get('/admin/api/apps?q=sample&category=marketplace', cookie)).json();
@@ -129,10 +156,13 @@ async function run() {
     assert.strictEqual(appSecond.rows.length, 6);
     assert.strictEqual(appSecond.hasMore, false);
     assert.strictEqual(new Set([...appFirst.rows, ...appSecond.rows].map((row) => row.name)).size, 31);
+    assert.strictEqual([...appFirst.rows, ...appSecond.rows].find((row) => row.name === 'app15m').lastBackup, nowSeconds * 1000);
     assert(appQueries.every(({ params }) => params.length === 2));
     assert.strictEqual((await get('/admin/api/apps?cursor=bad', cookie)).status, 400);
     const backups = await (await get('/admin/api/backups?appname=sampleapp', cookie)).json();
     assert.strictEqual(backups.rows[0].bytes, 1024);
+    assert.strictEqual(backups.rows[0].checkpoint, nowSeconds * 1000);
+    assert.strictEqual(backups.rows[0].time, nowSeconds * 1000);
     assert(backups.rows[0].url.endsWith('/Qm123abc'));
     const walletChallenge = await (await post('/admin/api/challenge', {})).json();
     const walletSignature = bitcoinMessage.sign(walletChallenge.message, privateKey, true).toString('base64');

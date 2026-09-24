@@ -22,7 +22,7 @@ function taskState(row) {
 }
 
 async function dashboard(req, res) {
-  const since = (Math.floor(Date.now() / 86400000) - 6) * 86400000;
+  const since = (Math.floor(Date.now() / 86400000) - 6) * 86400;
   const [stats] = await db.execute(`
     SELECT COUNT(*) AS total,
       SUM(finishTime = 0 AND uploaded = 0 AND fails < 4 AND startTime > 0 AND removedFromFluxdrive = 0) AS running,
@@ -34,9 +34,9 @@ async function dashboard(req, res) {
     SELECT COUNT(*) AS total,
       SUM(is_marketplace = 1) AS marketplace,
       SUM(is_marketplace = 1 AND first_seen_at >= ?) AS newMarketplace7d
-    FROM automatic_backups WHERE status IS NULL OR status != 'cancelled'`, [since]);
+    FROM automatic_backups WHERE status IS NULL OR status != 'cancelled'`, [since * 1000]);
   const daily = await db.execute(`
-    SELECT FLOOR(finishTime / 86400000) AS day, COUNT(*) AS count
+    SELECT FLOOR(finishTime / 86400) AS day, COUNT(*) AS count
     FROM tasks WHERE uploaded = 1 AND removedFromFluxdrive = 0 AND finishTime >= ?
     GROUP BY day ORDER BY day`, [since]);
   const recent = await db.execute(`
@@ -58,7 +58,7 @@ async function dashboard(req, res) {
       appname: row.appname,
       component: row.component,
       bytes: number(row.filesize),
-      time: number(row.finishTime),
+      time: number(row.finishTime) * 1000,
       state: taskState(row),
     })),
   });
@@ -131,7 +131,7 @@ async function apps(req, res) {
       name: row.appname,
       category: row.is_marketplace ? 'Marketplace' : 'Standard',
       status: row.status || 'Unknown',
-      lastBackup: number(row.last_backup_timestamp) || number(filesByName.get(row.appname)?.last_finished),
+      lastBackup: number(row.last_backup_timestamp) || number(filesByName.get(row.appname)?.last_finished) * 1000,
       files: number(filesByName.get(row.appname)?.files),
       bytes: number(filesByName.get(row.appname)?.bytes),
     })),
@@ -154,10 +154,10 @@ async function backups(req, res) {
     pageSize,
     rows: rows.map((row) => ({
       id: row.taskId,
-      checkpoint: number(row.timestamp),
+      checkpoint: number(row.timestamp) * 1000,
       component: row.component,
       bytes: number(row.filesize),
-      time: number(row.finishTime),
+      time: number(row.finishTime) * 1000,
       url: safeHash(row.hash) ? `${gateway}/${row.hash}` : null,
     })),
   });
