@@ -415,6 +415,7 @@ class DBClient {
         expire_counter int DEFAULT '0',
         last_backup_timestamp bigint unsigned DEFAULT '0',
         is_marketplace tinyint DEFAULT NULL,
+        first_seen_at bigint unsigned NOT NULL DEFAULT '0',
         dispatch_token varchar(64) DEFAULT NULL,
         dispatch_lease_until bigint unsigned NOT NULL DEFAULT '0',
         last_failure_fingerprint varchar(64) DEFAULT NULL,
@@ -442,6 +443,12 @@ class DBClient {
       log.info('is_marketplace column added successfully');
     } else {
       log.info('is_marketplace column already exists, moving on...');
+    }
+
+    const firstSeenColumn = await this.query(`SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
+      WHERE TABLE_SCHEMA = '${this.InitDB}' AND TABLE_NAME = 'automatic_backups' AND COLUMN_NAME = 'first_seen_at'`);
+    if (firstSeenColumn.length === 0) {
+      await this.query("ALTER TABLE automatic_backups ADD COLUMN first_seen_at BIGINT UNSIGNED NOT NULL DEFAULT '0'");
     }
 
     const dispatchColumnRows = await this.query(`

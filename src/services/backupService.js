@@ -1083,8 +1083,8 @@ async function checkExpiredApps() {
 const { normalizeAppName } = enterpriseDiscoveryCache;
 
 const AUTOMATIC_BACKUP_UPSERT_SQL = `INSERT INTO automatic_backups (
-  appname, components, status, expire_counter, last_backup_timestamp, is_marketplace
-) VALUES (?, ?, 'pending', 0, 0, ?)
+  appname, components, status, expire_counter, last_backup_timestamp, is_marketplace, first_seen_at
+) VALUES (?, ?, 'pending', 0, 0, ?, ?)
 ON DUPLICATE KEY UPDATE
   components = VALUES(components),
   expire_counter = 0,
@@ -1099,6 +1099,7 @@ async function upsertAutomaticBackupApp(database, app, isMarketplace) {
     app.appName,
     JSON.stringify(app.componentNames),
     isMarketplace,
+    Date.now(),
   ]);
 }
 
@@ -2804,6 +2805,7 @@ async function init() {
 
 module.exports = {
   init,
+  getDatabase: () => dbCli,
   registerBackupTask,
   getBackupList,
   getTaskStatus,
