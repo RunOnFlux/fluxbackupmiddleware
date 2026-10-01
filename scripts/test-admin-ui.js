@@ -87,7 +87,7 @@ backupService.getDatabase = () => ({
     if (sql.includes('COUNT(*) AS total FROM tasks')) return [{ total: 1 }];
     if (sql.includes('SELECT taskId, timestamp')) {
       return [{
-        taskId: 42, timestamp: nowSeconds, component: 'app', filesize: 1024, hash: 'Qm123abc', finishTime: nowSeconds,
+        taskId: 42, timestamp: nowSeconds * 1000, component: 'app', filesize: 1024, hash: 'Qm123abc', finishTime: nowSeconds,
       }];
     }
     return [];

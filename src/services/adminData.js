@@ -13,6 +13,10 @@ const db = {
 
 const pageSize = 25;
 function number(value, fallback = 0) { return Number(value) || fallback; }
+function milliseconds(value) {
+  const time = number(value);
+  return time > 0 && time < 100000000000 ? time * 1000 : time;
+}
 function page(value) { return Math.min(Math.max(parseInt(value, 10) || 0, 0), 10000); }
 function safeHash(hash) { return typeof hash === 'string' && /^[a-zA-Z0-9]+$/.test(hash) ? hash : null; }
 function taskState(row) {
@@ -58,7 +62,7 @@ async function dashboard(req, res) {
       appname: row.appname,
       component: row.component,
       bytes: number(row.filesize),
-      time: number(row.finishTime) * 1000,
+      time: milliseconds(row.finishTime),
       state: taskState(row),
     })),
   });
@@ -131,7 +135,7 @@ async function apps(req, res) {
       name: row.appname,
       category: row.is_marketplace ? 'Marketplace' : 'Standard',
       status: row.status || 'Unknown',
-      lastBackup: number(row.last_backup_timestamp) || number(filesByName.get(row.appname)?.last_finished) * 1000,
+      lastBackup: milliseconds(row.last_backup_timestamp) || milliseconds(filesByName.get(row.appname)?.last_finished),
       files: number(filesByName.get(row.appname)?.files),
       bytes: number(filesByName.get(row.appname)?.bytes),
     })),
@@ -154,10 +158,10 @@ async function backups(req, res) {
     pageSize,
     rows: rows.map((row) => ({
       id: row.taskId,
-      checkpoint: number(row.timestamp) * 1000,
+      checkpoint: milliseconds(row.timestamp),
       component: row.component,
       bytes: number(row.filesize),
-      time: number(row.finishTime) * 1000,
+      time: milliseconds(row.finishTime),
       url: safeHash(row.hash) ? `${gateway}/${row.hash}` : null,
     })),
   });
