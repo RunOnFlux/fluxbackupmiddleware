@@ -11,7 +11,7 @@
 <script nonce="__CSP_NONCE__">
 const $=id=>document.getElementById(id);let appPage=0,appCursors=[''],filePage=0,fileTotal=0,currentApp='',logCursor=null,logHasMore=false,logLoaded=0,appLoadId=0;
 function size(v){const n=Number(v)||0;if(n<1024)return n+' B';const u=['KB','MB','GB','TB'];let x=n,i=-1;do{x/=1024;i++}while(x>=1024&&i<u.length-1);return x.toFixed(x<10?1:0)+' '+u[i]}
-function date(v){return v?new Date(Number(v)).toLocaleString():'—'}
+function date(v){const time=Number(v);return Number.isFinite(time)&&time>0?new Date(time).toISOString().replace('T',' ').replace(/\.\d{3}Z$/,' UTC'):'—'}
 function cell(row,value,cls){const td=row.insertCell();td.textContent=value;if(cls)td.className=cls;return td}
 function empty(tbody,count,message){tbody.innerHTML='';const row=tbody.insertRow();const td=row.insertCell();td.colSpan=count;td.className='empty';td.textContent=message}
 function notice(message){$('notice').textContent=message;$('notice').classList.toggle('hidden',!message)}
