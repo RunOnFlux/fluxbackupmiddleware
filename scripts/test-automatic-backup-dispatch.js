@@ -44,8 +44,8 @@ async function main() {
   log.warn = () => {};
   log.info = () => {};
 
-  assert.strictEqual(config.automaticBackupSchedule.dispatcherIntervalMinutes, 2);
-  assert.strictEqual(config.automaticBackupSchedule.maxConcurrentAutomaticBackups, 4);
+  assert.strictEqual(config.automaticBackupSchedule.dispatcherIntervalMinutes, 1);
+  assert.strictEqual(config.automaticBackupSchedule.maxConcurrentAutomaticBackups, 8);
 
   const now = Date.parse('2026-08-21T10:00:00.000Z');
   const claimed = await testHooks.claimNextAutomaticBackup(

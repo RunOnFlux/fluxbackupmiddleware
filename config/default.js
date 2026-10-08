@@ -12,13 +12,14 @@ module.exports = {
   dbQueryTimeoutMs: 15000,
   dbOperationTimeoutMs: 20000,
   dbSlowQueryMs: 2000,
-  maxConcurrentTasks: 10,
+  // Allow eight file tasks; download admission also checks available disk space.
+  maxConcurrentTasks: 8,
   quotaPerUser: 50, // GB
   automaticBackupSchedule: {
     standardIntervalHours: 7 * 24,
     marketplaceIntervalHours: 24,
-    dispatcherIntervalMinutes: 2,
-    maxConcurrentAutomaticBackups: 4,
+    dispatcherIntervalMinutes: 1,
+    maxConcurrentAutomaticBackups: 8,
     dispatcherLeaseMinutes: 6 * 60,
     discordFailureCooldownMinutes: 60,
   },

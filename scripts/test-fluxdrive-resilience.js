@@ -14,6 +14,7 @@ const originalStoragePath = config.storagePath;
 const originalUploadTimeout = config.fluxDriveUploadInactivityTimeoutMs;
 const originalGetKey = Vault.getKey;
 const originalLogError = log.error;
+const originalCreateReadStream = fs.createReadStream;
 
 async function listen(server) {
   await new Promise((resolve, reject) => {
@@ -30,7 +31,23 @@ async function close(server) {
 
 async function main() {
   const storageRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'flux-upload-test-'));
+  let rejectUpload = false;
+  let acceptUpload = false;
+  const uploadStreams = [];
   const server = http.createServer((request, response) => {
+    if (request.url === '/api/v0/put' && rejectUpload) {
+      response.writeHead(400, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ error: 'Error parsing form' }));
+      return;
+    }
+    if (request.url === '/api/v0/put' && acceptUpload) {
+      request.resume();
+      request.on('end', () => {
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ hash: 'test-upload-hash' }));
+      });
+      return;
+    }
     if (request.url === '/api/v0/cat') {
       response.writeHead(200, { 'content-type': 'application/x-tar' });
       response.end('archive-data');
@@ -48,6 +65,11 @@ async function main() {
       return 'test-secret';
     };
     log.error = () => {};
+    fs.createReadStream = (...args) => {
+      const stream = originalCreateReadStream(...args);
+      uploadStreams.push(stream);
+      return stream;
+    };
 
     const task = {
       taskId: 9001,
@@ -63,6 +85,26 @@ async function main() {
       assert.strictEqual(error.diagnostic.errorCode, 'FLUXDRIVE_UPLOAD_TIMEOUT');
       return true;
     });
+
+    assert(uploadStreams.every((stream) => stream.closed && stream.destroyed));
+
+    // An early rejection of a large request leaves the source paused unless explicitly closed.
+    rejectUpload = true;
+    config.fluxDriveUploadInactivityTimeoutMs = 2000;
+    fs.truncateSync(taskFileStorage.getTaskFilePath(task), 64 * 1024 * 1024);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      // Retry sequentially, as the task runner does after each failed upload.
+      // eslint-disable-next-line no-await-in-loop
+      await assert.rejects(fluxDrive.uploadFile(task));
+      assert(uploadStreams.every((stream) => stream.closed && stream.destroyed));
+    }
+
+    rejectUpload = false;
+    acceptUpload = true;
+    fs.writeFileSync(taskFileStorage.getTaskFilePath(task), 'successful-upload');
+    await fluxDrive.uploadFile(task);
+    assert.strictEqual(task.uploaded, true);
+    assert(uploadStreams.every((stream) => stream.closed && stream.destroyed));
 
     const chunks = [];
     const response = new Writable({
@@ -98,6 +140,7 @@ async function main() {
     config.fluxDriveUploadInactivityTimeoutMs = originalUploadTimeout;
     Vault.getKey = originalGetKey;
     log.error = originalLogError;
+    fs.createReadStream = originalCreateReadStream;
     if (server.listening) await close(server);
     fs.rmSync(storageRoot, { recursive: true, force: true });
   }
