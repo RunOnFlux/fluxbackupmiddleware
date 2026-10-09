@@ -56,9 +56,14 @@ backupService.getDatabase = () => ({
       assert(params[0] > 1000000000000);
       return [{ total: 3, marketplace: 2, newMarketplace7d: 1 }];
     }
-    if (sql.includes('FLOOR(finishTime')) {
-      assert(sql.includes('finishTime / 86400'));
-      return [{ day: Math.floor(nowSeconds / 86400), count: 7 }];
+    if (sql.includes(') backup_runs')) {
+      assert(params.every((time) => time > 1000000000000));
+      assert(sql.includes("event_kind = 'run'"));
+      assert(sql.includes("backup_type NOT LIKE 'automatic%'"));
+      return [
+        { day: Math.floor(nowSeconds / 86400), successful: '7', failed: '3' },
+        { day: Math.floor(nowSeconds / 86400) - 1, successful: '0', failed: '2' },
+      ];
     }
     if (sql.includes('FROM tasks ORDER BY taskId DESC LIMIT 8')) {
       return [{
@@ -152,7 +157,11 @@ async function run() {
     const dashboard = await (await get('/admin/api/dashboard', cookie)).json();
     assert.strictEqual(dashboard.stats.running, 5);
     assert.strictEqual(dashboard.recent[0].time, nowSeconds * 1000);
-    assert.strictEqual(dashboard.daily[0].day, Math.floor(nowSeconds / 86400));
+    assert.deepStrictEqual(dashboard.daily[0], {
+      day: Math.floor(nowSeconds / 86400), count: 7, successful: 7, failed: 3,
+    });
+    assert.strictEqual(dashboard.daily[1].successful, 0);
+    assert.strictEqual(dashboard.daily[1].failed, 2);
     assert.strictEqual((await get('/admin', cookie)).status, 200);
     assert.strictEqual((await get('/admin/', cookie)).status, 200);
     const apps = await (await get('/admin/api/apps?q=sample&category=marketplace', cookie)).json();

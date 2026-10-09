@@ -63,9 +63,19 @@ async function dashboard(req, res) {
       SUM(is_marketplace = 1 AND first_seen_at >= ?) AS newMarketplace7d
     FROM automatic_backups WHERE status IS NULL OR status != 'cancelled'`, [since * 1000]);
   const daily = await db.execute(`
-    SELECT FLOOR(finishTime / 86400) AS day, COUNT(*) AS count
-    FROM tasks WHERE uploaded = 1 AND removedFromFluxdrive = 0 AND finishTime >= ?
-    GROUP BY day ORDER BY day`, [since]);
+    SELECT FLOOR(completed_at / 86400000) AS day,
+      SUM(failed = 0) AS successful, SUM(failed = 1) AS failed
+    FROM (
+      SELECT backup_type, appname, batch_key, MAX(occurred_at) AS completed_at,
+        MAX(outcome = 'failed') AS failed
+      FROM backup_activity_events
+      WHERE occurred_at >= ? AND occurred_at < ?
+        AND (event_kind = 'run'
+          OR (event_kind = 'file' AND backup_type NOT LIKE 'automatic%'))
+        AND outcome IN ('success', 'failed')
+      GROUP BY backup_type, appname, batch_key
+    ) backup_runs
+    GROUP BY day ORDER BY day`, [since * 1000, now]);
   const recent = await db.execute(`
     SELECT taskId, appname, component, filesize, finishTime, uploaded, fails, status
     FROM tasks ORDER BY taskId DESC LIMIT 8`);
@@ -79,7 +89,12 @@ async function dashboard(req, res) {
       marketplace: number(appStats.marketplace),
       newMarketplace7d: number(appStats.newMarketplace7d),
     },
-    daily: daily.map((row) => ({ day: row.day, count: number(row.count) })),
+    daily: daily.map((row) => ({
+      day: number(row.day),
+      count: number(row.successful),
+      successful: number(row.successful),
+      failed: number(row.failed),
+    })),
     recent: recent.map((row) => ({
       id: row.taskId,
       appname: row.appname,
