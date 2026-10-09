@@ -29,11 +29,34 @@ async function dashboard(req, res) {
   const since = (Math.floor(Date.now() / 86400000) - 6) * 86400;
   const [stats] = await db.execute(`
     SELECT COUNT(*) AS total,
-      SUM(finishTime = 0 AND uploaded = 0 AND fails < 4 AND startTime > 0 AND removedFromFluxdrive = 0) AS running,
       SUM(uploaded = 1 AND removedFromFluxdrive = 0 AND finishTime >= ?) AS completed7d,
       SUM(CASE WHEN uploaded = 1 AND removedFromFluxdrive = 0 THEN COALESCE(filesize, 0) ELSE 0 END) AS storedBytes,
       SUM(CASE WHEN uploaded = 1 AND removedFromFluxdrive = 0 AND finishTime >= ? THEN COALESCE(filesize, 0) ELSE 0 END) AS addedBytes7d
     FROM tasks`, [since, since]);
+  // Include archive creation, and count component transfers as one backup run.
+  // Leases exclude abandoned dispatches; transfer states exclude waiting/retry rows.
+  const now = Date.now();
+  const [runningStats] = await db.execute(`
+    SELECT COUNT(*) AS running FROM (
+      SELECT CONCAT('automatic:', id) AS run_key
+      FROM automatic_backups
+      WHERE status = 'pending' AND dispatch_token IS NOT NULL
+        AND dispatch_lease_until > ?
+      UNION
+      SELECT CONCAT('task:', owner, ':', appname, ':', timestamp) AS run_key
+      FROM tasks t
+      WHERE finishTime = 0 AND uploaded = 0 AND fails < 4
+        AND startTime > 0 AND removedFromFluxdrive = 0
+        AND JSON_UNQUOTE(JSON_EXTRACT(status, '$.state'))
+          IN ('started', 'downloading', 'uploading')
+        AND NOT EXISTS (
+          SELECT 1 FROM automatic_backups a
+          WHERE a.appname = t.appname AND a.status = 'pending'
+            AND a.dispatch_token IS NOT NULL AND a.dispatch_lease_until > ?
+            AND t.backup_type LIKE 'automatic%'
+        )
+    ) active_runs
+  `, [now, now]);
   const [appStats] = await db.execute(`
     SELECT COUNT(*) AS total,
       SUM(is_marketplace = 1) AS marketplace,
@@ -48,7 +71,7 @@ async function dashboard(req, res) {
     FROM tasks ORDER BY taskId DESC LIMIT 8`);
   res.set('Cache-Control', 'no-store').json({
     stats: {
-      running: number(stats.running),
+      running: number(runningStats.running),
       completed7d: number(stats.completed7d),
       storedBytes: number(stats.storedBytes),
       addedBytes7d: number(stats.addedBytes7d),

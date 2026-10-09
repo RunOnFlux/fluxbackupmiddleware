@@ -38,7 +38,15 @@ const appQueries = [];
 const nowSeconds = Math.floor(Date.now() / 1000);
 backupService.getDatabase = () => ({
   execute: async (sql, params = []) => {
-    if (sql.includes('SUM(finishTime')) {
+    if (sql.includes(') active_runs')) {
+      assert(params.every((time) => time > 1000000000000));
+      assert(sql.includes("status = 'pending' AND dispatch_token IS NOT NULL"));
+      assert(sql.includes('dispatch_lease_until > ?'));
+      assert(sql.includes('AND NOT EXISTS'));
+      assert(sql.includes("IN ('started', 'downloading', 'uploading')"));
+      return [{ running: 5 }];
+    }
+    if (sql.includes('AS completed7d')) {
       assert(params.every((time) => time < 10000000000));
       return [{
         running: 2, completed7d: 7, storedBytes: 4096, addedBytes7d: 1024,
@@ -142,6 +150,7 @@ async function run() {
     assert(login.headers.get('set-cookie').includes('SameSite=Strict'));
     assert.strictEqual((await post('/admin/api/login', { id: challenge.id, address, signature })).status, 401);
     const dashboard = await (await get('/admin/api/dashboard', cookie)).json();
+    assert.strictEqual(dashboard.stats.running, 5);
     assert.strictEqual(dashboard.recent[0].time, nowSeconds * 1000);
     assert.strictEqual(dashboard.daily[0].day, Math.floor(nowSeconds / 86400));
     assert.strictEqual((await get('/admin', cookie)).status, 200);
