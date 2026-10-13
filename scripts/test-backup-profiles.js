@@ -113,7 +113,7 @@ async function main() {
     assert.strictEqual(byComponent('web', { appname: 'dragonwilds1790000000000' }), profile, 'app name, single component');
     assert.strictEqual(byComponent('web', { appname: 'dragonwilds1790000000000', componentCount: 2 }), null, 'app name says nothing about which of several components');
     assert.strictEqual(byComponent('mydragonwilds'), null, 'component rule is anchored, as in the hub');
-    assert.strictEqual(byComponent('valheim', { repotag: 'lloesche/valheim-server:latest', appname: 'valheim1' }), null);
+    assert.strictEqual(byComponent('palworld', { repotag: 'thijsvanloef/palworld-server-docker:latest', appname: 'palworld1' }), null);
 
     // No image needed: an enterprise spec read from the chain has none.
     const resolved = backupProfiles.resolveComponentProfiles(APP, [COMPONENT]);
@@ -268,6 +268,132 @@ async function main() {
       { [COMPONENT]: profile },
     );
     assert.strictEqual(seen[0][4][COMPONENT].id, 'dragonwilds-world');
+
+    // --- Valheim -------------------------------------------------------------------
+    const VAPP = 'valheim1790000000000';
+    const VCOMP = 'valheimvalheim';
+    const valheim = backupProfiles.profileForComponent({
+      appname: VAPP, component: VCOMP, repotag: null, componentCount: 1,
+    });
+    assert.strictEqual(valheim.id, 'valheim-world', 'marketplace component');
+    assert.strictEqual(byComponent('valheim').id, 'valheim-world', 'hub plan component');
+    assert.strictEqual(byComponent('web', { repotag: 'lloesche/valheim-server:latest' }).id, 'valheim-world');
+    assert.strictEqual(byComponent('dragonwildsdragonwilds'), profile, 'Dragonwilds still its own');
+
+    const file = (name, size, minutesAgo = 60) => ({
+      name, size, isFile: true, isDirectory: false, modifiedAt: new Date(Date.now() - minutesAgo * 60000).toISOString(),
+    });
+    const dir = (name, size, children) => ({
+      name, size, isFile: false, isDirectory: true, ...(children ? { children } : {}),
+    });
+    // A committed 1.0 world (valheim1790392831101, generation 260), and the
+    // half-synced one (valheim1789657999079: .ok and .fwl2 at 852, .db2 and
+    // .chunks still at 851).
+    const committed = [
+      file('00_00__0_1.chunk', 183), file('1e_1e__1_46.chunk', 1142295),
+      file('_main.260.chunks', 197), file('_main.260.db2', 149852), file('_main.260.fwl2', 1563), file('_main.260.ok', 4),
+      file('_main.259.sync-conflict-20260930-165322-XUVBXFM.db2', 149852),
+    ];
+    const halfSynced = [
+      file('_main.851.chunks', 681), file('_main.851.db2', 164003), file('_main.852.fwl2', 2998), file('_main.852.ok', 4),
+    ];
+    const worlds = valheim.include[0];
+    assert.strictEqual(worlds.validate([dir('localhost', 7800000, committed)]), null);
+    assert.match(worlds.validate([dir('Vally2026', 170000, halfSynced)]), /_main\.852\.ok but no _main\.852\.db2 \(a half-synced save\)/);
+    assert.match(worlds.validate([dir('W', 10, [file('_main.1.db2', 9)])]), /no _main\.N\.ok/, 'a first save in progress');
+    assert.strictEqual(worlds.validate([file('Old.db', 9000), file('Old.fwl', 40)]), null, 'a pre-1.0 world');
+    assert.match(worlds.validate([file('Old.db', 9000)]), /Old\.db has no Old\.fwl/);
+    assert.strictEqual(worlds.validate([]), 'no world');
+    assert.strictEqual(worlds.validate([dir('empty', 0, [])]), 'no world');
+    assert.strictEqual(worlds.validate([dir('localhost', 1, committed), dir('Vally2026', 1, halfSynced)]) !== null, true, 'every world must be committed');
+
+    // The volume: a committed world beside Valheim's own automatic backup, the
+    // hourly zips (the newest still being written), BepInEx and the lists.
+    const vRoute = (folder, entries) => ({
+      match: (r) => r.method === 'get' && r.url === `${NODE}/apps/getfolderinfo/${VAPP}/${VCOMP}/${encodeURIComponent(folder)}`,
+      reply: () => (entries ? success(entries) : missing()),
+    });
+    const valheimVolume = (world = committed, extraWorlds = []) => [
+      vRoute('appdata', [
+        dir('worlds_local', 0), dir('backups', 0), dir('bepinex', 0), file('prefs', 775),
+        file('adminlist.txt', 39), file('bannedlist.txt', 40), file('permittedlist.txt', 42), dir('sync-conflicts', 0),
+      ]),
+      vRoute('appdata/worlds_local', [
+        dir('localhost', 7800000), dir('localhost_backup_auto-20261013120000', 7800000), ...extraWorlds,
+      ]),
+      vRoute('appdata/worlds_local/localhost', world),
+      vRoute('appdata/backups', [
+        file('worlds-20261013-160501.zip', 4644289, 125),
+        file('worlds-20261013-170502.zip', 4650000, 65),
+        file('worlds-20261013-180503.zip', 4700000, 2),
+        file('README.txt', 10, 1),
+      ]),
+      vRoute('appdata/bepinex', [dir('plugins', 120000), file('BepInEx.cfg', 900)]),
+      vRoute('appdata/valheimplus', null),
+      {
+        match: (r) => r.url.startsWith(`${NODE}/apps/createfolder/`),
+        reply: () => ({ status: 200, headers: {}, data: { status: 'success', data: {} } }),
+      },
+      {
+        match: (r) => r.method === 'post' && r.url === `${NODE}/apps/compressobject`,
+        reply: () => ({ status: 202, headers: {}, data: { status: 'success', data: { jobId: 'job-v' } } }),
+      },
+      {
+        match: (r) => r.url === `${NODE}/apps/operations/job-v`,
+        reply: () => success({ status: 'Succeeded' }),
+      },
+    ];
+
+    calls.length = 0;
+    routes = valheimVolume();
+    outcome = await fluxOS.testHooks.createProfiledArchiveOnNode(NODE, 'auth', VAPP, VCOMP, valheim, []);
+    assert.deepStrictEqual(outcome, { fits: true });
+    assert.deepStrictEqual(calls.find((r) => r.url.endsWith('/apps/compressobject')).data, {
+      appname: VAPP,
+      component: VCOMP,
+      source: [
+        'appdata/.flux-backup',
+        'appdata/worlds_local/localhost',
+        'appdata/backups/worlds-20261013-170502.zip',
+        'appdata/bepinex',
+        'appdata/prefs',
+        'appdata/adminlist.txt',
+        'appdata/bannedlist.txt',
+        'appdata/permittedlist.txt',
+      ],
+      destination: `backup/local/backup_${VCOMP}.tar.gz`,
+      overwrite: true,
+    });
+    const listedFolders = calls.filter((r) => r.url.includes('/apps/getfolderinfo/')).map((r) => decodeURIComponent(r.url.split('/').pop()));
+    assert(!listedFolders.some((folder) => folder.includes('_backup_auto')), "Valheim's own backups are never listed");
+    assert.strictEqual(listedFolders.filter((folder) => folder === 'appdata').length, 1, 'appdata is listed once for every file entry');
+
+    // The standby caught half-way through a save -> the full backup.
+    calls.length = 0;
+    routes = valheimVolume(halfSynced);
+    outcome = await fluxOS.testHooks.createProfiledArchiveOnNode(NODE, 'auth', VAPP, VCOMP, valheim, []);
+    assert.strictEqual(outcome.fits, false);
+    assert.match(outcome.reason, /^worlds_local: localhost has _main\.852\.ok but no _main\.852\.db2/);
+    assert(!calls.some((r) => r.url.endsWith('/apps/compressobject')));
+
+    // More world folders than are worth checking -> the full backup.
+    const many = Array.from({ length: backupProfiles.MAX_CHILD_FOLDERS }, (_, i) => dir(`w${i}`, 1));
+    routes = [...many.map((d) => vRoute(`appdata/worlds_local/${d.name}`, committed)), ...valheimVolume(committed, many)];
+    outcome = await fluxOS.testHooks.createProfiledArchiveOnNode(NODE, 'auth', VAPP, VCOMP, valheim, []);
+    assert.match(outcome.reason, /more than 20 folders/);
+
+    // No settled hourly zip yet (a new server): the worlds alone.
+    const plan2 = backupProfiles.planProfiledArchive(valheim, {
+      worlds_local: [dir('localhost', 1, committed)],
+      backups: [file('worlds-20261013-180503.zip', 4700000, 2)],
+      bepinex: null,
+      valheimplus: null,
+      prefs: null,
+      'adminlist.txt': null,
+      'bannedlist.txt': null,
+      'permittedlist.txt': null,
+    });
+    assert.deepStrictEqual(plan2, { fits: true, sources: ['appdata/.flux-backup', 'appdata/worlds_local/localhost'] });
 
     // --- backupService ----------------------------------------------------------
     backupHooks.setDatabaseForTests({

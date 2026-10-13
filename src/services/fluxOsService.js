@@ -1125,11 +1125,10 @@ async function compressOnNode(node, zelidAuth, payload) {
  *   retried on another node rather than read as a missing layout
  */
 async function createProfiledArchiveOnNode(node, zelidAuth, appname, component, profile, diagnostics) {
-  const listings = {};
-  for (let i = 0; i < profile.include.length; i += 1) {
-    const entry = profile.include[i];
-    listings[entry.path] = await listVolumeFolder(node, zelidAuth, appname, component, `appdata/${entry.path}`);
-  }
+  const listings = await backupProfiles.collectProfileListings(
+    profile,
+    (folder) => listVolumeFolder(node, zelidAuth, appname, component, folder ? `appdata/${folder}` : 'appdata'),
+  );
   const plan = backupProfiles.planProfiledArchive(profile, listings);
   if (!plan.fits) return plan;
 
