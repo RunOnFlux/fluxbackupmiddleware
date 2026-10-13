@@ -2382,34 +2382,44 @@ function parseJsonList(value) {
 /**
  * The backup profile of each component of an app, or null for a full backup.
  *
- * Read from the enterprise discovery cache, which holds the decrypted repotags
- * of every enterprise app, and from the public spec otherwise. Never throws: a
- * profile only ever narrows what is archived, so when it cannot be resolved the
- * full backup is the safe answer.
+ * Matched by the app's and the components' names, which the middleware always
+ * has, and by the images where they are known: from the enterprise discovery
+ * cache, which holds the decrypted specs, or from the public spec otherwise.
+ * An enterprise spec read from the chain has an empty compose, so the images
+ * are a help and never a requirement. Never throws: a profile only ever
+ * narrows what is archived, so when it cannot be resolved the full backup is
+ * the safe answer.
  */
 async function resolveBackupProfiles(appname, componentList) {
   try {
     let specComponentNames = null;
-    let repotags = null;
+    let specRepotags = null;
     const rows = await dbCli.execute(
       'SELECT components, repotags FROM enterprise_app_discovery WHERE appname = ?',
       [appname],
     );
     if (rows.length > 0) {
       specComponentNames = parseJsonList(rows[0].components);
-      repotags = parseJsonList(rows[0].repotags);
+      specRepotags = parseJsonList(rows[0].repotags);
     }
-    if (!specComponentNames || !repotags || repotags.length === 0) {
+    if (!specComponentNames || specComponentNames.length === 0) {
       const spec = await fluxOS.getAppSpecs(appname);
       if (spec && Array.isArray(spec.compose) && spec.compose.length > 0) {
         specComponentNames = spec.compose.map((component) => component.name);
-        repotags = spec.compose.map((component) => component.repotag);
+        specRepotags = spec.compose.map((component) => component.repotag);
       } else if (spec && spec.repotag) {
         specComponentNames = [spec.name];
-        repotags = [spec.repotag];
+        specRepotags = [spec.repotag];
       }
     }
-    const profiles = backupProfiles.resolveComponentProfiles(componentList, specComponentNames, repotags);
+    const repotags = {};
+    (specComponentNames || []).forEach((name, index) => {
+      if (specRepotags && specRepotags[index]) repotags[name] = specRepotags[index];
+    });
+    const profiles = backupProfiles.resolveComponentProfiles(appname, componentList, {
+      repotags,
+      componentCount: specComponentNames ? specComponentNames.length : null,
+    });
     if (profiles) {
       log.info(`Backup profiles for ${appname}: ${Object.entries(profiles).map(([component, profile]) => `${component}=${profile.id}`).join(', ')}`);
     }

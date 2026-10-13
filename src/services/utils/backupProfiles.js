@@ -9,24 +9,35 @@ const defaultProfiles = require('../../../config/backupProfiles');
  */
 const PROFILE_MARKER_DIR = '.flux-backup';
 
+const pattern = (source) => (source ? new RegExp(source, 'i') : null);
+
 /**
- * The image a repotag names, without registry host, tag or digest, lowercased.
- * `docker.io/Foo/bar:1.2@sha256:...` -> `foo/bar`.
+ * Whether a profile's `match` names this component. The games hub's rule
+ * (catalog.js appMatchesEntry), applied to one component rather than to the
+ * whole app: any one criterion is enough, and the app's name counts only when
+ * the app has no other component it could mean.
+ *
+ * @param {object} match - { name, component, repotag }, regular expression sources
+ * @param {object} target
+ * @param {string} target.appname
+ * @param {string} target.component
+ * @param {string|null} target.repotag - null when it is not known
+ * @param {number} target.componentCount - how many components the app has
  */
-function imageOf(repotag) {
-  let image = String(repotag || '').trim().toLowerCase();
-  [image] = image.split('@');
-  const lastSlash = image.lastIndexOf('/');
-  const lastColon = image.lastIndexOf(':');
-  if (lastColon > lastSlash) image = image.slice(0, lastColon);
-  image = image.replace(/^(docker\.io|index\.docker\.io|registry-1\.docker\.io)\//, '');
-  return image;
+function matchesComponent(match, {
+  appname, component, repotag, componentCount,
+}) {
+  const m = match || {};
+  const byComponent = pattern(m.component);
+  const byImage = pattern(m.repotag);
+  const byName = pattern(m.name);
+  if (byComponent && byComponent.test(String(component || ''))) return true;
+  if (byImage && repotag && byImage.test(String(repotag))) return true;
+  return Boolean(byName && componentCount === 1 && byName.test(String(appname || '')));
 }
 
-function profileForRepotag(repotag, profiles = defaultProfiles) {
-  const image = imageOf(repotag);
-  if (!image) return null;
-  return profiles.find((profile) => profile.images.some((candidate) => imageOf(candidate) === image)) || null;
+function profileForComponent(target, profiles = defaultProfiles) {
+  return profiles.find((profile) => matchesComponent(profile.match, target)) || null;
 }
 
 /**
@@ -36,19 +47,26 @@ function profileForRepotag(repotag, profiles = defaultProfiles) {
  * profiled archive with appendbackuptask would stop the app for the full
  * archive anyway and save nothing.
  *
- * @param {string[]} componentNames - the components to back up
- * @param {string[]} specComponentNames - component names as the spec lists them
- * @param {string[]} repotags - repotags in the same order as specComponentNames
+ * @param {string} appname
+ * @param {string[]} componentNames - the components being backed up
+ * @param {object} [known]
+ * @param {Object<string, string>} [known.repotags] - component name -> repotag, where known
+ * @param {number} [known.componentCount] - how many components the app has, when
+ *   known; otherwise the components being backed up are taken to be all of them
  * @returns {Object<string, object>|null} component name -> profile
  */
-function resolveComponentProfiles(componentNames, specComponentNames, repotags, profiles = defaultProfiles) {
+function resolveComponentProfiles(appname, componentNames, known = {}, profiles = defaultProfiles) {
   if (!Array.isArray(componentNames) || componentNames.length === 0) return null;
-  if (!Array.isArray(specComponentNames) || !Array.isArray(repotags)) return null;
+  const repotags = known.repotags || {};
+  const componentCount = known.componentCount || componentNames.length;
   const result = {};
   for (let i = 0; i < componentNames.length; i += 1) {
-    const index = specComponentNames.indexOf(componentNames[i]);
-    if (index === -1) return null;
-    const profile = profileForRepotag(repotags[index], profiles);
+    const profile = profileForComponent({
+      appname,
+      component: componentNames[i],
+      repotag: repotags[componentNames[i]] || null,
+      componentCount,
+    }, profiles);
     if (!profile) return null;
     result[componentNames[i]] = profile;
   }
@@ -90,8 +108,8 @@ function planProfiledArchive(profile, listings) {
 
 module.exports = {
   PROFILE_MARKER_DIR,
-  imageOf,
-  profileForRepotag,
+  matchesComponent,
+  profileForComponent,
   resolveComponentProfiles,
   planProfiledArchive,
 };

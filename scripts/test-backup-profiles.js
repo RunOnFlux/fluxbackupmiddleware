@@ -44,7 +44,9 @@ const NODE = 'http://10.0.0.2:16127';
 const APP = 'dragonwilds1790000000000';
 const COMPONENT = 'dragonwilds';
 const IMAGE = 'indifferentbroccoli/runescape-dragonwilds-server-docker:latest';
-const profile = backupProfiles.profileForRepotag(IMAGE);
+const profile = backupProfiles.profileForComponent({
+  appname: APP, component: COMPONENT, repotag: IMAGE, componentCount: 1,
+});
 const success = (data) => ({ status: 200, headers: {}, data: { status: 'success', data } });
 const missing = () => ({
   status: 200,
@@ -99,18 +101,26 @@ async function main() {
 
   try {
     // --- matching ------------------------------------------------------------
-    assert.strictEqual(backupProfiles.imageOf('Docker.io/Foo/Bar:1.2@sha256:abc'), 'foo/bar');
-    assert.strictEqual(backupProfiles.imageOf('ghcr.io/acemod/arma-reforger:latest'), 'ghcr.io/acemod/arma-reforger');
-    assert.strictEqual(backupProfiles.imageOf('localhost:5000/img'), 'localhost:5000/img');
+    // The games hub's rule: the game is named by the app, the component or the
+    // image, and any one is enough.
     assert.strictEqual(profile.id, 'dragonwilds-world');
-    assert.strictEqual(backupProfiles.profileForRepotag('indifferentbroccoli/runescape-dragonwilds-server-docker'), profile);
-    assert.strictEqual(backupProfiles.profileForRepotag('lloesche/valheim-server:latest'), null);
+    const byComponent = (component, extra = {}) => backupProfiles.profileForComponent({
+      appname: 'x1', component, repotag: null, componentCount: 1, ...extra,
+    });
+    assert.strictEqual(byComponent('dragonwilds'), profile, 'hub plan component');
+    assert.strictEqual(byComponent('DragonwildsDragonwilds'), profile, 'marketplace component, any case');
+    assert.strictEqual(byComponent('web', { repotag: 'runonflux/dragonwilds-server:2.0' }), profile, 'our own image would still match');
+    assert.strictEqual(byComponent('web', { appname: 'dragonwilds1790000000000' }), profile, 'app name, single component');
+    assert.strictEqual(byComponent('web', { appname: 'dragonwilds1790000000000', componentCount: 2 }), null, 'app name says nothing about which of several components');
+    assert.strictEqual(byComponent('mydragonwilds'), null, 'component rule is anchored, as in the hub');
+    assert.strictEqual(byComponent('valheim', { repotag: 'lloesche/valheim-server:latest', appname: 'valheim1' }), null);
 
-    const resolved = backupProfiles.resolveComponentProfiles([COMPONENT], [COMPONENT], [IMAGE]);
+    // No image needed: an enterprise spec read from the chain has none.
+    const resolved = backupProfiles.resolveComponentProfiles(APP, [COMPONENT]);
     assert.deepStrictEqual(Object.keys(resolved), [COMPONENT]);
-    assert.strictEqual(backupProfiles.resolveComponentProfiles([COMPONENT, 'db'], [COMPONENT, 'db'], [IMAGE, 'mysql:8']), null, 'all components need a profile');
-    assert.strictEqual(backupProfiles.resolveComponentProfiles(['other'], [COMPONENT], [IMAGE]), null);
-    assert.strictEqual(backupProfiles.resolveComponentProfiles([COMPONENT], null, null), null);
+    assert.strictEqual(backupProfiles.resolveComponentProfiles(APP, [COMPONENT, 'db']), null, 'all components need a profile');
+    assert.strictEqual(backupProfiles.resolveComponentProfiles('dragonwilds1', ['web'], { componentCount: 3 }), null);
+    assert.strictEqual(backupProfiles.resolveComponentProfiles(APP, []), null);
 
     // --- planning ------------------------------------------------------------
     const plan = backupProfiles.planProfiledArchive(profile, {
@@ -241,6 +251,15 @@ async function main() {
     });
     const profiles = await backupHooks.resolveBackupProfiles(APP, [COMPONENT]);
     assert.strictEqual(profiles[COMPONENT].id, 'dragonwilds-world');
+
+    // Not in the discovery cache, and the chain's enterprise spec has an empty
+    // compose: the names alone still resolve it.
+    routes = [{
+      match: (r) => r.url.startsWith('https://api.runonflux.io/apps/appspecifications/'),
+      reply: () => success({ name: 'dragonwilds1790000000001', version: 8, compose: [] }),
+    }];
+    const fromNames = await backupHooks.resolveBackupProfiles('dragonwilds1790000000001', ['dragonwildsdragonwilds']);
+    assert.strictEqual(fromNames.dragonwildsdragonwilds.id, 'dragonwilds-world');
 
     routes = [{
       match: (r) => r.url.startsWith('https://api.runonflux.io/apps/appspecifications/'),

@@ -2,7 +2,24 @@
  * Backup profiles: apps whose automatic backup archives only the data that
  * cannot be fetched again, instead of the component's whole appdata.
  *
- * A profile is matched by the component's image (the repotag without its tag).
+ * A profile is matched to a component by `match`, the same rule the games hub
+ * (runonflux.com/games, src/games/catalog.js) uses to tell which game an app is,
+ * so the two never disagree. Each is a case-insensitive regular expression and
+ * ANY one of them is enough:
+ *
+ *   component  the component's name
+ *   repotag    the component's image, when it is known (enterprise apps only
+ *              have it once discovery has decrypted the spec)
+ *   name       the app's name, for a single-component app only: in an app with
+ *              several, it says nothing about which component is the game
+ *
+ * Matching names the GAME, not the image, on purpose: the image can change
+ * (our own build replacing a community one) without the game's data moving.
+ * What the profile relies on is the layout of the volume, and that is checked
+ * on the node before every backup (`required`, `mustContain` below). A
+ * component that matches but does not have the layout gets the full backup,
+ * so a wider match can only ever cost a full backup, never lose data.
+ *
  * `include` lists paths RELATIVE TO THE COMPONENT'S APPDATA, so the archive has
  * the same layout as the full one FluxOS's appendbackuptask writes: a restore
  * that unpacks it into appdata puts every file back where it was.
@@ -27,7 +44,10 @@ module.exports = [
     // install (~5.4 GB, ~1.9 GB compressed); the world, its settings and the
     // owner's pak mods are well under 1 MB of it.
     id: 'dragonwilds-world',
-    images: ['indifferentbroccoli/runescape-dragonwilds-server-docker'],
+    // As in the hub's catalogue. Components are `dragonwilds` in the hub's
+    // plans and `dragonwildsdragonwilds` in the marketplace app; the image is
+    // indifferentbroccoli/runescape-dragonwilds-server-docker today.
+    match: { name: 'dragonwilds', repotag: 'dragonwilds', component: '^dragonwilds' },
     include: [
       // The world .sav files.
       { path: 'RSDragonwilds/Saved/SaveGames', required: true, mustContain: /\.sav$/i },
