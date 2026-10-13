@@ -170,12 +170,20 @@ async function main() {
       /Could not list/,
     );
 
-    // A failed job is an error even though every response was a 200.
+    // A failed job is a failure even though every response was a 200, and it
+    // sends the backup to the full archive rather than failing it.
     routes = [...worldFolders(), anyCreateFolder, ...compressRoute(['Running', 'Failed'])];
-    await assert.rejects(
-      fluxOS.testHooks.createProfiledArchiveOnNode(NODE, 'auth', APP, COMPONENT, profile, []),
-      /compressobject Failed: tar: disk full/,
-    );
+    outcome = await fluxOS.testHooks.createProfiledArchiveOnNode(NODE, 'auth', APP, COMPONENT, profile, []);
+    assert.deepStrictEqual(outcome, { fits: false, archiveFailed: true, reason: 'compressobject Failed: tar: disk full' });
+
+    // A FluxOS older than 8.18 has no compressobject: the same.
+    routes = [...worldFolders(), anyCreateFolder, {
+      match: (r) => r.url === `${NODE}/apps/compressobject`,
+      reply: () => ({ status: 404, headers: {}, data: 'Cannot POST /apps/compressobject' }),
+    }];
+    outcome = await fluxOS.testHooks.createProfiledArchiveOnNode(NODE, 'auth', APP, COMPONENT, profile, []);
+    assert.strictEqual(outcome.archiveFailed, true);
+    assert(/older than 8\.18/.test(outcome.reason));
 
     // An offered statusUrl on another host is never followed.
     calls.length = 0;
@@ -220,6 +228,27 @@ async function main() {
     const full = calls.find((r) => r.url.endsWith('/apps/appendbackuptask'));
     assert.deepStrictEqual(full.data, { appname: APP, backup: [{ component: COMPONENT, backup: true }] });
     assert(result.diagnostics.some((d) => d.outcome === 'skipped' && /dragonwilds-world does not fit/.test(d.detail)));
+
+    // The node cannot write the partial archive -> the full backup, not no backup.
+    calls.length = 0;
+    routes = [
+      ...worldFolders(),
+      anyCreateFolder,
+      {
+        match: (r) => r.url === `${NODE}/apps/compressobject`,
+        reply: () => ({ status: 404, headers: {}, data: 'Cannot POST /apps/compressobject' }),
+      },
+      {
+        match: (r) => r.url === `${NODE}/apps/appendbackuptask`,
+        reply: () => ({ status: 200, headers: {}, data: 'Finalizing...\n' }),
+      },
+      ...listingRoutes,
+    ];
+    result = await fluxOS.createBackupTaskOnNode(NODE, 'auth', APP, [COMPONENT], { [COMPONENT]: profile });
+    assert.strictEqual(result.status, 'completed');
+    assert.strictEqual(result.components[0].profile, null);
+    assert(calls.some((r) => r.url.endsWith('/apps/appendbackuptask')));
+    assert(result.diagnostics.some((d) => d.outcome === 'skipped' && /dragonwilds-world archive failed: .*older than 8\.18/.test(d.detail)));
 
     // No profile -> unchanged behaviour.
     calls.length = 0;

@@ -1117,9 +1117,12 @@ async function compressOnNode(node, zelidAuth, payload) {
  * No stop is needed: backups are taken on the secondary, where a g: app's
  * container does not run, and the archive is written in well under a second.
  *
- * @returns {Promise<{fits: boolean, reason?: string}>} fits:false when the app
- *   does not have the profile's layout; the caller then takes the full backup
- * @throws on a node or transport failure
+ * @returns {Promise<{fits: boolean, archiveFailed?: boolean, reason?: string}>}
+ *   fits:false when the app does not have the profile's layout, or (archiveFailed)
+ *   when the node could not write the partial archive; the caller then takes the
+ *   full backup either way
+ * @throws when the profile's paths cannot be listed, so a transient failure is
+ *   retried on another node rather than read as a missing layout
  */
 async function createProfiledArchiveOnNode(node, zelidAuth, appname, component, profile, diagnostics) {
   const listings = {};
@@ -1130,17 +1133,25 @@ async function createProfiledArchiveOnNode(node, zelidAuth, appname, component, 
   const plan = backupProfiles.planProfiledArchive(profile, listings);
   if (!plan.fits) return plan;
 
-  await ensureVolumeFolder(node, zelidAuth, appname, component, `appdata/${backupProfiles.PROFILE_MARKER_DIR}`);
-  // appendbackuptask makes backup/local itself; on a node that never ran one it is not there yet.
-  await ensureVolumeFolder(node, zelidAuth, appname, component, 'backup');
-  await ensureVolumeFolder(node, zelidAuth, appname, component, 'backup/local');
-  await compressOnNode(node, zelidAuth, {
-    appname,
-    component,
-    source: plan.sources,
-    destination: `backup/local/backup_${component.toLowerCase()}.tar.gz`,
-    overwrite: true,
-  });
+  // From here on a failure is the node not writing the partial archive: a
+  // FluxOS older than 8.18 without compressobject, a refused or failed job.
+  // appendbackuptask can still take the full one, as it did before
+  // profiles existed. Never a reason to leave the app with no backup at all.
+  try {
+    await ensureVolumeFolder(node, zelidAuth, appname, component, `appdata/${backupProfiles.PROFILE_MARKER_DIR}`);
+    // appendbackuptask makes backup/local itself; on a node that never ran one it is not there yet.
+    await ensureVolumeFolder(node, zelidAuth, appname, component, 'backup');
+    await ensureVolumeFolder(node, zelidAuth, appname, component, 'backup/local');
+    await compressOnNode(node, zelidAuth, {
+      appname,
+      component,
+      source: plan.sources,
+      destination: `backup/local/backup_${component.toLowerCase()}.tar.gz`,
+      overwrite: true,
+    });
+  } catch (error) {
+    return { fits: false, archiveFailed: true, reason: error?.message || String(error) };
+  }
 
   diagnostics.push({
     check: `Flux node profiled archive (${component})`,
@@ -1180,12 +1191,13 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList, c
         if (outcome.fits) {
           usedProfiles[component] = profile.id;
         } else {
-          log.info(`Backup profile ${profile.id} does not fit ${appname}/${component} (${outcome.reason}); taking the full backup instead`);
+          const why = outcome.archiveFailed ? 'archive failed' : 'does not fit';
+          log.info(`Backup profile ${profile.id} ${why} for ${appname}/${component} (${outcome.reason}); taking the full backup instead`);
           diagnostics.push({
             check: `Backup profile (${component})`,
             outcome: 'skipped',
             node,
-            detail: `${profile.id} does not fit: ${outcome.reason}`,
+            detail: `${profile.id} ${why}: ${outcome.reason}`,
           });
           profiled = false;
         }
