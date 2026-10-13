@@ -334,7 +334,7 @@ class DBClient {
   */
   async getUserBackups(owner, appname) {
     if (!this.connected) await this.init();
-    const result = await this.execute('SELECT timestamp, component, hash, filesize FROM tasks where owner = ? and appname = ? and uploaded = 1 and removedFromFluxdrive = 0 order by timestamp', [owner, appname]);
+    const result = await this.execute('SELECT timestamp, component, hash, filesize, backup_profile FROM tasks where owner = ? and appname = ? and uploaded = 1 and removedFromFluxdrive = 0 order by timestamp', [owner, appname]);
     if (result.length) {
       return result;
     }
@@ -556,6 +556,25 @@ class DBClient {
       log.info('reconciliationRecovered column added successfully');
     } else {
       log.info('reconciliationRecovered column already exists, moving on...');
+    }
+
+    const backupProfileColumnCheck = await this.query(`
+      SELECT COLUMN_NAME
+      FROM INFORMATION_SCHEMA.COLUMNS
+      WHERE TABLE_SCHEMA = '${this.InitDB}'
+      AND TABLE_NAME = 'tasks'
+      AND COLUMN_NAME = 'backup_profile'
+    `);
+
+    if (backupProfileColumnCheck.length === 0) {
+      log.info('Adding backup_profile column to tasks table...');
+      await this.query(`
+        ALTER TABLE tasks
+        ADD COLUMN backup_profile VARCHAR(64) DEFAULT NULL AFTER backup_type
+      `);
+      log.info('backup_profile column added successfully');
+    } else {
+      log.info('backup_profile column already exists, moving on...');
     }
 
     // Add index on backup_type for faster queries

@@ -14,6 +14,7 @@ const fluxDrive = require('./fluxDrive');
 const fluxOS = require('./fluxOsService');
 const marketplaceService = require('./marketplaceService');
 const enterpriseDiscoveryCache = require('./utils/enterpriseDiscoveryCache');
+const backupProfiles = require('./utils/backupProfiles');
 const discordNotifier = require('./discordNotifier');
 const dailyBackupReport = require('./utils/dailyBackupReport');
 const {
@@ -1454,12 +1455,14 @@ async function registerBackupTask(req, res, taskObj = null) {
   let filesize;
   let owner;
   let backupType;
+  let backupProfile = null;
 
   // If taskObj is provided, use its values; otherwise extract from request
   if (taskObj) {
     ({
       appname, component, timestamp, host, filesize, owner, filename, backup_type: backupType,
     } = taskObj);
+    backupProfile = taskObj.backup_profile || null;
     // Default to 'manual' if not specified in taskObj
     backupType = backupType || 'manual';
   } else {
@@ -1559,6 +1562,7 @@ async function registerBackupTask(req, res, taskObj = null) {
       const newTask = {
         owner, timestamp, filename, appname, component, filesize, host, extra, appExpireHeight, backup_type: backupType,
       };
+      if (backupProfile) newTask.backup_profile = backupProfile;
       const result = await dbCli.addNewTask(newTask);
       taskId = result.insertId;
       if (!taskId) {
@@ -1592,6 +1596,21 @@ async function registerBackupTask(req, res, taskObj = null) {
  * @param {Object} res - The response object.
  * @throws Will throw an error if the user session is invalid, application name is invalid, or database operation fails.
  */
+/**
+ * One component of a checkpoint as getbackuplist returns it. `profile` names
+ * the backup profile a partial archive was taken with, and is absent on a full
+ * one: a client restoring a partial archive must not clear appdata first.
+ */
+function checkpointComponent(row) {
+  const entry = {
+    component: row.component,
+    file_url: `https://jetpack2_38080.app.runonflux.io/ipfs/${row.hash}`,
+    file_size: row.filesize,
+  };
+  if (row.backup_profile) entry.profile = row.backup_profile;
+  return entry;
+}
+
 async function getBackupList(req, res) {
   let { appname } = req.body || {};
   appname = appname || (req.query || {}).appname;
@@ -1643,12 +1662,12 @@ async function getBackupList(req, res) {
       let i = 0;
       for (; i < result.length; i += 1) {
         if (Object.prototype.hasOwnProperty.call(temp, result[i].timestamp)) {
-          temp[result[i].timestamp].components.push({ component: result[i].component, file_url: `https://jetpack2_38080.app.runonflux.io/ipfs/${result[i].hash}`, file_size: result[i].filesize });
+          temp[result[i].timestamp].components.push(checkpointComponent(result[i]));
         } else {
           if (i > 0) {
             checkpoints.push({ timestamp: result[i - 1].timestamp, components: temp[result[i - 1].timestamp].components });
           }
-          temp[result[i].timestamp] = { components: [{ component: result[i].component, file_url: `https://jetpack2_38080.app.runonflux.io/ipfs/${result[i].hash}`, file_size: result[i].filesize }] };
+          temp[result[i].timestamp] = { components: [checkpointComponent(result[i])] };
         }
       }
       checkpoints.push({ timestamp: result[i - 1].timestamp, components: temp[result[i - 1].timestamp].components });
@@ -2347,6 +2366,70 @@ async function persistAutomaticBackupCompletion(
   }]);
 }
 
+function parseJsonList(value) {
+  if (Array.isArray(value)) return value;
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : null;
+    } catch (error) {
+      return null;
+    }
+  }
+  return null;
+}
+
+/**
+ * The backup profile of each component of an app, or null for a full backup.
+ *
+ * Matched by the app's and the components' names, which the middleware always
+ * has, and by the images where they are known: from the enterprise discovery
+ * cache, which holds the decrypted specs, or from the public spec otherwise.
+ * An enterprise spec read from the chain has an empty compose, so the images
+ * are a help and never a requirement. Never throws: a profile only ever
+ * narrows what is archived, so when it cannot be resolved the full backup is
+ * the safe answer.
+ */
+async function resolveBackupProfiles(appname, componentList) {
+  try {
+    let specComponentNames = null;
+    let specRepotags = null;
+    const rows = await dbCli.execute(
+      'SELECT components, repotags FROM enterprise_app_discovery WHERE appname = ?',
+      [appname],
+    );
+    if (rows.length > 0) {
+      specComponentNames = parseJsonList(rows[0].components);
+      specRepotags = parseJsonList(rows[0].repotags);
+    }
+    if (!specComponentNames || specComponentNames.length === 0) {
+      const spec = await fluxOS.getAppSpecs(appname);
+      if (spec && Array.isArray(spec.compose) && spec.compose.length > 0) {
+        specComponentNames = spec.compose.map((component) => component.name);
+        specRepotags = spec.compose.map((component) => component.repotag);
+      } else if (spec && spec.repotag) {
+        specComponentNames = [spec.name];
+        specRepotags = [spec.repotag];
+      }
+    }
+    const repotags = {};
+    (specComponentNames || []).forEach((name, index) => {
+      if (specRepotags && specRepotags[index]) repotags[name] = specRepotags[index];
+    });
+    const profiles = backupProfiles.resolveComponentProfiles(appname, componentList, {
+      repotags,
+      componentCount: specComponentNames ? specComponentNames.length : null,
+    });
+    if (profiles) {
+      log.info(`Backup profiles for ${appname}: ${Object.entries(profiles).map(([component, profile]) => `${component}=${profile.id}`).join(', ')}`);
+    }
+    return profiles;
+  } catch (error) {
+    log.warn(`Could not resolve backup profiles for ${appname}, taking the full backup: ${getErrorMessage(error)}`);
+    return null;
+  }
+}
+
 async function processAutomaticBackupInternal() {
   const maxRetries = 3;
   let retryCount = 0;
@@ -2458,10 +2541,14 @@ async function processAutomaticBackupInternal() {
         const { owner } = ownerResult;
 
         // Create backup task on node
+        const componentProfiles = await resolveBackupProfiles(appname, componentList);
         const backupResult = await fluxOS.createBackupTaskWithTeamCredentials(
           node,
           appname,
           componentList,
+          undefined,
+          undefined,
+          componentProfiles,
         );
         attemptDiagnostics.push(...(backupResult?.diagnostics || []));
         if (!backupResult || backupResult.status === 'failed' || !backupResult.components) {
@@ -2493,6 +2580,7 @@ async function processAutomaticBackupInternal() {
               owner,
               filename: componentData.backups.name,
               backup_type: 'automatic',
+              backup_profile: componentData.profile || null,
             };
 
             try {
@@ -2886,6 +2974,8 @@ module.exports = {
   forceSyncSyncthingApps,
   testHooks: {
     enforceAppBackupRetention,
+    resolveBackupProfiles,
+    checkpointComponent,
     claimNextAutomaticBackup,
     persistAutomaticBackupCompletion,
     runAutomaticBackupDispatcher,

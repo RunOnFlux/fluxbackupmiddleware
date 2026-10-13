@@ -6,6 +6,7 @@
   "scripts": {
     "test": "node index.js",
     "test:automatic-backup-dispatch": "node scripts/test-automatic-backup-dispatch.js",
+    "test:backup-profiles": "node scripts/test-backup-profiles.js",
     "test:concurrent-downloads": "node scripts/test-concurrent-task-downloads.js",
     "test:db-client-resilience": "node scripts/test-db-client-resilience.js",
     "test:daily-backup-report": "node scripts/test-daily-backup-report.js",
