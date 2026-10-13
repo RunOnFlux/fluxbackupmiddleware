@@ -23,3 +23,19 @@ npm start
 ```
 
 Service will be started on 127.0.0.1:2052
+
+## Admin UI
+
+Open `/admin/` on the service host. Add the wallet addresses allowed to sign in to the ignored `secrets.json` file:
+
+```json
+{
+  "adminAddresses": ["YOUR_FLUX_ADDRESS", "0xYOUR_ETHEREUM_ADDRESS"]
+}
+```
+
+Keep the existing secret keys in that file. Restart the service after changing the list. An empty or missing list denies every admin login. Use **Open Zelcore to sign**, or sign the displayed one-time message in another compatible wallet and paste the address and signature. Each challenge lasts five minutes and can be used once. Admin sessions last eight hours and are invalidated at logout or service restart.
+
+The dashboard counts completed backup files and bytes from active task records. Its seven-day chart uses UTC calendar days. New marketplace app tracking begins when this schema update is installed; older apps have no known first-seen date.
+
+Serve the admin UI over HTTPS. TLS may terminate at a load balancer that forwards HTTP to this service; no proxy trust setting is needed. Session cookies are Secure, HttpOnly, and SameSite=Strict. Login, logout, and wallet session redemption require an HTTPS same-origin browser request. For local HTTP development only, set `ADMIN_COOKIE_SECURE=false`. The log search API reads log files in chunks and sends only 50 matching lines at a time.

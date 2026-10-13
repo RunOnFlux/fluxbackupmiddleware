@@ -806,6 +806,61 @@ async function getQuotaPruningCandidates(task) {
   `, [task.owner, task.appname, task.timestamp, TASK_MAX_FAILURES]);
 }
 
+async function enforceAppBackupRetention(owner, appname) {
+  return runUserQuotaOperation(owner, async () => {
+    const limit = Number(config.maxUploadedBackupsPerApp);
+    if (!Number.isInteger(limit) || limit < 1) {
+      throw new Error('maxUploadedBackupsPerApp must be a positive integer');
+    }
+    const tasks = await dbCli.execute(`
+      SELECT retained.taskId, retained.appname, retained.timestamp, retained.hash,
+        retained.filesize
+      FROM tasks retained
+      WHERE retained.owner = ? AND retained.appname = ?
+        AND retained.uploaded = 1 AND retained.finishTime > 0
+        AND retained.removedFromFluxdrive = 0
+        AND retained.hash IS NOT NULL AND retained.hash <> ''
+        AND NOT EXISTS (
+          SELECT 1 FROM tasks pending
+          WHERE pending.owner = retained.owner AND pending.appname = retained.appname
+            AND pending.timestamp = retained.timestamp
+            AND pending.removedFromFluxdrive = 0
+            AND (pending.uploaded = 0 OR pending.finishTime = 0)
+        )
+    `, [owner, appname]);
+    const batches = groupBackupTasksByAge(tasks);
+    const excess = batches.slice(0, Math.max(0, batches.length - limit));
+    for (let i = 0; i < excess.length; i += 1) {
+      const batch = excess[i];
+      for (let j = 0; j < batch.tasks.length; j += 1) {
+        const oldTask = batch.tasks[j];
+        const result = await fluxDrive.removeFileVerified(oldTask.hash);
+        const error = getFluxDriveRemovalError(result);
+        if (error) throw new Error(`App retention removal failed for ${oldTask.taskId}: ${error}`);
+        const update = await dbCli.softRemoveTask(oldTask.taskId);
+        if (update?.affectedRows !== 1) {
+          throw new Error(`App retention could not record removal of ${oldTask.taskId}`);
+        }
+        log.info(`App retention removed task ${oldTask.taskId}: app=${appname}, limit=${limit}`);
+      }
+    }
+  });
+}
+
+async function sweepAppBackupRetention() {
+  const apps = await dbCli.execute(`
+    SELECT DISTINCT owner, appname FROM tasks
+    WHERE uploaded = 1 AND finishTime > 0 AND removedFromFluxdrive = 0
+  `);
+  for (let i = 0; i < apps.length; i += 1) {
+    try {
+      await enforceAppBackupRetention(apps[i].owner, apps[i].appname);
+    } catch (error) {
+      log.error(`App retention cleanup failed for ${apps[i].appname}: ${getErrorMessage(error)}`);
+    }
+  }
+}
+
 async function ensureUserQuotaForDownloadedTask(task) {
   return runUserQuotaOperation(task.owner, async () => {
     const quotaLimit = getQuotaLimitBytes();
@@ -935,6 +990,12 @@ async function runTask(id) {
     task.extra = '';
     await dbCli.updateTask(task);
     await recordTaskActivity(task, 'success', 'completed', 'finished');
+
+    try {
+      await enforceAppBackupRetention(task.owner, task.appname);
+    } catch (error) {
+      log.error(`App retention cleanup failed for ${task.appname}: ${getErrorMessage(error)}`);
+    }
   } catch (error) {
     const message = getErrorMessage(error);
     const deferredForStorage = error.deferWithoutFailure === true;
@@ -1083,8 +1144,8 @@ async function checkExpiredApps() {
 const { normalizeAppName } = enterpriseDiscoveryCache;
 
 const AUTOMATIC_BACKUP_UPSERT_SQL = `INSERT INTO automatic_backups (
-  appname, components, status, expire_counter, last_backup_timestamp, is_marketplace
-) VALUES (?, ?, 'pending', 0, 0, ?)
+  appname, components, status, expire_counter, last_backup_timestamp, is_marketplace, first_seen_at
+) VALUES (?, ?, 'pending', 0, 0, ?, ?)
 ON DUPLICATE KEY UPDATE
   components = VALUES(components),
   expire_counter = 0,
@@ -1099,6 +1160,7 @@ async function upsertAutomaticBackupApp(database, app, isMarketplace) {
     app.appName,
     JSON.stringify(app.componentNames),
     isMarketplace,
+    Date.now(),
   ]);
 }
 
@@ -1128,7 +1190,7 @@ async function syncSyncthingApps() {
 
     if (!discovery) {
       log.error('Failed to fetch apps with Syncthing');
-      return;
+      return { success: false, error: 'Failed to fetch apps with Syncthing' };
     }
     // MySQL's appname key uses a case-insensitive collation, while Map keys are
     // case-sensitive. Canonicalize and de-duplicate the discovery response so
@@ -1295,8 +1357,61 @@ async function syncSyncthingApps() {
       `cache failures=${cacheUpdateFailures}`,
     ].join(', ');
     log.info(`Sync complete. ${syncSummary}.`);
+    return {
+      success: true,
+      discoveredApps: syncthingApps.length,
+      addedApps,
+      insertFailures,
+      classifiedExistingApps,
+      classificationFailures,
+      expiredApps: expiredApps.length - expirationUpdateFailures,
+      expirationUpdateFailures,
+      cacheUpdateFailures,
+    };
   } catch (error) {
     log.error('Error syncing Syncthing apps:', error);
+    return { success: false, error: getErrorMessage(error) };
+  }
+}
+
+async function runSyncthingSyncNow(operation = syncSyncthingApps) {
+  const jobName = 'syncthing-app-sync';
+  if (activeScheduledJobs.has(jobName)) {
+    return { started: false, reason: 'Syncthing discovery is already running' };
+  }
+
+  activeScheduledJobs.add(jobName);
+  try {
+    const result = await operation();
+    return { started: true, result };
+  } finally {
+    activeScheduledJobs.delete(jobName);
+  }
+}
+
+async function forceSyncSyncthingApps(req, res) {
+  if (!isLocalReportRequest(req)) {
+    res.status(403).json({ error: 'This endpoint is available only through localhost' });
+    return;
+  }
+
+  try {
+    const syncRun = await runSyncthingSyncNow();
+    if (!syncRun.started) {
+      res.status(409).json({ status: 'busy', message: syncRun.reason });
+      return;
+    }
+    if (!syncRun.result?.success) {
+      res.status(500).json({
+        status: 'error',
+        message: syncRun.result?.error || 'Syncthing discovery failed',
+      });
+      return;
+    }
+    res.json({ status: 'success', ...syncRun.result });
+  } catch (error) {
+    log.error(`Forced Syncthing discovery failed: ${getErrorMessage(error)}`);
+    res.status(500).json({ status: 'error', message: getErrorMessage(error) });
   }
 }
 
@@ -2329,20 +2444,6 @@ async function processAutomaticBackupInternal() {
         attemptedNodes.add(nodeAddress);
         log.info(`Using node: ${node}`);
 
-        // Get zelidAuth from node
-        const loginResult = await fluxOS.verifyTeamLoginDetailed(node);
-        attemptDiagnostics.push(...loginResult.diagnostics);
-
-        if (!loginResult.zelidAuth) {
-          throw createBackupFailure(
-            loginResult.reason || `Failed to authenticate with ${node}`,
-            'node_auth',
-            [],
-            attemptDiagnostics,
-          );
-        }
-        const { zelidAuth } = loginResult;
-
         // Get app owner
         const ownerResult = await fluxOS.getAppOwnerDetailed(appname);
         attemptDiagnostics.push(...ownerResult.diagnostics);
@@ -2357,12 +2458,16 @@ async function processAutomaticBackupInternal() {
         const { owner } = ownerResult;
 
         // Create backup task on node
-        const backupResult = await fluxOS.createBackupTaskOnNode(node, zelidAuth, appname, componentList);
+        const backupResult = await fluxOS.createBackupTaskWithTeamCredentials(
+          node,
+          appname,
+          componentList,
+        );
         attemptDiagnostics.push(...(backupResult?.diagnostics || []));
         if (!backupResult || backupResult.status === 'failed' || !backupResult.components) {
           throw createBackupFailure(
             backupResult?.error || `Failed to create backup tasks on ${node}`,
-            'create_backup',
+            backupResult?.failureStage || 'create_backup',
             [],
             attemptDiagnostics,
           );
@@ -2713,7 +2818,10 @@ async function init() {
   await dbCli.checkSchema();
   await logFluxDriveStoredSize();
   setTimeout(() => {
-    launchScheduledJob('fluxdrive-reconciliation', reconcileFluxDriveInventory);
+    launchScheduledJob('fluxdrive-reconciliation', async () => {
+      await reconcileFluxDriveInventory();
+      await sweepAppBackupRetention();
+    });
   }, 30 * 1000);
   setInterval(() => {
     launchScheduledJob('task-queue-update', updateQueue);
@@ -2754,6 +2862,7 @@ async function init() {
   setInterval(() => {
     launchScheduledJob('automatic-backup-cleanup', async () => {
       await cleanupOldAutomaticBackups();
+      await sweepAppBackupRetention();
       await reconcileFluxDriveInventory();
     });
   }, 24 * 60 * 60 * 1000); // Run every 24 hours
@@ -2761,6 +2870,7 @@ async function init() {
 
 module.exports = {
   init,
+  getDatabase: () => dbCli,
   registerBackupTask,
   getBackupList,
   getTaskStatus,
@@ -2773,7 +2883,9 @@ module.exports = {
   sendDailyBackupReport,
   getDailyBackupReport,
   forceSendDailyBackupReport,
+  forceSyncSyncthingApps,
   testHooks: {
+    enforceAppBackupRetention,
     claimNextAutomaticBackup,
     persistAutomaticBackupCompletion,
     runAutomaticBackupDispatcher,
@@ -2785,6 +2897,7 @@ module.exports = {
     normalizeAppName,
     upsertAutomaticBackupApp,
     launchScheduledJob,
+    runSyncthingSyncNow,
     setDatabaseForTests: (database) => { dbCli = database; },
   },
 };

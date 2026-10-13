@@ -713,6 +713,19 @@ function reachedCredentialVerification(result) {
   ));
 }
 
+function isExplicitAuthorizationFailure(result) {
+  const diagnostics = result?.diagnostics || [];
+  if (diagnostics.some((diagnostic) => (
+    diagnostic.httpStatus === 401 || diagnostic.httpStatus === 403
+  ))) return true;
+
+  const details = [
+    result?.error,
+    ...diagnostics.map((diagnostic) => diagnostic.detail),
+  ].filter(Boolean).join(' ');
+  return /unauthori[sz]ed|access denied|forbidden|session expired/i.test(details);
+}
+
 async function verifyTeamLoginDetailed(node, verifier = verifyLoginDetailed) {
   const credentials = await getTeamCredentials();
   if (credentials.length === 0) {
@@ -765,36 +778,6 @@ async function verifyTeamLogin(node) {
   return result.zelidAuth || false;
 }
 
-async function createTeamArcaneNodeSessions(
-  sessionFactory = enterpriseCrypto.createArcaneNodeSessions,
-) {
-  const credentials = await getTeamCredentials();
-  for (let index = 0; index < credentials.length; index += 1) {
-    const credential = credentials[index];
-    let sessions = [];
-    try {
-      // eslint-disable-next-line no-await-in-loop
-      sessions = await sessionFactory(
-        credential.zelid,
-        credential.privateKey,
-        enterpriseCrypto.ARCANE_NODE_RETRY_COUNT,
-      );
-    } catch (error) {
-      log.error(`Failed to prepare ArcaneOS sessions with ${credential.label} credentials:`, error.message);
-    }
-    if (sessions.length > 0) {
-      if (credential.label === 'secondary') {
-        log.info('Using secondary team credentials for enterprise decryption');
-      }
-      return sessions;
-    }
-    if (index + 1 < credentials.length) {
-      log.warn('Primary team credentials produced no ArcaneOS sessions; trying secondary credentials');
-    }
-  }
-  return [];
-}
-
 /**
  * Checks whether an app is expired via global app specifications.
  * Expired apps return success with an empty data array.
@@ -825,8 +808,9 @@ async function isAppExpiredInGlobalSpecs(appname) {
 
 /**
  * Retrieves all global app specifications and filters for apps with Syncthing components.
- * Plain apps are checked directly. Enterprise apps (encrypted compose) are decrypted
- * on ArcaneOS nodes before checking containerData prefixes s:, r:, or g:.
+ * Plain apps are checked directly. Enterprise apps (encrypted compose) have their
+ * AES key unwrapped by SAS over mTLS, then are decrypted locally before checking
+ * containerData prefixes s:, r:, or g:.
  *
  * @async
  * @returns {Promise<Object|false>} Discovery results and cache changes, or false on fetch failure.
@@ -885,43 +869,33 @@ async function discoverAppsWithSyncthing(
     });
 
     if (enterpriseAppsToDecrypt.length > 0) {
-      const teamCredentials = await getTeamCredentials();
-      if (teamCredentials.length === 0) {
-        log.error('Complete team Flux credentials are required to decrypt enterprise apps');
+      try {
+        await enterpriseCrypto.assertSasConfigured();
+      } catch (error) {
+        log.error(`SAS enterprise decryption is unavailable: ${error.message}`);
         enterpriseAppsToDecrypt.forEach((app) => unresolvedEnterpriseAppNames.add(app.name));
         decryptFailures = enterpriseAppsToDecrypt.length;
-      } else {
-        const arcaneSessions = await createTeamArcaneNodeSessions();
+      }
 
-        if (arcaneSessions.length === 0) {
-          enterpriseAppsToDecrypt.forEach((app) => unresolvedEnterpriseAppNames.add(app.name));
-          decryptFailures = enterpriseAppsToDecrypt.length;
-        } else {
-          log.info(`Decrypting ${enterpriseAppsToDecrypt.length} new or changed enterprise apps`);
-        }
-
-        if (arcaneSessions.length > 0) {
-          for (let i = 0; i < enterpriseAppsToDecrypt.length; i += 1) {
-            const app = enterpriseAppsToDecrypt[i];
-            try {
-              const decryptedFields = await enterpriseCrypto.decryptEnterpriseSpecWithRetry(
-                app,
-                arcaneSessions,
-              );
-              const decryptedSpec = {
-                ...app,
-                compose: decryptedFields.compose || [],
-                contacts: decryptedFields.contacts || [],
-              };
-              const entry = enterpriseCrypto.buildSyncthingAppEntry(decryptedSpec);
-              if (entry) appsWithSyncthing.push(entry);
-              const cacheUpdate = enterpriseDiscoveryCache.buildCacheUpdate(app, entry);
-              if (cacheUpdate) cacheUpdates.push(cacheUpdate);
-            } catch (error) {
-              decryptFailures += 1;
-              unresolvedEnterpriseAppNames.add(app.name);
-              log.warn(`Failed to decrypt enterprise app ${app.name} after ArcaneOS retries: ${error.message}`);
-            }
+      if (decryptFailures === 0) {
+        log.info(`Decrypting ${enterpriseAppsToDecrypt.length} new or changed enterprise apps through SAS`);
+        for (let i = 0; i < enterpriseAppsToDecrypt.length; i += 1) {
+          const app = enterpriseAppsToDecrypt[i];
+          try {
+            const decryptedFields = await enterpriseCrypto.decryptEnterpriseSpecWithSas(app);
+            const decryptedSpec = {
+              ...app,
+              compose: decryptedFields.compose || [],
+              contacts: decryptedFields.contacts || [],
+            };
+            const entry = enterpriseCrypto.buildSyncthingAppEntry(decryptedSpec);
+            if (entry) appsWithSyncthing.push(entry);
+            const cacheUpdate = enterpriseDiscoveryCache.buildCacheUpdate(app, entry);
+            if (cacheUpdate) cacheUpdates.push(cacheUpdate);
+          } catch (error) {
+            decryptFailures += 1;
+            unresolvedEnterpriseAppNames.add(app.name);
+            log.warn(`Failed to decrypt enterprise app ${app.name} through SAS: ${error.message}`);
           }
         }
       }
@@ -1280,6 +1254,92 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList) {
   }
 }
 
+async function createBackupTaskWithTeamCredentials(
+  node,
+  appname,
+  componentList,
+  verifier = verifyLoginDetailed,
+  backupCreator = createBackupTaskOnNode,
+) {
+  const credentials = await getTeamCredentials();
+  if (credentials.length === 0) {
+    return {
+      appname,
+      status: 'failed',
+      components: [],
+      error: 'No complete team Flux credentials are configured',
+      failureStage: 'node_auth',
+      diagnostics: [{
+        check: 'Team Flux credentials',
+        outcome: 'failed',
+        node,
+        detail: 'Configure teamFluxID/teamPK or teamFluxID2/teamPK2',
+      }],
+    };
+  }
+
+  const diagnostics = [];
+  let lastResult = null;
+  let failureStage = 'node_auth';
+
+  for (let index = 0; index < credentials.length; index += 1) {
+    const credential = credentials[index];
+    // eslint-disable-next-line no-await-in-loop
+    const loginResult = await verifier(credential.zelid, credential.privateKey, node);
+    diagnostics.push(...labelLoginDiagnostics(loginResult.diagnostics, credential.label));
+
+    if (!loginResult.zelidAuth) {
+      lastResult = {
+        appname,
+        status: 'failed',
+        components: [],
+        error: loginResult.reason || `Failed to authenticate with ${node}`,
+      };
+      const hasAnotherCredential = index + 1 < credentials.length;
+      if (!hasAnotherCredential || !reachedCredentialVerification(loginResult)) break;
+      log.warn(`Team authentication with ${credential.label} credentials was rejected by ${node}; trying the next credentials`);
+      // eslint-disable-next-line no-continue
+      continue;
+    }
+
+    // eslint-disable-next-line no-await-in-loop
+    const backupResult = await backupCreator(
+      node,
+      loginResult.zelidAuth,
+      appname,
+      componentList,
+    );
+    lastResult = backupResult;
+    failureStage = 'create_backup';
+    diagnostics.push(...labelLoginDiagnostics(backupResult?.diagnostics, credential.label));
+
+    if (backupResult && backupResult.status !== 'failed' && backupResult.components) {
+      if (credential.label === 'secondary') {
+        log.info(`Backup creation for ${appname} authorized with secondary team credentials`);
+      }
+      return {
+        ...backupResult,
+        diagnostics,
+        credential: credential.label,
+      };
+    }
+
+    const hasAnotherCredential = index + 1 < credentials.length;
+    if (!hasAnotherCredential || !isExplicitAuthorizationFailure(backupResult)) break;
+    log.warn(`Backup creation for ${appname} was denied with ${credential.label} credentials; trying the next credentials`);
+  }
+
+  return {
+    appname,
+    status: 'failed',
+    components: [],
+    error: lastResult?.error || `Failed to create backup tasks on ${node}`,
+    failureStage,
+    diagnostics,
+    credential: null,
+  };
+}
+
 module.exports = {
   getAppSpecs,
   getBlockHeight,
@@ -1294,11 +1354,12 @@ module.exports = {
   isTeamFluxId,
   verifyTeamLoginDetailed,
   verifyTeamLogin,
-  createTeamArcaneNodeSessions,
   discoverAppsWithSyncthing,
   getAppsWithSyncthing,
   isAppExpiredInGlobalSpecs,
   getSecondaryNodeSelection,
   getSecondaryNodeFromHAProxy,
   createBackupTaskOnNode,
+  createBackupTaskWithTeamCredentials,
+  isExplicitAuthorizationFailure,
 };

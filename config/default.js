@@ -13,12 +13,13 @@ module.exports = {
   dbOperationTimeoutMs: 20000,
   dbSlowQueryMs: 2000,
   maxConcurrentTasks: 10,
-  quotaPerUser: 50, // GB
+  quotaPerUser: 20, // GiB
+  maxUploadedBackupsPerApp: 7, // Completed runs per owner/app, including all components
   automaticBackupSchedule: {
     standardIntervalHours: 7 * 24,
     marketplaceIntervalHours: 24,
-    dispatcherIntervalMinutes: 2,
-    maxConcurrentAutomaticBackups: 4,
+    dispatcherIntervalMinutes: 1,
+    maxConcurrentAutomaticBackups: 10,
     dispatcherLeaseMinutes: 6 * 60,
     discordFailureCooldownMinutes: 60,
   },
@@ -30,6 +31,15 @@ module.exports = {
   marketplaceCatalog: {
     url: 'https://api.marketplace.runonflux.io/api/v1/marketplace/apps',
     cacheHours: 24,
+  },
+  sasApi: {
+    baseUrl: process.env.SAS_API_BASE_URL,
+    keyPath: process.env.SAS_API_KEY_PATH,
+    certPath: process.env.SAS_API_CERT_PATH,
+    caPath: process.env.SAS_API_CA_PATH,
+    timeoutMs: Number(process.env.SAS_API_TIMEOUT_MS || 10000),
+    retryAttempts: Number(process.env.SAS_API_RETRY_ATTEMPTS || 4),
+    retryDelayMs: Number(process.env.SAS_API_RETRY_DELAY_MS || 16000),
   },
   // Keep transient backup files in a deterministic location regardless of the
   // process working directory used by PM2.

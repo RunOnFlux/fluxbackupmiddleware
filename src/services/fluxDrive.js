@@ -280,8 +280,6 @@ async function uploadFile(file) {
   const form = new FormData();
   const fileName = filename;
   const fileSize = fs.statSync(filePath).size;
-  const fileStream = fs.createReadStream(filePath);
-  form.append('file', fileStream, { filename: fileName, knownLength: fileSize });
 
   const fullUrl = buildFluxDriveUrl(FD_SERVER, '/api/v0/put');
   const parsedUrl = new URL(fullUrl);
@@ -298,15 +296,29 @@ async function uploadFile(file) {
       Authorization: `Basic ${Buffer.from(`${ZELID}:${API_KEY}`).toString('base64')}`,
     },
   };
+  const fileStream = fs.createReadStream(filePath);
+  form.append('file', fileStream, { filename: fileName, knownLength: fileSize });
   let progress = 0;
   fileStream.on('data', (chunk) => {
     progress += chunk.length;
     file.status = { state: 'uploading', message: 'Uploading file to FluxDrive', progress: Number(((progress / fileSize) * 100).toFixed(2)) };
     // console.log(file.status);
   });
+  let req;
+  const cleanupUpload = async () => {
+    fileStream.unpipe();
+    form.destroy();
+    if (req && !req.destroyed) req.destroy();
+    // Wait for the descriptor to close before callers delete or retry the file.
+    if (!fileStream.closed) {
+      await new Promise((resolve) => {
+        fileStream.once('close', resolve);
+        fileStream.destroy();
+      });
+    }
+  };
   return new Promise((resolve, reject) => {
     let settled = false;
-    let req;
     const failUpload = (error, statusCode = null, responseBody = null) => {
       if (settled) return;
       settled = true;
@@ -376,7 +388,7 @@ async function uploadFile(file) {
     form.on('error', (error) => failUpload(error));
 
     form.pipe(req);
-  });
+  }).finally(cleanupUpload);
 }
 
 async function getFile(req, res) {
