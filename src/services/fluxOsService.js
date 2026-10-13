@@ -10,6 +10,7 @@ const log = require('../lib/log');
 const Vault = require('./Vault');
 const enterpriseCrypto = require('./enterpriseCrypto');
 const enterpriseDiscoveryCache = require('./utils/enterpriseDiscoveryCache');
+const backupProfiles = require('./utils/backupProfiles');
 
 // Create HTTPS agent that accepts insecure connections
 const httpsAgent = new https.Agent({
@@ -928,6 +929,230 @@ async function getAppsWithSyncthing() {
   return discovery ? discovery.apps : false;
 }
 
+const FILE_OPERATION_TERMINAL_STATES = ['Succeeded', 'Failed', 'Canceled', 'Evicted'];
+const FILE_OPERATION_TIMEOUT_MS = 10 * 60 * 1000;
+const FILE_OPERATION_MAX_BUSY_RETRIES = 12;
+
+function isMissingPathResponse(data) {
+  const code = data?.data?.code || data?.code;
+  if (code === 'ENOENT') return true;
+  const message = getSafeApiMessage(data) || '';
+  return /ENOENT|no such file|does not exist/i.test(message);
+}
+
+function retryAfterMs(headers, fallbackSeconds = 5) {
+  const seconds = Number(headers?.['retry-after']);
+  return (Number.isFinite(seconds) && seconds > 0 ? Math.min(seconds, 60) : fallbackSeconds) * 1000;
+}
+
+/**
+ * Ask the node for the full appdata archive of each component
+ * (appendbackuptask), and give it time to write it.
+ */
+async function requestFullBackupOnNode(node, zelidAuth, appname, componentList, diagnostics) {
+  const createEndpoint = `${node}/apps/appendbackuptask`;
+  const backupPayload = {
+    appname,
+    backup: componentList.map((component) => ({
+      component,
+      backup: true,
+    })),
+  };
+
+  // Make the backup request
+  const backupResponse = await axios({
+    method: 'post',
+    url: createEndpoint,
+    headers: {
+      'Content-Type': 'application/json',
+      zelidauth: zelidAuth,
+    },
+    data: backupPayload,
+    timeout: 300000, // 5 minutes timeout for backup process
+    httpsAgent,
+  });
+
+  if (!backupResponse.data) {
+    throw new Error('No response data from backup task creation');
+  }
+  if (backupResponse.data.status === 'error') {
+    throw new Error(
+      getSafeApiMessage(backupResponse.data) || 'Flux node rejected the backup task',
+    );
+  }
+
+  diagnostics.push({
+    check: 'Flux node backup creation',
+    outcome: 'success',
+    endpoint: createEndpoint,
+    node,
+    httpStatus: backupResponse.status,
+    detail: 'Node accepted the backup task',
+  });
+
+  log.info(`Backup task created successfully for ${appname}`);
+
+  // Wait longer for backup creation to ensure files are generated
+  log.info(`Waiting for backup files to be created for ${appname}...`);
+  await new Promise((resolve) => { setTimeout(resolve, 5 * 60 * 1000); }); // Wait 5 minutes
+}
+
+/**
+ * List a directory of a component's volume.
+ *
+ * @param {string} folder - path relative to the volume root (appdata/...)
+ * @returns {Promise<Array|null>} the entries, or null when the directory does not exist
+ * @throws when the node cannot answer, so a transient failure is never read as "missing"
+ */
+async function listVolumeFolder(node, zelidAuth, appname, component, folder) {
+  const endpoint = `${node}/apps/getfolderinfo/${appname}/${component}/${encodeURIComponent(folder)}`;
+  const response = await axios({
+    method: 'get',
+    url: endpoint,
+    headers: { zelidauth: zelidAuth },
+    timeout: 30000,
+    httpsAgent,
+  });
+  const { data } = response;
+  if (data?.status === 'success' && Array.isArray(data.data)) return data.data;
+  if (data?.status === 'error' && isMissingPathResponse(data)) return null;
+  const error = new Error(`Could not list ${folder}: ${getSafeApiMessage(data) || 'unexpected response'}`);
+  error.endpoint = endpoint;
+  throw error;
+}
+
+/** Create a directory on the volume; one that already exists is fine. */
+async function ensureVolumeFolder(node, zelidAuth, appname, component, folder) {
+  const endpoint = `${node}/apps/createfolder/${appname}/${component}/${encodeURIComponent(folder)}`;
+  const response = await axios({
+    method: 'get',
+    url: endpoint,
+    headers: { zelidauth: zelidAuth },
+    timeout: 60000,
+    httpsAgent,
+    validateStatus: () => true,
+  });
+  const { data } = response;
+  if (data?.status === 'success') return;
+  const code = data?.data?.code || data?.code;
+  const message = getSafeApiMessage(data) || `HTTP ${response.status}`;
+  if (code === 'EEXIST' || /already exists|file exists/i.test(message)) return;
+  const error = new Error(`Could not create ${folder}: ${message}`);
+  error.endpoint = endpoint;
+  throw error;
+}
+
+/**
+ * Run compressobject and wait for it to finish.
+ *
+ * The node answers 200 when the archive was written inline, 202 with a job to
+ * poll when it continues in the background, and 503 with Retry-After when
+ * another operation holds this app's volume. A job's outcome is its status
+ * field, never the HTTP code: a failed job is a 200 that says Failed.
+ */
+async function compressOnNode(node, zelidAuth, payload) {
+  const endpoint = `${node}/apps/compressobject`;
+  let response;
+  for (let attempt = 0; ; attempt += 1) {
+    response = await axios({
+      method: 'post',
+      url: endpoint,
+      headers: { 'Content-Type': 'application/json', zelidauth: zelidAuth },
+      data: payload,
+      timeout: 60000,
+      httpsAgent,
+      validateStatus: () => true,
+    });
+    if (response.status !== 503 || attempt >= FILE_OPERATION_MAX_BUSY_RETRIES) break;
+    const waitMs = retryAfterMs(response.headers);
+    await new Promise((resolve) => { setTimeout(resolve, waitMs); });
+  }
+
+  const body = response.data;
+  if (response.status === 404) {
+    throw new Error('Node does not support compressobject (FluxOS older than 8.18.0)');
+  }
+  if (response.status === 202 && body?.data?.jobId) {
+    const offered = body.data.statusUrl;
+    // Only a path on this node: an offered URL naming another host would carry the zelidauth there.
+    const statusPath = typeof offered === 'string' && offered.startsWith('/') && !offered.startsWith('//')
+      ? offered
+      : `/apps/operations/${body.data.jobId}`;
+    const giveUpAt = Date.now() + FILE_OPERATION_TIMEOUT_MS;
+    let failures = 0;
+    while (Date.now() < giveUpAt) {
+      await new Promise((resolve) => { setTimeout(resolve, 2000); });
+      try {
+        const poll = await axios({
+          method: 'get',
+          url: `${node}${statusPath}`,
+          headers: { zelidauth: zelidAuth },
+          timeout: 30000,
+          httpsAgent,
+        });
+        const view = poll.data?.data || {};
+        if (FILE_OPERATION_TERMINAL_STATES.includes(view.status)) {
+          if (view.status === 'Succeeded') return;
+          throw new Error(`compressobject ${view.status}: ${view.error?.detail || view.error?.title || 'no detail'}`);
+        }
+        failures = 0;
+      } catch (error) {
+        if (/^compressobject /.test(error.message)) throw error;
+        failures += 1;
+        if (failures >= 3) throw error;
+      }
+    }
+    throw new Error('compressobject did not finish within 10 minutes');
+  }
+  if (response.status < 200 || response.status >= 300 || body?.status === 'error') {
+    throw new Error(`compressobject refused: ${getSafeApiMessage(body) || `HTTP ${response.status}`}`);
+  }
+}
+
+/**
+ * Write a profile's partial archive where appendbackuptask writes the full one,
+ * backup/local/backup_<component>.tar.gz, so everything after this - the
+ * readiness check, the download and the upload - is the same for both.
+ *
+ * No stop is needed: backups are taken on the secondary, where a g: app's
+ * container does not run, and the archive is written in well under a second.
+ *
+ * @returns {Promise<{fits: boolean, reason?: string}>} fits:false when the app
+ *   does not have the profile's layout; the caller then takes the full backup
+ * @throws on a node or transport failure
+ */
+async function createProfiledArchiveOnNode(node, zelidAuth, appname, component, profile, diagnostics) {
+  const listings = {};
+  for (let i = 0; i < profile.include.length; i += 1) {
+    const entry = profile.include[i];
+    listings[entry.path] = await listVolumeFolder(node, zelidAuth, appname, component, `appdata/${entry.path}`);
+  }
+  const plan = backupProfiles.planProfiledArchive(profile, listings);
+  if (!plan.fits) return plan;
+
+  await ensureVolumeFolder(node, zelidAuth, appname, component, `appdata/${backupProfiles.PROFILE_MARKER_DIR}`);
+  // appendbackuptask makes backup/local itself; on a node that never ran one it is not there yet.
+  await ensureVolumeFolder(node, zelidAuth, appname, component, 'backup');
+  await ensureVolumeFolder(node, zelidAuth, appname, component, 'backup/local');
+  await compressOnNode(node, zelidAuth, {
+    appname,
+    component,
+    source: plan.sources,
+    destination: `backup/local/backup_${component.toLowerCase()}.tar.gz`,
+    overwrite: true,
+  });
+
+  diagnostics.push({
+    check: `Flux node profiled archive (${component})`,
+    outcome: 'success',
+    endpoint: `${node}/apps/compressobject`,
+    node,
+    detail: `${profile.id}: ${plan.sources.join(', ')}`,
+  });
+  log.info(`Profiled archive ${profile.id} written for ${appname}/${component}: ${plan.sources.join(', ')}`);
+  return { fits: true };
+}
+
 /**
  * Creates a backup task for an application and retrieves backup lists for each component.
  *
@@ -938,57 +1163,41 @@ async function getAppsWithSyncthing() {
  * @param {Array} componentList - Array of component names
  * @returns {Promise<Object|null>} - Combined backup data for all components, or null if failed
  */
-async function createBackupTaskOnNode(node, zelidAuth, appname, componentList) {
+async function createBackupTaskOnNode(node, zelidAuth, appname, componentList, componentProfiles = null) {
   const diagnostics = [];
   const createEndpoint = `${node}/apps/appendbackuptask`;
+  const usedProfiles = {};
   try {
     log.info(`Creating backup task for ${appname} with components: ${JSON.stringify(componentList)}`);
 
-    // Prepare backup payload
-    const backupPayload = {
-      appname,
-      backup: componentList.map((component) => ({
-        component,
-        backup: true,
-      })),
-    };
-
-    // Make the backup request
-    const backupResponse = await axios({
-      method: 'post',
-      url: createEndpoint,
-      headers: {
-        'Content-Type': 'application/json',
-        zelidauth: zelidAuth,
-      },
-      data: backupPayload,
-      timeout: 300000, // 5 minutes timeout for backup process
-      httpsAgent,
-    });
-
-    if (!backupResponse.data) {
-      throw new Error('No response data from backup task creation');
-    }
-    if (backupResponse.data.status === 'error') {
-      throw new Error(
-        getSafeApiMessage(backupResponse.data) || 'Flux node rejected the backup task',
-      );
+    let profiled = false;
+    if (componentProfiles) {
+      profiled = true;
+      for (let i = 0; i < componentList.length && profiled; i += 1) {
+        const component = componentList[i];
+        const profile = componentProfiles[component];
+        const outcome = await createProfiledArchiveOnNode(node, zelidAuth, appname, component, profile, diagnostics);
+        if (outcome.fits) {
+          usedProfiles[component] = profile.id;
+        } else {
+          log.info(`Backup profile ${profile.id} does not fit ${appname}/${component} (${outcome.reason}); taking the full backup instead`);
+          diagnostics.push({
+            check: `Backup profile (${component})`,
+            outcome: 'skipped',
+            node,
+            detail: `${profile.id} does not fit: ${outcome.reason}`,
+          });
+          profiled = false;
+        }
+      }
+      if (!profiled) {
+        Object.keys(usedProfiles).forEach((component) => { delete usedProfiles[component]; });
+      }
     }
 
-    diagnostics.push({
-      check: 'Flux node backup creation',
-      outcome: 'success',
-      endpoint: createEndpoint,
-      node,
-      httpStatus: backupResponse.status,
-      detail: 'Node accepted the backup task',
-    });
-
-    log.info(`Backup task created successfully for ${appname}`);
-
-    // Wait longer for backup creation to ensure files are generated
-    log.info(`Waiting for backup files to be created for ${appname}...`);
-    await new Promise((resolve) => { setTimeout(resolve, 5 * 60 * 1000); }); // Wait 5 minutes
+    if (!profiled) {
+      await requestFullBackupOnNode(node, zelidAuth, appname, componentList, diagnostics);
+    }
 
     // Get volume mount paths for all components upfront
     const componentMounts = {};
@@ -1167,6 +1376,7 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList) {
               const encodedFileName = encodeURIComponent(latestBackup.name);
               componentBackupData = {
                 component,
+                profile: usedProfiles[component] || null,
                 backups: latestBackup,
                 host: `${node}/backup/downloadlocalfile/${backupPath}%2F${encodedFileName}/${appname}`,
               };
@@ -1260,6 +1470,7 @@ async function createBackupTaskWithTeamCredentials(
   componentList,
   verifier = verifyLoginDetailed,
   backupCreator = createBackupTaskOnNode,
+  componentProfiles = null,
 ) {
   const credentials = await getTeamCredentials();
   if (credentials.length === 0) {
@@ -1308,6 +1519,7 @@ async function createBackupTaskWithTeamCredentials(
       loginResult.zelidAuth,
       appname,
       componentList,
+      componentProfiles,
     );
     lastResult = backupResult;
     failureStage = 'create_backup';
@@ -1362,4 +1574,10 @@ module.exports = {
   createBackupTaskOnNode,
   createBackupTaskWithTeamCredentials,
   isExplicitAuthorizationFailure,
+  testHooks: {
+    listVolumeFolder,
+    ensureVolumeFolder,
+    compressOnNode,
+    createProfiledArchiveOnNode,
+  },
 };
