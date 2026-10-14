@@ -307,6 +307,23 @@ async function getPrimaryNodeIp(appname, diagnostics) {
   }
 }
 
+/**
+ * The primary's API address (ip:port): its IP from FDM appips, its port from
+ * the location API. Null when either cannot say, or when several locations
+ * share that IP and the port cannot be told apart.
+ */
+async function getPrimaryNodeAddress(appname, diagnostics) {
+  const primaryIp = await getPrimaryNodeIp(appname, diagnostics);
+  if (!primaryIp) return null;
+  const locationUrl = `https://api.runonflux.io/apps/location/${appname}`;
+  const response = await axios.get(locationUrl, { httpsAgent, timeout: 30000 });
+  const locations = response.data?.status === 'success' && Array.isArray(response.data.data)
+    ? response.data.data
+    : [];
+  const matching = locations.filter((location) => location?.ip && extractNodeIp(location.ip) === primaryIp);
+  return matching.length === 1 ? formatLocationNode(matching[0].ip) : null;
+}
+
 async function getSecondaryNodeFromLocationApi(
   appname,
   primaryIp,
@@ -1143,6 +1160,50 @@ async function removeVolumeObject(node, zelidAuth, appname, component, object) {
   }
 }
 
+/** The empty folder every partial archive starts with; see backupProfiles.PROFILE_MARKER_DIR. */
+const PROFILE_MARKER = `appdata/${backupProfiles.PROFILE_MARKER_DIR}`;
+/** How often, and how many times, to look for a marker made on the primary to reach the standby. */
+const PROFILE_MARKER_SYNC_WAIT_MS = 15 * 1000;
+const PROFILE_MARKER_SYNC_CHECKS = 8;
+
+/** FluxOS 8.21+ refusing a write on a standby, whose copy follows the primary's. */
+function isReadOnlyCopyRefusal(error) {
+  return /read-only copy/i.test(error?.message || '');
+}
+
+/**
+ * Make sure the marker is on the node the archive is written on.
+ *
+ * Since FluxOS 8.21 a standby refuses writes into appdata, which is the
+ * replicated part of its volume: syncthing would never send them and the
+ * standby reverts them. The marker is then made on the primary, which owns
+ * the copy, and arrives on the standby like any other file. Being an empty
+ * folder, it is harmless to the game, and once there it stays: later backups
+ * find it and ask the primary for nothing. A full backup carries it too, and
+ * is still told apart by its first entry, `./`.
+ *
+ * @param {function(): Promise<{node: string, zelidAuth: string}>} [reachPrimary]
+ * @throws when the marker cannot be put on this node
+ */
+async function ensureProfileMarker(node, zelidAuth, appname, component, reachPrimary) {
+  const present = () => listVolumeFolder(node, zelidAuth, appname, component, PROFILE_MARKER);
+  if (await present()) return;
+  try {
+    // Accepted by a primary, a standby on FluxOS older than 8.21, and an app with no synced copy.
+    await ensureVolumeFolder(node, zelidAuth, appname, component, PROFILE_MARKER);
+    return;
+  } catch (error) {
+    if (!isReadOnlyCopyRefusal(error) || !reachPrimary) throw error;
+  }
+  const primary = await reachPrimary();
+  await ensureVolumeFolder(primary.node, primary.zelidAuth, appname, component, PROFILE_MARKER);
+  for (let check = 0; check < PROFILE_MARKER_SYNC_CHECKS; check += 1) {
+    await new Promise((resolve) => { setTimeout(resolve, PROFILE_MARKER_SYNC_WAIT_MS); });
+    if (await present()) return;
+  }
+  throw new Error(`${PROFILE_MARKER} was made on the primary ${primary.node} but had not reached this node after ${(PROFILE_MARKER_SYNC_WAIT_MS * PROFILE_MARKER_SYNC_CHECKS) / 1000}s`);
+}
+
 /**
  * How long to wait before listing again a volume whose files were still
  * arriving. Syncthing delivers a save in seconds; this leaves it a wide margin
@@ -1173,7 +1234,7 @@ const PROFILE_ARCHIVE_ATTEMPTS = 2;
  * @throws when the profile's paths cannot be listed, so a transient failure is
  *   retried on another node rather than read as a missing layout
  */
-async function createProfiledArchiveOnNode(node, zelidAuth, appname, component, profile, diagnostics) {
+async function createProfiledArchiveOnNode(node, zelidAuth, appname, component, profile, diagnostics, reachPrimary = null) {
   const listAll = () => backupProfiles.collectProfileListings(
     profile,
     (folder) => listVolumeFolder(node, zelidAuth, appname, component, folder ? `appdata/${folder}` : 'appdata'),
@@ -1198,7 +1259,7 @@ async function createProfiledArchiveOnNode(node, zelidAuth, appname, component, 
   // appendbackuptask can still take the full one, as it did before
   // profiles existed. Never a reason to leave the app with no backup at all.
   try {
-    await ensureVolumeFolder(node, zelidAuth, appname, component, `appdata/${backupProfiles.PROFILE_MARKER_DIR}`);
+    await ensureProfileMarker(node, zelidAuth, appname, component, reachPrimary);
     // appendbackuptask makes backup/local itself; on a node that never ran one it is not there yet.
     await ensureVolumeFolder(node, zelidAuth, appname, component, 'backup');
     await ensureVolumeFolder(node, zelidAuth, appname, component, 'backup/local');
@@ -1250,7 +1311,7 @@ async function createProfiledArchiveOnNode(node, zelidAuth, appname, component, 
  * @param {Array} componentList - Array of component names
  * @returns {Promise<Object|null>} - Combined backup data for all components, or null if failed
  */
-async function createBackupTaskOnNode(node, zelidAuth, appname, componentList, componentProfiles = null) {
+async function createBackupTaskOnNode(node, zelidAuth, appname, componentList, componentProfiles = null, reachPrimary = null) {
   const diagnostics = [];
   const createEndpoint = `${node}/apps/appendbackuptask`;
   const usedProfiles = {};
@@ -1263,7 +1324,7 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList, c
       for (let i = 0; i < componentList.length && profiled; i += 1) {
         const component = componentList[i];
         const profile = componentProfiles[component];
-        const outcome = await createProfiledArchiveOnNode(node, zelidAuth, appname, component, profile, diagnostics);
+        const outcome = await createProfiledArchiveOnNode(node, zelidAuth, appname, component, profile, diagnostics, reachPrimary);
         if (outcome.fits) {
           usedProfiles[component] = profile.id;
         } else {
@@ -1617,6 +1678,25 @@ async function createBackupTaskWithTeamCredentials(
       continue;
     }
 
+    // A profiled backup may need the primary for its marker (see
+    // ensureProfileMarker), reached with the credential the standby accepted.
+    // Asked for at most once, and only when needed.
+    let primaryAccess = null;
+    const reachPrimary = componentProfiles ? () => {
+      primaryAccess = primaryAccess || (async () => {
+        const address = await getPrimaryNodeAddress(appname, []);
+        if (!address) throw new Error('the primary node could not be identified');
+        const primaryNode = `http://${address}`;
+        if (primaryNode === node) throw new Error(`${node} is the primary itself`);
+        const primaryLogin = await verifier(credential.zelid, credential.privateKey, primaryNode);
+        if (!primaryLogin.zelidAuth) {
+          throw new Error(`could not log in on the primary ${primaryNode}: ${primaryLogin.reason || 'refused'}`);
+        }
+        return { node: primaryNode, zelidAuth: primaryLogin.zelidAuth };
+      })();
+      return primaryAccess;
+    } : null;
+
     // eslint-disable-next-line no-await-in-loop
     const backupResult = await backupCreator(
       node,
@@ -1624,6 +1704,7 @@ async function createBackupTaskWithTeamCredentials(
       appname,
       componentList,
       componentProfiles,
+      reachPrimary,
     );
     lastResult = backupResult;
     failureStage = 'create_backup';
@@ -1684,5 +1765,7 @@ module.exports = {
     removeVolumeObject,
     compressOnNode,
     createProfiledArchiveOnNode,
+    ensureProfileMarker,
+    getPrimaryNodeAddress,
   },
 };

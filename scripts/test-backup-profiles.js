@@ -4,9 +4,19 @@ const assert = require('assert');
 // itself before anything requires it.
 const calls = [];
 let routes = [];
+// Asked by every profiled archive before it writes; absent unless a test says otherwise.
+const markerAbsent = {
+  match: (r) => r.method === 'get' && /\/apps\/getfolderinfo\/[^/]+\/[^/]+\/appdata%2F\.flux-backup$/.test(r.url),
+  reply: () => ({
+    status: 200,
+    headers: {},
+    data: { status: 'error', data: { code: 'ENOENT', message: "ENOENT: no such file or directory, realpath '/x'" } },
+  }),
+};
 async function axiosMock(request) {
   calls.push(request);
-  const route = routes.find((candidate) => candidate.match(request));
+  const route = routes.find((candidate) => candidate.match(request))
+    || (markerAbsent.match(request) ? markerAbsent : null);
   if (!route) throw new Error(`Unexpected request in test: ${request.method} ${request.url}`);
   return route.reply(request);
 }
@@ -328,6 +338,137 @@ async function main() {
       { [COMPONENT]: profile },
     );
     assert.strictEqual(seen[0][4][COMPONENT].id, 'dragonwilds-world');
+
+    // --- the marker on a standby that refuses writes (FluxOS 8.21+) -----------------
+    const PRIMARY = 'http://10.0.0.1:16137';
+    const markerListing = (node, present) => ({
+      match: (r) => r.method === 'get' && r.url === `${node}/apps/getfolderinfo/${APP}/${COMPONENT}/${encodeURIComponent('appdata/.flux-backup')}`,
+      reply: () => (present() ? success([]) : missing()),
+    });
+    const readOnlyRefusal = {
+      match: (r) => r.url === `${NODE}/apps/createfolder/${APP}/${COMPONENT}/${encodeURIComponent('appdata/.flux-backup')}`,
+      reply: () => ({
+        status: 409,
+        headers: {},
+        data: { status: 'error', data: { code: 409, name: 'ReadOnlyCopy', message: "This node holds a read-only copy of this app's data, which follows the node running the app. Make changes on that node." } },
+      }),
+    };
+    let synced = false;
+    let primaryCreated = [];
+    const primaryCreateFolder = {
+      match: (r) => r.url.startsWith(`${PRIMARY}/apps/createfolder/`),
+      reply: (r) => {
+        primaryCreated.push(decodeURIComponent(r.url.split('/').pop()));
+        return success({});
+      },
+    };
+    const standbyRoutes = (extra = []) => [
+      markerListing(NODE, () => synced),
+      readOnlyRefusal,
+      primaryCreateFolder,
+      ...extra,
+      ...worldFolders(),
+      anyCreateFolder,
+      ...compressRoute(['Succeeded']),
+    ];
+
+    // Already on the standby: nothing is written there, the primary is never asked.
+    calls.length = 0;
+    synced = true;
+    routes = standbyRoutes();
+    let primaryAsked = 0;
+    const reachPrimary = async () => { primaryAsked += 1; return { node: PRIMARY, zelidAuth: 'primary-auth' }; };
+    outcome = await fluxOS.testHooks.createProfiledArchiveOnNode(NODE, 'auth', APP, COMPONENT, profile, [], reachPrimary);
+    assert.deepStrictEqual(outcome, { fits: true });
+    assert.strictEqual(primaryAsked, 0);
+    assert(!calls.some((r) => r.url.includes(`createfolder/${APP}/${COMPONENT}/${encodeURIComponent('appdata/.flux-backup')}`)));
+
+    // Refused on the standby: made on the primary, waited for, then archived.
+    calls.length = 0;
+    synced = false;
+    primaryCreated = [];
+    let looks = 0;
+    routes = standbyRoutes();
+    routes[0] = markerListing(NODE, () => { looks += 1; return looks >= 3; });
+    outcome = await fluxOS.testHooks.createProfiledArchiveOnNode(NODE, 'auth', APP, COMPONENT, profile, [], reachPrimary);
+    assert.deepStrictEqual(outcome, { fits: true });
+    assert.deepStrictEqual(primaryCreated, ['appdata/.flux-backup'], 'only the marker is written on the primary');
+    assert.strictEqual(calls.find((r) => r.url.startsWith(`${PRIMARY}/`)).headers.zelidauth, 'primary-auth');
+    assert(calls.some((r) => r.url === `${NODE}/apps/compressobject`));
+
+    // Never arrives: the full backup, not a partial archive without its marker.
+    calls.length = 0;
+    synced = false;
+    routes = standbyRoutes();
+    outcome = await fluxOS.testHooks.createProfiledArchiveOnNode(NODE, 'auth', APP, COMPONENT, profile, [], reachPrimary);
+    assert.strictEqual(outcome.archiveFailed, true);
+    assert.match(outcome.reason, /made on the primary http:\/\/10\.0\.0\.1:16137 but had not reached this node/);
+    assert(!calls.some((r) => r.url.endsWith('/apps/compressobject')));
+
+    // No way to the primary, or the primary refuses: the same.
+    routes = standbyRoutes();
+    outcome = await fluxOS.testHooks.createProfiledArchiveOnNode(NODE, 'auth', APP, COMPONENT, profile, []);
+    assert.strictEqual(outcome.archiveFailed, true);
+    assert.match(outcome.reason, /read-only copy/);
+    outcome = await fluxOS.testHooks.createProfiledArchiveOnNode(NODE, 'auth', APP, COMPONENT, profile, [], async () => {
+      throw new Error('could not log in on the primary');
+    });
+    assert.strictEqual(outcome.archiveFailed, true);
+    assert.match(outcome.reason, /could not log in on the primary/);
+
+    // Any other refusal is not sent to the primary.
+    primaryAsked = 0;
+    routes = standbyRoutes();
+    routes[1] = { ...readOnlyRefusal, reply: () => ({ status: 200, headers: {}, data: { status: 'error', data: { message: 'No free space on the application volume' } } }) };
+    outcome = await fluxOS.testHooks.createProfiledArchiveOnNode(NODE, 'auth', APP, COMPONENT, profile, [], reachPrimary);
+    assert.strictEqual(outcome.archiveFailed, true);
+    assert.strictEqual(primaryAsked, 0);
+
+    // The primary's address: its IP from appips, its port from the locations.
+    const appips = (ips) => ({
+      match: (r) => r.url.endsWith(`/api/appips/${APP}`),
+      reply: () => success({ ips }),
+    });
+    const locations = (ips) => ({
+      match: (r) => r.url === `https://api.runonflux.io/apps/location/${APP}`,
+      reply: () => success(ips.map((ip) => ({ name: APP, ip }))),
+    });
+    routes = [appips(['10.0.0.1']), locations(['10.0.0.2:16127', '10.0.0.1:16137'])];
+    assert.strictEqual(await fluxOS.testHooks.getPrimaryNodeAddress(APP, []), '10.0.0.1:16137');
+    routes = [appips(['10.0.0.1']), locations(['10.0.0.1:16127', '10.0.0.1:16137'])];
+    assert.strictEqual(await fluxOS.testHooks.getPrimaryNodeAddress(APP, []), null, 'two instances on one IP: no guessing');
+    routes = [appips(['10.0.0.9']), locations(['10.0.0.2:16127'])];
+    assert.strictEqual(await fluxOS.testHooks.getPrimaryNodeAddress(APP, []), null);
+
+    // The wrapper logs in on the primary with the credential the standby took, once,
+    // and only when the node step asks.
+    routes = [appips(['10.0.0.1']), locations(['10.0.0.2:16127', '10.0.0.1:16137'])];
+    const logins = [];
+    const reached = [];
+    await fluxOS.createBackupTaskWithTeamCredentials(
+      NODE,
+      APP,
+      [COMPONENT],
+      async (zelid, key, node) => { logins.push(node); return { zelidAuth: `auth@${node}`, diagnostics: [] }; },
+      async (node, auth, app, components, profiles, reach) => {
+        reached.push(await reach(), await reach());
+        return { status: 'completed', components: [] };
+      },
+      { [COMPONENT]: profile },
+    );
+    assert.deepStrictEqual(logins, [NODE, PRIMARY]);
+    assert.deepStrictEqual(reached[0], { node: PRIMARY, zelidAuth: `auth@${PRIMARY}` });
+    assert.strictEqual(reached[1], reached[0]);
+    // No profiles: no primary.
+    seen.length = 0;
+    await fluxOS.createBackupTaskWithTeamCredentials(
+      NODE,
+      APP,
+      [COMPONENT],
+      async () => ({ zelidAuth: 'auth', diagnostics: [] }),
+      async (...args) => { seen.push(args); return { status: 'completed', components: [] }; },
+    );
+    assert.strictEqual(seen[0][5], null);
 
     // --- Valheim -------------------------------------------------------------------
     const VAPP = 'valheim1790000000000';
