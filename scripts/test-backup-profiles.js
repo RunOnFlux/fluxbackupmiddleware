@@ -696,11 +696,14 @@ async function main() {
     // Mid-save on the standby -> waited for, then archived.
     calls.length = 0;
     let served = 0;
+    // Built once: worldFiles() stamps its files from Date.now(), and two
+    // listings a millisecond apart would read as a save in between.
+    const settledWorld = strip(worldFiles());
     routes = [{
       match: (r) => r.method === 'get' && r.url === `${NODE}/apps/getfolderinfo/${PAPP}/${PCOMP}/${encodeURIComponent(`appdata/SaveGames/0/${W}`)}`,
       reply: () => {
         served += 1;
-        return success(served === 1 ? [...strip(worldFiles()), pFile('.syncthing.LevelMeta.sav.new_tmp.tmp', 1931, at(0))] : strip(worldFiles()));
+        return success(served === 1 ? [...settledWorld, pFile('.syncthing.LevelMeta.sav.new_tmp.tmp', 1931, at(0))] : settledWorld);
       },
     }, ...palworldVolume()];
     outcome = await fluxOS.testHooks.createProfiledArchiveOnNode(NODE, 'auth', PAPP, PCOMP, palworld, []);
