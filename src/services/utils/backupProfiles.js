@@ -85,6 +85,38 @@ const parentOf = (entryPath) => {
   return slash === -1 ? '' : entryPath.slice(0, slash);
 };
 const baseName = (entryPath) => entryPath.slice(entryPath.lastIndexOf('/') + 1);
+/** A path under a profile entry's; an entry's path is '' for appdata itself. */
+const joinPath = (folder, name) => (folder ? `${folder}/${name}` : String(name));
+
+/**
+ * One folder of a `children` entry with `excludeWithin`: what it holds less
+ * what is left out, each kept folder listed in turn (undefined past
+ * MAX_CHILD_FOLDERS, which the plan refuses), and `latestWithin`'s folder.
+ */
+async function listWithin(entry, folder, item, inside, listOnce) {
+  const leftOut = (child) => entry.excludeWithin.test(String(child.name));
+  const children = [];
+  let folders = 0;
+  const kept = inside.filter((child) => child && !leftOut(child));
+  for (let k = 0; k < kept.length; k += 1) {
+    const child = kept[k];
+    if (child.isDirectory) {
+      folders += 1;
+      children.push({
+        ...child,
+        // eslint-disable-next-line no-await-in-loop
+        children: folders <= MAX_CHILD_FOLDERS ? ((await listOnce(`${folder}/${child.name}`)) || []) : undefined,
+      });
+    } else {
+      children.push(child);
+    }
+  }
+  const result = { ...item, children, excludedChildren: inside.filter((child) => child && leftOut(child)) };
+  if (entry.latestWithin) {
+    result.latestCandidates = (await listOnce(`${folder}/${entry.latestWithin.path}`)) || [];
+  }
+  return result;
+}
 
 /**
  * List what the node holds for each of a profile's entries.
@@ -96,7 +128,10 @@ const baseName = (entryPath) => entryPath.slice(entryPath.lastIndexOf('/') + 1);
  * @returns {Promise<Object<string, Array|object|null>>} entry path -> its listing
  *   (an array), or for a `file` entry its own getfolderinfo entry; null when
  *   missing. A `children` entry's folders carry their own listing as `children`
- *   (undefined past MAX_CHILD_FOLDERS)
+ *   (undefined past MAX_CHILD_FOLDERS). With `excludeWithin`, what it leaves out
+ *   of a folder is under `excludedChildren` instead, the kept folders inside are
+ *   listed in turn, and with `latestWithin` the folder it names is under
+ *   `latestCandidates`
  */
 async function collectProfileListings(profile, list) {
   const listed = new Map();
@@ -127,8 +162,15 @@ async function collectProfileListings(profile, list) {
         const item = kept[j];
         if (item.isDirectory && folders < MAX_CHILD_FOLDERS) {
           folders += 1;
+          const folder = joinPath(entry.path, item.name);
           // eslint-disable-next-line no-await-in-loop
-          listing.push({ ...item, children: (await listOnce(`${entry.path}/${item.name}`)) || [] });
+          const inside = (await listOnce(folder)) || [];
+          if (entry.excludeWithin) {
+            // eslint-disable-next-line no-await-in-loop
+            listing.push(await listWithin(entry, folder, item, inside, listOnce));
+          } else {
+            listing.push({ ...item, children: inside });
+          }
         } else {
           listing.push(item);
         }
@@ -141,15 +183,16 @@ async function collectProfileListings(profile, list) {
 
 /**
  * The newest non-empty file of a listing whose name matches, leaving out one
- * modified within `settledMs`: a file that is still being written.
+ * modified within `settledMs`: a file that is still being written. With
+ * `directory`, the newest folder instead.
  */
-function newestSettledFile(listing, { name, settledMs = 0 }, now) {
+function newestSettledFile(listing, { name, settledMs = 0, directory = false }, now) {
   const time = (item) => {
     const parsed = Date.parse(item.modifiedAt);
     return Number.isFinite(parsed) ? parsed : 0;
   };
   return listing
-    .filter((item) => item && item.isFile && Number(item.size) > 0 && name.test(String(item.name)))
+    .filter((item) => item && (directory ? item.isDirectory : item.isFile) && Number(item.size) > 0 && name.test(String(item.name)))
     .filter((item) => !settledMs || now - time(item) >= settledMs)
     .sort((a, b) => (time(b) - time(a)) || String(b.name).localeCompare(String(a.name)))[0] || null;
 }
@@ -189,11 +232,12 @@ function planProfiledArchive(profile, listings, now = Date.now()) {
         return { fits: false, reason: `${entry.path} holds no non-empty file matching ${entry.mustContain}` };
       }
     }
-    if (entry.children && listing.some((item) => item.isDirectory && item.children === undefined)) {
+    if (entry.children && listing.some((item) => item.isDirectory && (item.children === undefined
+      || (entry.excludeWithin && item.children.some((child) => child.isDirectory && child.children === undefined))))) {
       return { fits: false, reason: `${entry.path} holds more than ${MAX_CHILD_FOLDERS} folders to check` };
     }
     if (entry.validate) {
-      const problem = entry.validate(listing);
+      const problem = entry.validate(listing, now);
       if (problem) {
         const { reason, unsettled } = typeof problem === 'string' ? { reason: problem } : problem;
         return { fits: false, reason: `${entry.path}: ${reason}`, ...(unsettled ? { unsettled: true } : {}) };
@@ -205,7 +249,20 @@ function planProfiledArchive(profile, listings, now = Date.now()) {
       else if (entry.required) return { fits: false, reason: `${entry.path} holds no settled file matching ${entry.latest.name}` };
     } else if (entry.children) {
       if (!listing.length && entry.required) return { fits: false, reason: `${entry.path} holds nothing to archive` };
-      listing.forEach((item) => sources.push(`appdata/${entry.path}/${item.name}`));
+      listing.forEach((item) => {
+        const itemPath = joinPath(entry.path, item.name);
+        if (!(item.isDirectory && entry.excludeWithin)) {
+          sources.push(`appdata/${itemPath}`);
+          return;
+        }
+        // Only what is kept inside, each on its own, so a restore replaces
+        // those and leaves what was left out where it is.
+        item.children.forEach((child) => sources.push(`appdata/${itemPath}/${child.name}`));
+        if (entry.latestWithin) {
+          const newest = newestSettledFile(item.latestCandidates || [], entry.latestWithin, now);
+          if (newest) sources.push(`appdata/${itemPath}/${entry.latestWithin.path}/${newest.name}`);
+        }
+      });
     } else {
       sources.push(`appdata/${entry.path}`);
     }
@@ -216,7 +273,11 @@ function planProfiledArchive(profile, listings, now = Date.now()) {
 /**
  * Whether two collectProfileListings results describe the same files: every
  * entry, and the listed folders inside it, by name, kind, size and modifiedAt.
- * A folder's size counts all it holds, so a file written deeper still shows.
+ * A folder's size counts all it holds, so a file written deeper still shows. A
+ * folder whose contents are listed is compared by them alone: its size and
+ * time also count what `excludeWithin` leaves out (the game's own rotating
+ * snapshots, rewritten every minute), which is not archived. `latestWithin`'s
+ * candidates are not compared either; the one archived is a settled one.
  * Taken before and after the archive is written, a difference means the volume
  * changed meanwhile (Syncthing delivering a save) and the archive may hold
  * half of it.
@@ -226,8 +287,12 @@ function sameListings(before, after) {
     const lines = [];
     const add = (where, item) => {
       if (!item) return;
+      if (Array.isArray(item.children)) {
+        lines.push([where, item.name, 'd'].join('|'));
+        item.children.forEach((child) => add(`${where}/${item.name}`, child));
+        return;
+      }
       lines.push([where, item.name, item.isDirectory ? 'd' : 'f', item.size, item.modifiedAt].join('|'));
-      if (Array.isArray(item.children)) item.children.forEach((child) => add(`${where}/${item.name}`, child));
     };
     Object.keys(listings).forEach((entryPath) => {
       const listing = listings[entryPath];

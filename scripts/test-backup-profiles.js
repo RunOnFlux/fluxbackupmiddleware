@@ -113,7 +113,7 @@ async function main() {
     assert.strictEqual(byComponent('web', { appname: 'dragonwilds1790000000000' }), profile, 'app name, single component');
     assert.strictEqual(byComponent('web', { appname: 'dragonwilds1790000000000', componentCount: 2 }), null, 'app name says nothing about which of several components');
     assert.strictEqual(byComponent('mydragonwilds'), null, 'component rule is anchored, as in the hub');
-    assert.strictEqual(byComponent('palworld', { repotag: 'thijsvanloef/palworld-server-docker:latest', appname: 'palworld1' }), null);
+    assert.strictEqual(byComponent('enshrouded', { repotag: 'mornedhels/enshrouded-server:latest', appname: 'enshrouded1' }), null);
 
     // No image needed: an enterprise spec read from the chain has none.
     const resolved = backupProfiles.resolveComponentProfiles(APP, [COMPONENT]);
@@ -549,6 +549,172 @@ async function main() {
       'permittedlist.txt': null,
     });
     assert.deepStrictEqual(plan2, { fits: true, sources: ['appdata/.flux-backup', 'appdata/worlds_local/localhost'] });
+
+    // --- Palworld -------------------------------------------------------------------
+    const PAPP = 'palworld1790000000000';
+    const PCOMP = 'palworldpalworld';
+    const palworld = backupProfiles.profileForComponent({
+      appname: PAPP, component: PCOMP, repotag: null, componentCount: 1,
+    });
+    assert.strictEqual(palworld.id, 'palworld-world', 'marketplace component');
+    assert.strictEqual(byComponent('palworld').id, 'palworld-world', 'hub plan component');
+    assert.strictEqual(byComponent('web', { repotag: 'runonflux/palworld-server-flux:latest' }).id, 'palworld-world');
+    assert.strictEqual(byComponent('valheimvalheim').id, 'valheim-world', 'Valheim still its own');
+
+    // One save: every file of Players/ and the two Level files in the same second
+    // (palworld1788788877472, 2026-10-14). `ago` in minutes.
+    const SAVED = 3;
+    const at = (minutesAgo, seconds = 0) => new Date(Date.now() - minutesAgo * 60000 + seconds * 1000).toISOString();
+    const pFile = (name, size, modifiedAt) => ({
+      name, size, isFile: true, isDirectory: false, modifiedAt,
+    });
+    const pDir = (name, size, extra = {}) => ({
+      name, size, isFile: false, isDirectory: true, modifiedAt: at(SAVED), ...extra,
+    });
+    const players = [
+      pFile('0F150E1B000000000000000000000000.sav', 14133, at(SAVED)),
+      pFile('488F5019000000000000000000000000_dps.sav', 33554, at(SAVED, 0.4)),
+    ];
+    const worldFiles = (playerFiles = players, extra = []) => [
+      pFile('Level.sav', 4587627, at(SAVED, 1)), pFile('LevelMeta.sav', 1931, at(SAVED, 1)),
+      pFile('LocalData.sav', 50327, at(40)), pDir('Players', 667270, { children: playerFiles }), ...extra,
+    ];
+    const pWorld = (files = worldFiles(), excluded = [pDir('backup', 129857180)]) => pDir('C52D1EBB4AE561E5C1BF519CB56B3101', 134795822, {
+      children: files, excludedChildren: excluded,
+    });
+    const pWorlds = palworld.include[0];
+    assert.strictEqual(pWorlds.validate([pWorld()]), null);
+    assert.strictEqual(pWorlds.validate([pWorld(), pDir('14ADF22A4F2E4A0B9F2D3E5E6A7B8C9D', 0, { children: [], excludedChildren: [] })]), null, 'an empty GUID folder is not checked');
+    assert.strictEqual(pWorlds.validate([]), 'no world');
+    assert.strictEqual(pWorlds.validate([pDir('E', 0, { children: [], excludedChildren: [] })]), 'no world');
+    // Mid-save on the primary, or arriving on the standby.
+    assert.match(unsettledReason(pWorlds.validate([pWorld(worldFiles(), [pDir('backup', 1), pFile('Level.sav.new_tmp', 4578572, at(2))])])), /Level\.sav\.new_tmp: a save is still being written or synced/);
+    assert.match(unsettledReason(pWorlds.validate([pWorld(worldFiles(), [pDir('world_save_temp', 4914137, { modifiedAt: at(2) })])])), /world_save_temp/);
+    assert.match(unsettledReason(pWorlds.validate([pWorld(worldFiles(), [pFile('.syncthing..atomic_save_update_manifest_world.json.tmp', 582, at(SAVED, 30))])])), /atomic_save_update_manifest/);
+    // ... but not one a sync gave up on hours ago (64.235.94.187: 06:37 and 09:02
+    // beside a Level.sav of 10:28).
+    assert.strictEqual(pWorlds.validate([pWorld(worldFiles(), [
+      pFile('.syncthing.Level.sav.new_tmp.tmp', 3032089, at(230)), pFile('.syncthing..atomic_save_update_manifest_world.json.tmp', 582, at(90)),
+    ])]), null, 'abandoned temporary files');
+    assert.match(unsettledReason(pWorlds.validate([pWorld(worldFiles(players.map((f) => ({ ...f, modifiedAt: at(SAVED - 1) }))))])), /Players\/0F150E1B.* is not from the same save/, 'the next save half-arrived');
+    assert.match(unsettledReason(pWorlds.validate([pWorld(worldFiles([...players, pFile('A008CC54000000000000000000000000.sav', 6332, at(SAVED + 1))]))])), /A008CC54.* is not from the same save/, 'a player from the save before');
+    assert.strictEqual(pWorlds.validate([pWorld(worldFiles([...players, pFile('DB2C1001000000000000000000000000.sav', 30604, at(SAVED + 1088))]))]), null, 'a character the world no longer rewrites');
+    assert.match(unsettledReason(pWorlds.validate([pWorld(worldFiles([...players, pFile('.syncthing.DB2C1001000000000000000000000000.sav.tmp', 9, at(1))]))])), /Players\/\.syncthing\..* is still being synced/);
+    assert.match(unsettledReason(pWorlds.validate([pWorld([pFile('Level.sav', 9, at(SAVED)), pFile('LevelMeta.sav', 1931, at(SAVED + 1))])])), /LevelMeta\.sav is not from the same save/);
+    assert.match(unsettledReason(pWorlds.validate([pWorld([pFile('Level.sav', 9, at(SAVED))])])), /no LevelMeta\.sav/);
+    // A world nothing in which has changed for 15 minutes is not mid-save:
+    // waiting would not change it. All three were refused for good before.
+    const quiet = (minutesAgo, extra = [], playerFiles = []) => pWorld([
+      pFile('Level.sav', 4587627, at(minutesAgo)), pFile('LevelMeta.sav', 1931, at(minutesAgo, 10)),
+      pDir('Players', 1, { children: playerFiles, modifiedAt: at(minutesAgo) }), ...extra,
+    ]);
+    assert.strictEqual(pWorlds.validate([quiet(24000)]), null, 'a final save whose LevelMeta.sav landed 10 s later');
+    assert.match(unsettledReason(pWorlds.validate([quiet(3)])), /LevelMeta\.sav is not from the same save/, 'the same, still being saved');
+    assert.strictEqual(pWorlds.validate([quiet(300, [pDir('world_save_temp', 4914137, { modifiedAt: at(300, -2) })])]), null, 'a save that died hours ago');
+    assert.strictEqual(pWorlds.validate([quiet(600, [], [pFile('16B1C9F3000000000000000000000000.sav', 9, at(605))])]), null, 'a world set aside');
+    assert.match(unsettledReason(pWorlds.validate([quiet(600, [], [pFile('16B1C9F3000000000000000000000000.sav', 9, at(1))])])), /not from the same save/, 'quiet is every file, players too');
+    assert.match(unsettledReason(pWorlds.validate([quiet(600)], Date.now() - 590 * 60000)), /LevelMeta/, 'measured from `now`');
+
+    // The volume, as listed on a standby.
+    const W = 'C52D1EBB4AE561E5C1BF519CB56B3101';
+    const pRoute = (folder, entries) => ({
+      match: (r) => r.method === 'get' && r.url === `${NODE}/apps/getfolderinfo/${PAPP}/${PCOMP}/${encodeURIComponent(folder)}`,
+      reply: () => (entries ? success(entries) : missing()),
+    });
+    const strip = (entries) => entries.map(({ children, ...rest }) => rest);
+    const palworldVolume = (files = worldFiles()) => [
+      pRoute('appdata', [
+        pDir('Config', 9832), pDir('Crashes', 25304), pDir('ImGui', 61), pDir('SaveGames', 134795822),
+        pFile('flux-guard.log', 75994, at(1)), pFile('flux-guard.sync-conflict-20260920-190406-U3XHAR2.log', 9000, at(9000)),
+        pDir('Mods', 41030000), pFile('1717_AA9DD0E543D84265BF2E2947A1F66406.zip', 115000, at(9000)),
+      ]),
+      pRoute('appdata/Mods', [pFile('PalBoxGate.pak', 41030000, at(9000))]),
+      pRoute('appdata/SaveGames/0', [pDir(W, 134795822), pDir('backup', 3862)]),
+      pRoute(`appdata/SaveGames/0/${W}`, [...strip(files), pDir('backup', 129857180), pDir('world_save_bak', 4727876),
+        pFile('.syncthing.Level.sav.new_tmp.tmp', 3032089, at(230))]),
+      pRoute(`appdata/SaveGames/0/${W}/Players`, players),
+      pRoute(`appdata/SaveGames/0/${W}/backup/world`, [
+        pDir('2026.10.07-16.16.49', 4900000, { modifiedAt: at(10000) }),
+        pDir('2026.10.14-11.49.42', 4900000, { modifiedAt: at(34) }),
+        pDir('2026.10.14-11.59.42', 4900000, { modifiedAt: at(24) }),
+        pDir('2026.10.14-12.21.42', 4900000, { modifiedAt: at(2) }),
+      ]),
+      pRoute('appdata/Config/LinuxServer', [pFile('PalWorldSettings.ini', 3588, at(400)), pFile('GameUserSettings.ini', 1859, at(400))]),
+      {
+        match: (r) => r.url.startsWith(`${NODE}/apps/createfolder/`),
+        reply: () => ({ status: 200, headers: {}, data: { status: 'success', data: {} } }),
+      },
+      {
+        match: (r) => r.method === 'post' && r.url === `${NODE}/apps/compressobject`,
+        reply: () => ({ status: 202, headers: {}, data: { status: 'success', data: { jobId: 'job-p' } } }),
+      },
+      {
+        match: (r) => r.url === `${NODE}/apps/operations/job-p`,
+        reply: () => success({ status: 'Succeeded' }),
+      },
+    ];
+    calls.length = 0;
+    routes = palworldVolume();
+    outcome = await fluxOS.testHooks.createProfiledArchiveOnNode(NODE, 'auth', PAPP, PCOMP, palworld, []);
+    assert.deepStrictEqual(outcome, { fits: true });
+    assert.deepStrictEqual(calls.find((r) => r.url.endsWith('/apps/compressobject')).data.source, [
+      'appdata/.flux-backup',
+      `appdata/SaveGames/0/${W}/Level.sav`,
+      `appdata/SaveGames/0/${W}/LevelMeta.sav`,
+      `appdata/SaveGames/0/${W}/LocalData.sav`,
+      `appdata/SaveGames/0/${W}/Players`,
+      // The newest restore point at least ten minutes old.
+      `appdata/SaveGames/0/${W}/backup/world/2026.10.14-11.59.42`,
+      'appdata/Config/LinuxServer',
+      // What the owner put in Pal/Saved; not the crash reports, ImGui or logs.
+      'appdata/Mods',
+      'appdata/1717_AA9DD0E543D84265BF2E2947A1F66406.zip',
+    ]);
+    const pListed = calls.filter((r) => r.url.includes('/apps/getfolderinfo/')).map((r) => decodeURIComponent(r.url.split('/').pop()));
+    assert(!pListed.includes('appdata/SaveGames/0/backup'), 'the stray restore point folder is not a world');
+    assert(!pListed.some((folder) => folder.endsWith('world_save_bak')));
+    assert(!pListed.some((folder) => /^appdata\/(Crashes|ImGui|SaveGames)$/.test(folder)), 'left out at the top, never listed');
+    assert.strictEqual(compressions(), 1, 'nothing changed: one archive');
+
+    // The game writes a restore point every minute: a new one, or one more
+    // pruned, between the listing and the check after the archive, is not a
+    // change to what was archived.
+    const listingsP = await backupProfiles.collectProfileListings(palworld, (folder) => {
+      const route = palworldVolume().find((r) => r.match({ method: 'get', url: `${NODE}/apps/getfolderinfo/${PAPP}/${PCOMP}/${encodeURIComponent(`appdata/${folder}`)}` }));
+      return route ? route.reply().data.data || null : null;
+    });
+    const later = JSON.parse(JSON.stringify(listingsP));
+    later['SaveGames/0'][0].size += 4900000;
+    later['SaveGames/0'][0].modifiedAt = at(0);
+    later['SaveGames/0'][0].excludedChildren[1].size += 4900000;
+    later['SaveGames/0'][0].latestCandidates.push(pDir('2026.10.14-12.22.42', 4900000, { modifiedAt: at(1) }));
+    assert(backupProfiles.sameListings(listingsP, later), 'only the restore points changed');
+    const resaved = JSON.parse(JSON.stringify(listingsP));
+    resaved['SaveGames/0'][0].children[0].modifiedAt = at(0);
+    assert(!backupProfiles.sameListings(listingsP, resaved), 'a new save is a change');
+
+    // Mid-save on the standby -> waited for, then archived.
+    calls.length = 0;
+    let served = 0;
+    routes = [{
+      match: (r) => r.method === 'get' && r.url === `${NODE}/apps/getfolderinfo/${PAPP}/${PCOMP}/${encodeURIComponent(`appdata/SaveGames/0/${W}`)}`,
+      reply: () => {
+        served += 1;
+        return success(served === 1 ? [...strip(worldFiles()), pFile('.syncthing.LevelMeta.sav.new_tmp.tmp', 1931, at(0))] : strip(worldFiles()));
+      },
+    }, ...palworldVolume()];
+    outcome = await fluxOS.testHooks.createProfiledArchiveOnNode(NODE, 'auth', PAPP, PCOMP, palworld, []);
+    assert.deepStrictEqual(outcome, { fits: true });
+    assert.strictEqual(served, 3, 'mid-save, listed again after the wait, then after the archive');
+
+    // A world with more folders inside than are worth listing -> the full backup.
+    const crowded = Array.from({ length: backupProfiles.MAX_CHILD_FOLDERS + 1 }, (_, i) => pDir(`Players.pre-restore-${i}`, 1));
+    const crowdedListings = await backupProfiles.collectProfileListings(palworld, async (folder) => {
+      if (folder === 'SaveGames/0') return [pDir(W, 1)];
+      if (folder === `SaveGames/0/${W}`) return [...strip(worldFiles()), ...crowded];
+      return [];
+    });
+    assert.match(backupProfiles.planProfiledArchive(palworld, crowdedListings).reason, /more than 20 folders/);
 
     // --- backupService ----------------------------------------------------------
     backupHooks.setDatabaseForTests({
