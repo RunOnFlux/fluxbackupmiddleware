@@ -63,6 +63,11 @@
  * older image, a server that has not saved yet, a save caught half-synced), and
  * the backup falls back to the full archive.
  *
+ * `minSavedShare` (a profile option, 0 to 1): take the full backup when what
+ * the profile leaves out is a smaller share of the volume than this. The full
+ * backup pauses Syncthing while it archives and the profiled one does not, so
+ * a profile that saves almost nothing is not worth a world caught changing.
+ *
  * A profile assumes a g: app: backups are taken on the secondary, where the
  * container does not run, so nothing is written while the paths are archived.
  */
@@ -281,8 +286,12 @@ const bedrockWorlds = (item) => item.isDirectory && item.name === 'worlds' && (i
 const MINECRAFT_JAVA_INSTALL = new RegExp([
   '^(libraries|versions|\\.fabric|cache|\\.cache|logs|crash-reports|debug|\\.flux-backup)$',
   // .forge-manifest.json, .papermc-manifest.json, .install-fabric.env, .run-forge.env, .paper.env
-  '^\\.([\\w-]+-manifest\\.json|install-[\\w-]+\\.env|run-[\\w-]+\\.env|paper\\.env|purpur\\.env)$',
-  '^(run\\.sh|run\\.bat|user_jvm_args\\.txt|\\.rcon-cli\\.env|\\.rcon-cli\\.yaml)$',
+  // ... and Syncthing's conflict copies of them, as old as the install they describe
+  '^\\.([\\w-]+-manifest(\\.sync-conflict-[\\w-]+)?\\.json|install-[\\w-]+\\.env|run-[\\w-]+\\.env|paper\\.env|purpur\\.env)$',
+  // The RCON password file is written again on every start, conflict copies included.
+  '^(run\\.sh|run\\.bat|user_jvm_args\\.txt)$|^\\.rcon-cli\\.',
+  // Mixin's debug dump of the classes it transformed.
+  '^\\.mixin\\.out$',
   '^hs_err_pid\\d+\\.log$',
   '^minecraft_server\\.[\\d.]+\\.jar(\\.download)?$',
   '^(paper|purpur|folia)-[\\d.]+-\\d+\\.jar(\\.download)?$',
@@ -431,6 +440,12 @@ module.exports = [
     // (MINECRAFT_JAVA_INSTALL): 55% of the median server, 14% of the fleet.
     // Mods, plugins and config are kept whole, the owner's or a modpack's.
     id: 'minecraft-java-world',
+    // A server with a large world saves next to nothing (0.6% of a 40 GB
+    // one); 18 of 90 nodes saved under 10%, together 3 GB of their 139 GB.
+    // Those keep the full backup, which pauses Syncthing while it archives:
+    // a big world on a busy server would otherwise be read while regions keep
+    // arriving, fail, be written again, and end in the full backup anyway.
+    minSavedShare: 0.1,
     // As in the hub's catalogue. Components are `minecraft`, `minecraftserver`
     // and `Minecraft` (doubled in the marketplace's).
     match: { name: 'minecraft', repotag: 'minecraft-server', component: '^minecraft' },

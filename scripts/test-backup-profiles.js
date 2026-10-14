@@ -741,13 +741,15 @@ async function main() {
       'minecraft_server.1.21.10.jar', 'minecraft_server.1.21.4.jar.download', 'paper-1.21.10-133.jar', 'paper-1.21.8-132.jar.download',
       'purpur-1.21.8-2648.jar', 'fabric-server-mc.1.21.10-loader.0.17.3-launcher.1.1.0.jar',
       'forge-1.20.1-47.4.10-installer.jar', 'forge-1.20.1-47.4.10-installer.jar.log', 'forge-26.3-66.0.11-shim.jar', 'forge-1.21.1-52.1.0-shim.jar',
+      '.papermc-manifest.sync-conflict-20260108-165032-EQDP3QP.json', '.rcon-cli.sync-conflict-20260907-095640-LR5NJ4S.env',
+      '.rcon-cli.sync-conflict-20260130-123102-4TFEYDV.yaml', '.mixin.out',
     ];
     installed.forEach((name) => assert(javaRoot.excludeChildren.test(name), `${name} is the install`));
     const owners = [
       'world', 'world_nether', 'world_the_end', 'season', 'Forever WOrld', 'trashcan', 'mods', 'plugins', 'config', 'datapacks', 'backup', 'cloud-backup',
       'server.properties', 'ops.json', 'whitelist.json', 'banned-players.json', 'banned-ips.json', 'usercache.json', 'eula.txt', 'server-icon.png',
       'bukkit.yml', 'spigot.yml', 'purpur.yml', 'log4j2.xml', 'Parties-3.2.18.jar', 'server.jar', 'paper.jar', 'playit', 'options.txt',
-      '.papermc-manifest.sync-conflict-20260108-165032-EQDP3QP.json', '.flux-empty-files-1791590881511.zip',
+      '.flux-empty-files-1791590881511.zip', 'server.sync-conflict-20260907-080318-LR5NJ4S.properties', '.paper', 'forge-installer-1.15.1-30.0.51.jar',
     ];
     owners.forEach((name) => assert(!javaRoot.excludeChildren.test(name), `${name} is kept`));
     const bedrockRoot = mcProfile('minecraftbedrock').include[0];
@@ -789,6 +791,18 @@ async function main() {
     assert.deepStrictEqual(backupProfiles.planProfiledArchive(mcProfile('minecraft'), mcListing), {
       fits: true,
       sources: ['appdata/.flux-backup', 'appdata/world', 'appdata/mods', 'appdata/config', 'appdata/server.properties', 'appdata/ops.json'],
+    });
+    assert(!Object.keys(mcListing['']).includes('leftOut'), 'what is left out is not compared by sameListings');
+    assert(backupProfiles.sameListings(mcListing, { '': [...mcListing['']] }), 'nor does it count as a difference');
+
+    // A world so large that the install is a rounding error: the full backup,
+    // which pauses Syncthing (minecraftj1785625568533: 230 MB of 40 GB).
+    const bigWorld = await backupProfiles.collectProfileListings(mcProfile('minecraft'), async (folder) => {
+      if (folder === '') return [mDir('season', 35e9), mDir('libraries', 200e6), mDir('versions', 30e6), mFile('server.properties', 1500)];
+      return [levelDat];
+    });
+    assert.deepStrictEqual(backupProfiles.planProfiledArchive(mcProfile('minecraft'), bigWorld), {
+      fits: false, reason: 'it would leave out only 1% of the volume',
     });
 
     // --- backupService ----------------------------------------------------------
