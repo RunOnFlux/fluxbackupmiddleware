@@ -1043,6 +1043,30 @@ async function ensureVolumeFolder(node, zelidAuth, appname, component, folder) {
 }
 
 /**
+ * Delete a file or folder of a component's volume; one already gone is fine.
+ *
+ * @param {string} object - path relative to the volume root
+ * @throws when the node does not confirm the removal
+ */
+async function removeVolumeObject(node, zelidAuth, appname, component, object) {
+  const endpoint = `${node}/apps/removeobject/${appname}/${component}/${encodeURIComponent(object)}`;
+  const response = await axios({
+    method: 'get',
+    url: endpoint,
+    headers: { zelidauth: zelidAuth },
+    timeout: 60000,
+    httpsAgent,
+    validateStatus: () => true,
+  });
+  const { data } = response;
+  if (data?.status === 'success') return;
+  if (data?.status === 'error' && isMissingPathResponse(data)) return;
+  const error = new Error(`Could not remove ${object}: ${getSafeApiMessage(data) || `HTTP ${response.status}`}`);
+  error.endpoint = endpoint;
+  throw error;
+}
+
+/**
  * Run compressobject and wait for it to finish.
  *
  * The node answers 200 when the archive was written inline, 202 with a job to
@@ -1110,26 +1134,53 @@ async function compressOnNode(node, zelidAuth, payload) {
 }
 
 /**
+ * How long to wait before listing again a volume whose files were still
+ * arriving. Syncthing delivers a save in seconds; this leaves it a wide margin
+ * without holding the backup worker long.
+ */
+const PROFILE_UNSETTLED_WAIT_MS = 90 * 1000;
+/** Archives written before giving up on a volume that keeps changing under them. */
+const PROFILE_ARCHIVE_ATTEMPTS = 2;
+
+/**
  * Write a profile's partial archive where appendbackuptask writes the full one,
  * backup/local/backup_<component>.tar.gz, so everything after this - the
  * readiness check, the download and the upload - is the same for both.
  *
  * No stop is needed: backups are taken on the secondary, where a g: app's
- * container does not run, and the archive is written in well under a second.
+ * container does not run. Syncthing still writes there, though, so the paths
+ * are listed again once the archive is written: when anything changed, the
+ * archive may hold half of a save, and it is written again from the new
+ * listing. A listing whose `validate` finds a save still arriving (unsettled)
+ * is listed again after PROFILE_UNSETTLED_WAIT_MS before giving up: the full
+ * backup would only archive the same half-synced files, and fifty times more.
  *
- * @returns {Promise<{fits: boolean, archiveFailed?: boolean, reason?: string}>}
- *   fits:false when the app does not have the profile's layout, or (archiveFailed)
- *   when the node could not write the partial archive; the caller then takes the
- *   full backup either way
+ * @returns {Promise<{fits: boolean, archiveFailed?: boolean, changing?: boolean, reason?: string}>}
+ *   fits:false when the app does not have the profile's layout, when the node
+ *   could not write the partial archive (archiveFailed), or when the volume
+ *   changed under every attempt (changing); the caller then takes the full
+ *   backup in every case
  * @throws when the profile's paths cannot be listed, so a transient failure is
  *   retried on another node rather than read as a missing layout
  */
 async function createProfiledArchiveOnNode(node, zelidAuth, appname, component, profile, diagnostics) {
-  const listings = await backupProfiles.collectProfileListings(
+  const listAll = () => backupProfiles.collectProfileListings(
     profile,
     (folder) => listVolumeFolder(node, zelidAuth, appname, component, folder ? `appdata/${folder}` : 'appdata'),
   );
-  const plan = backupProfiles.planProfiledArchive(profile, listings);
+  // The plan for a listing, listed once more after a wait when its files were still arriving.
+  const settle = async (first) => {
+    let listed = first;
+    let planned = backupProfiles.planProfiledArchive(profile, listed);
+    if (!planned.fits && planned.unsettled) {
+      log.info(`Backup profile ${profile.id} found ${appname}/${component} still syncing (${planned.reason}); listing again in ${PROFILE_UNSETTLED_WAIT_MS / 1000}s`);
+      await new Promise((resolve) => { setTimeout(resolve, PROFILE_UNSETTLED_WAIT_MS); });
+      listed = await listAll();
+      planned = backupProfiles.planProfiledArchive(profile, listed);
+    }
+    return { listed, planned };
+  };
+  let { listed: listings, planned: plan } = await settle(await listAll());
   if (!plan.fits) return plan;
 
   // From here on a failure is the node not writing the partial archive: a
@@ -1141,15 +1192,31 @@ async function createProfiledArchiveOnNode(node, zelidAuth, appname, component, 
     // appendbackuptask makes backup/local itself; on a node that never ran one it is not there yet.
     await ensureVolumeFolder(node, zelidAuth, appname, component, 'backup');
     await ensureVolumeFolder(node, zelidAuth, appname, component, 'backup/local');
-    await compressOnNode(node, zelidAuth, {
-      appname,
-      component,
-      source: plan.sources,
-      destination: `backup/local/backup_${component.toLowerCase()}.tar.gz`,
-      overwrite: true,
-    });
   } catch (error) {
     return { fits: false, archiveFailed: true, reason: error?.message || String(error) };
+  }
+
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      await compressOnNode(node, zelidAuth, {
+        appname,
+        component,
+        source: plan.sources,
+        destination: `backup/local/backup_${component.toLowerCase()}.tar.gz`,
+        overwrite: true,
+      });
+    } catch (error) {
+      return { fits: false, archiveFailed: true, reason: error?.message || String(error) };
+    }
+
+    const after = await listAll();
+    if (backupProfiles.sameListings(listings, after)) break;
+    if (attempt >= PROFILE_ARCHIVE_ATTEMPTS) {
+      return { fits: false, changing: true, reason: `the files changed while archiving, ${attempt} times` };
+    }
+    log.info(`Backup profile ${profile.id}: ${appname}/${component} changed while archiving; writing the archive again`);
+    ({ listed: listings, planned: plan } = await settle(after));
+    if (!plan.fits) return plan;
   }
 
   diagnostics.push({
@@ -1190,7 +1257,9 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList, c
         if (outcome.fits) {
           usedProfiles[component] = profile.id;
         } else {
-          const why = outcome.archiveFailed ? 'archive failed' : 'does not fit';
+          let why = 'does not fit';
+          if (outcome.archiveFailed) why = 'archive failed';
+          else if (outcome.changing) why = 'kept changing';
           log.info(`Backup profile ${profile.id} ${why} for ${appname}/${component} (${outcome.reason}); taking the full backup instead`);
           diagnostics.push({
             check: `Backup profile (${component})`,
@@ -1203,6 +1272,18 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList, c
       }
       if (!profiled) {
         Object.keys(usedProfiles).forEach((component) => { delete usedProfiles[component]; });
+        // A partial archive may already sit where the full one goes: written by
+        // this attempt before the volume changed under it, or by an earlier run
+        // on this node. appendbackuptask only replaces it once it has stopped
+        // the app, and it can refuse before that in its streamed answer, which
+        // reads as success here; what follows would then upload the partial
+        // archive as a full one, and a full one is restored over a wiped
+        // appdata. Cleared first, so a refusal leaves nothing to pick up. A
+        // node that cannot clear it fails this attempt, which moves on to
+        // another node.
+        for (let i = 0; i < componentList.length; i += 1) {
+          await removeVolumeObject(node, zelidAuth, appname, componentList[i], `backup/local/backup_${componentList[i].toLowerCase()}.tar.gz`);
+        }
       }
     }
 
@@ -1588,6 +1669,7 @@ module.exports = {
   testHooks: {
     listVolumeFolder,
     ensureVolumeFolder,
+    removeVolumeObject,
     compressOnNode,
     createProfiledArchiveOnNode,
   },

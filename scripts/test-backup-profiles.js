@@ -203,6 +203,18 @@ async function main() {
         reply: () => success([{ name: `backup_${COMPONENT}.tar.gz`, create: 1760000000000, size: 74125 }]),
       },
     ];
+    // Clearing the archive slot before a fallback: removeobject answers success
+    // whether or not the file was there.
+    const stalePath = `backup/local/backup_${COMPONENT}.tar.gz`;
+    const removeRoute = (reply = () => success({})) => ({
+      match: (r) => r.method === 'get' && r.url === `${NODE}/apps/removeobject/${APP}/${COMPONENT}/${encodeURIComponent(stalePath)}`,
+      reply,
+    });
+    const clearedBeforeFullBackup = () => {
+      const removed = calls.findIndex((r) => r.url.includes('/apps/removeobject/'));
+      const full = calls.findIndex((r) => r.url.endsWith('/apps/appendbackuptask'));
+      return removed !== -1 && full !== -1 && removed < full;
+    };
 
     calls.length = 0;
     routes = [...worldFolders(), anyCreateFolder, ...compressRoute(['Succeeded']), ...listingRoutes];
@@ -211,23 +223,36 @@ async function main() {
     assert.strictEqual(result.components[0].profile, 'dragonwilds-world');
     assert.strictEqual(result.components[0].backups.size, 74125);
     assert(!calls.some((r) => r.url.endsWith('/apps/appendbackuptask')), 'a profiled backup never stops the app for a full archive');
+    assert(!calls.some((r) => r.url.includes('/apps/removeobject/')), 'a profiled backup keeps its archive');
 
     // Layout mismatch -> the full backup, exactly as before.
     calls.length = 0;
-    routes = [
-      ...worldFolders([]),
-      {
-        match: (r) => r.url === `${NODE}/apps/appendbackuptask`,
-        reply: () => ({ status: 200, headers: {}, data: 'Finalizing...\n' }),
-      },
-      ...listingRoutes,
-    ];
+    const fullBackupRoute = {
+      match: (r) => r.url === `${NODE}/apps/appendbackuptask`,
+      reply: () => ({ status: 200, headers: {}, data: 'Finalizing...\n' }),
+    };
+    routes = [...worldFolders([]), removeRoute(), fullBackupRoute, ...listingRoutes];
     result = await fluxOS.createBackupTaskOnNode(NODE, 'auth', APP, [COMPONENT], { [COMPONENT]: profile });
     assert.strictEqual(result.status, 'completed');
     assert.strictEqual(result.components[0].profile, null);
     const full = calls.find((r) => r.url.endsWith('/apps/appendbackuptask'));
     assert.deepStrictEqual(full.data, { appname: APP, backup: [{ component: COMPONENT, backup: true }] });
     assert(result.diagnostics.some((d) => d.outcome === 'skipped' && /dragonwilds-world does not fit/.test(d.detail)));
+    assert(clearedBeforeFullBackup(), 'the archive slot is cleared before the full backup');
+
+    // The slot cannot be cleared -> this attempt fails, never a partial archive
+    // uploaded as a full one.
+    calls.length = 0;
+    routes = [
+      ...worldFolders([]),
+      removeRoute(() => ({ status: 200, headers: {}, data: { status: 'error', data: { message: 'Refused: volume busy' } } })),
+      fullBackupRoute,
+      ...listingRoutes,
+    ];
+    result = await fluxOS.createBackupTaskOnNode(NODE, 'auth', APP, [COMPONENT], { [COMPONENT]: profile });
+    assert.notStrictEqual(result && result.status, 'completed');
+    assert(!calls.some((r) => r.url.endsWith('/apps/appendbackuptask')));
+    assert(!calls.some((r) => r.url.startsWith(`${NODE}/backup/getlocalbackuplist/`)));
 
     // The node cannot write the partial archive -> the full backup, not no backup.
     calls.length = 0;
@@ -238,10 +263,8 @@ async function main() {
         match: (r) => r.url === `${NODE}/apps/compressobject`,
         reply: () => ({ status: 404, headers: {}, data: 'Cannot POST /apps/compressobject' }),
       },
-      {
-        match: (r) => r.url === `${NODE}/apps/appendbackuptask`,
-        reply: () => ({ status: 200, headers: {}, data: 'Finalizing...\n' }),
-      },
+      removeRoute(),
+      fullBackupRoute,
       ...listingRoutes,
     ];
     result = await fluxOS.createBackupTaskOnNode(NODE, 'auth', APP, [COMPONENT], { [COMPONENT]: profile });
@@ -249,6 +272,7 @@ async function main() {
     assert.strictEqual(result.components[0].profile, null);
     assert(calls.some((r) => r.url.endsWith('/apps/appendbackuptask')));
     assert(result.diagnostics.some((d) => d.outcome === 'skipped' && /dragonwilds-world archive failed: .*older than 8\.18/.test(d.detail)));
+    assert(clearedBeforeFullBackup());
 
     // No profile -> unchanged behaviour.
     calls.length = 0;
@@ -298,14 +322,49 @@ async function main() {
       file('_main.851.chunks', 681), file('_main.851.db2', 164003), file('_main.852.fwl2', 2998), file('_main.852.ok', 4),
     ];
     const worlds = valheim.include[0];
+    // Every refusal but "no world" is a sync caught half-way: unsettled.
+    const unsettledReason = (problem) => {
+      assert.strictEqual(problem && problem.unsettled, true, `unsettled: ${JSON.stringify(problem)}`);
+      return problem.reason;
+    };
     assert.strictEqual(worlds.validate([dir('localhost', 7800000, committed)]), null);
-    assert.match(worlds.validate([dir('Vally2026', 170000, halfSynced)]), /_main\.852\.ok but no _main\.852\.db2 \(a half-synced save\)/);
-    assert.match(worlds.validate([dir('W', 10, [file('_main.1.db2', 9)])]), /no _main\.N\.ok/, 'a first save in progress');
+    assert.match(unsettledReason(worlds.validate([dir('Vally2026', 170000, halfSynced)])), /_main\.852\.ok but no _main\.852\.db2 \(a half-synced save\)/);
+    assert.match(unsettledReason(worlds.validate([dir('W', 10, [file('_main.1.db2', 9)])])), /no _main\.N\.ok/, 'a first save in progress');
     assert.strictEqual(worlds.validate([file('Old.db', 9000), file('Old.fwl', 40)]), null, 'a pre-1.0 world');
-    assert.match(worlds.validate([file('Old.db', 9000)]), /Old\.db has no Old\.fwl/);
+    assert.match(unsettledReason(worlds.validate([file('Old.db', 9000)])), /Old\.db has no Old\.fwl/);
     assert.strictEqual(worlds.validate([]), 'no world');
     assert.strictEqual(worlds.validate([dir('empty', 0, [])]), 'no world');
     assert.strictEqual(worlds.validate([dir('localhost', 1, committed), dir('Vally2026', 1, halfSynced)]) !== null, true, 'every world must be committed');
+    // The next save half-arrived: a chunk newer than the committed .ok. Its
+    // .ok is at 60 minutes ago; a chunk written a minute later is not this save.
+    assert.match(
+      unsettledReason(worlds.validate([dir('localhost', 1, [...committed, file('20_1e__1_2.chunk', 593380, 59)])])),
+      /localhost\/20_1e__1_2\.chunk is newer than _main\.260\.ok/,
+    );
+    assert.strictEqual(worlds.validate([dir('localhost', 1, [...committed.slice(0, -1), file('1f_1e__1_1.chunk', 900, 59.95)])]), null, 'within the tolerance of one save');
+    assert.strictEqual(worlds.validate([dir('localhost', 1, [...committed, file('_main.261.sync-conflict-20261014-071000-AAAAAAA.db2', 9, 1)])]), null, 'a newer conflict copy is not a save');
+    const timeless = committed.map((entry) => ({ ...entry, modifiedAt: undefined }));
+    assert.strictEqual(worlds.validate([dir('localhost', 1, timeless)]), null, 'no modifiedAt: the generation check alone');
+    // Syncthing still writing a file, inside a world folder or beside it.
+    assert.match(unsettledReason(worlds.validate([dir('localhost', 1, [...committed, file('.syncthing._main.261.db2.tmp', 9, 0)])])), /localhost\/\.syncthing\._main\.261\.db2\.tmp is still being synced/);
+    assert.match(unsettledReason(worlds.validate([dir('localhost', 1, [...committed, file('~syncthing~1e_1e__1_46.chunk.tmp', 9, 0)])])), /still being synced/);
+    assert.match(unsettledReason(worlds.validate([file('Old.db', 9000), file('Old.fwl', 40), file('.syncthing.Old.db.tmp', 9000, 0)])), /\.syncthing\.Old\.db\.tmp is still being synced/);
+    // planProfiledArchive carries the flag; a plain-string refusal does not.
+    const vPlan = (worldsListing) => backupProfiles.planProfiledArchive(valheim, {
+      worlds_local: worldsListing, backups: null, bepinex: null, valheimplus: null, prefs: null, 'adminlist.txt': null, 'bannedlist.txt': null, 'permittedlist.txt': null,
+    });
+    assert.deepStrictEqual(vPlan([dir('Vally2026', 1, halfSynced)]), {
+      fits: false, reason: 'worlds_local: Vally2026 has _main.852.ok but no _main.852.db2 (a half-synced save)', unsettled: true,
+    });
+    assert.deepStrictEqual(vPlan([]), { fits: false, reason: 'worlds_local: no world' });
+
+    // sameListings: by name, kind, size and modifiedAt, inside listed folders too.
+    const listingsA = { worlds_local: [dir('localhost', 1, committed)], prefs: file('prefs', 775), bepinex: null };
+    assert(backupProfiles.sameListings(listingsA, JSON.parse(JSON.stringify(listingsA))));
+    assert(!backupProfiles.sameListings(listingsA, { ...listingsA, worlds_local: [dir('localhost', 1, [...committed.slice(1), { ...committed[0], size: 184 }])] }), 'a chunk rewritten');
+    assert(!backupProfiles.sameListings(listingsA, { ...listingsA, worlds_local: [dir('localhost', 1, [...committed, file('x.chunk', 1)])] }), 'a chunk added');
+    assert(!backupProfiles.sameListings(listingsA, { ...listingsA, bepinex: [] }), 'a folder appeared');
+    assert(!backupProfiles.sameListings(listingsA, { ...listingsA, prefs: { ...listingsA.prefs, modifiedAt: new Date().toISOString() } }), 'a file touched');
 
     // The volume: a committed world beside Valheim's own automatic backup, the
     // hourly zips (the newest still being written), BepInEx and the lists.
@@ -366,7 +425,65 @@ async function main() {
     });
     const listedFolders = calls.filter((r) => r.url.includes('/apps/getfolderinfo/')).map((r) => decodeURIComponent(r.url.split('/').pop()));
     assert(!listedFolders.some((folder) => folder.includes('_backup_auto')), "Valheim's own backups are never listed");
-    assert.strictEqual(listedFolders.filter((folder) => folder === 'appdata').length, 1, 'appdata is listed once for every file entry');
+    assert.strictEqual(listedFolders.filter((folder) => folder === 'appdata').length, 2, 'appdata is listed once for every file entry, before and after the archive');
+    assert.strictEqual(calls.filter((r) => r.url.endsWith('/apps/compressobject')).length, 1, 'nothing changed: one archive');
+    // A world folder whose listing answers each time with the next of `replies`
+    // (the last one repeats), in front of the volume above.
+    const worldListedAs = (...replies) => {
+      let served = 0;
+      return {
+        match: (r) => r.method === 'get' && r.url === `${NODE}/apps/getfolderinfo/${VAPP}/${VCOMP}/${encodeURIComponent('appdata/worlds_local/localhost')}`,
+        reply: () => { const entries = replies[Math.min(served, replies.length - 1)]; served += 1; return success(entries); },
+      };
+    };
+    const compressions = () => calls.filter((r) => r.url.endsWith('/apps/compressobject')).length;
+    const worldListings = () => calls.filter((r) => r.url.endsWith(encodeURIComponent('appdata/worlds_local/localhost'))).length;
+    const nextSave = [...committed, file('1e_1e__1_47.chunk', 1142295, 1)];
+    const nextSaveCommitted = [...nextSave.filter((entry) => !/^_main\.260\./.test(entry.name)),
+      file('_main.261.chunks', 197, 1), file('_main.261.db2', 149852, 1), file('_main.261.fwl2', 1563, 1), file('_main.261.ok', 4, 1)];
+
+    // Caught half-way, whole when listed again after the wait: the profile still.
+    calls.length = 0;
+    routes = [worldListedAs(halfSynced, committed), ...valheimVolume()];
+    outcome = await fluxOS.testHooks.createProfiledArchiveOnNode(NODE, 'auth', VAPP, VCOMP, valheim, []);
+    assert.deepStrictEqual(outcome, { fits: true });
+    assert.strictEqual(worldListings(), 3, 'half-synced, listed again after the wait, then after the archive');
+    assert.strictEqual(compressions(), 1);
+
+    // A save arrived while the archive was being written: written again from the
+    // new listing, and kept once a listing after it matches.
+    calls.length = 0;
+    routes = [worldListedAs(committed, nextSaveCommitted), ...valheimVolume()];
+    outcome = await fluxOS.testHooks.createProfiledArchiveOnNode(NODE, 'auth', VAPP, VCOMP, valheim, []);
+    assert.deepStrictEqual(outcome, { fits: true });
+    assert.strictEqual(compressions(), 2, 'the first archive may hold half a save');
+    assert.strictEqual(worldListings(), 3);
+
+    // The volume changes under every attempt: the full backup.
+    calls.length = 0;
+    const touched = (minutesAgo) => committed.map((entry) => (entry.name === '_main.260.ok' ? file(entry.name, 4, minutesAgo) : entry));
+    routes = [worldListedAs(committed, touched(50), touched(40)), ...valheimVolume()];
+    outcome = await fluxOS.testHooks.createProfiledArchiveOnNode(NODE, 'auth', VAPP, VCOMP, valheim, []);
+    assert.deepStrictEqual(outcome, { fits: false, changing: true, reason: 'the files changed while archiving, 2 times' });
+    assert.strictEqual(compressions(), 2);
+
+    // What arrived while archiving is a save half-way: waited for like the first
+    // listing, then archived again once it is whole.
+    calls.length = 0;
+    routes = [worldListedAs(committed, nextSave, nextSaveCommitted), ...valheimVolume()];
+    outcome = await fluxOS.testHooks.createProfiledArchiveOnNode(NODE, 'auth', VAPP, VCOMP, valheim, []);
+    assert.deepStrictEqual(outcome, { fits: true });
+    assert.strictEqual(compressions(), 2);
+    assert.strictEqual(worldListings(), 4, 'before, after the archive (half a save), after the wait, after the second archive');
+
+    // ... and when it is still half-way after the wait: the full backup, no third archive.
+    calls.length = 0;
+    routes = [worldListedAs(committed, nextSave), ...valheimVolume()];
+    outcome = await fluxOS.testHooks.createProfiledArchiveOnNode(NODE, 'auth', VAPP, VCOMP, valheim, []);
+    assert.strictEqual(outcome.fits, false);
+    assert.strictEqual(outcome.unsettled, true);
+    assert.match(outcome.reason, /1e_1e__1_47\.chunk is newer than _main\.260\.ok/);
+    assert.strictEqual(compressions(), 1);
 
     // The standby caught half-way through a save -> the full backup.
     calls.length = 0;
@@ -374,6 +491,8 @@ async function main() {
     outcome = await fluxOS.testHooks.createProfiledArchiveOnNode(NODE, 'auth', VAPP, VCOMP, valheim, []);
     assert.strictEqual(outcome.fits, false);
     assert.match(outcome.reason, /^worlds_local: localhost has _main\.852\.ok but no _main\.852\.db2/);
+    assert.strictEqual(outcome.unsettled, true);
+    assert.strictEqual(worldListings(), 2, 'listed again after the wait before giving up');
     assert(!calls.some((r) => r.url.endsWith('/apps/compressobject')));
 
     // More world folders than are worth checking -> the full backup.

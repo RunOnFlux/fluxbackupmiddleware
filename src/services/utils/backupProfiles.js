@@ -160,8 +160,9 @@ function newestSettledFile(listing, { name, settledMs = 0 }, now) {
  * @param {object} profile
  * @param {Object<string, Array|object|null>} listings - from collectProfileListings
  * @param {number} [now] - the time `latest` measures settledMs from
- * @returns {{fits: true, sources: string[]} | {fits: false, reason: string}}
- *   sources are relative to the VOLUME root, as compressobject takes them
+ * @returns {{fits: true, sources: string[]} | {fits: false, reason: string, unsettled?: true}}
+ *   sources are relative to the VOLUME root, as compressobject takes them;
+ *   unsettled when an entry's `validate` found its files still arriving
  */
 function planProfiledArchive(profile, listings, now = Date.now()) {
   const sources = [`appdata/${PROFILE_MARKER_DIR}`];
@@ -193,7 +194,10 @@ function planProfiledArchive(profile, listings, now = Date.now()) {
     }
     if (entry.validate) {
       const problem = entry.validate(listing);
-      if (problem) return { fits: false, reason: `${entry.path}: ${problem}` };
+      if (problem) {
+        const { reason, unsettled } = typeof problem === 'string' ? { reason: problem } : problem;
+        return { fits: false, reason: `${entry.path}: ${reason}`, ...(unsettled ? { unsettled: true } : {}) };
+      }
     }
     if (entry.latest) {
       const newest = newestSettledFile(listing, entry.latest, now);
@@ -209,6 +213,33 @@ function planProfiledArchive(profile, listings, now = Date.now()) {
   return { fits: true, sources };
 }
 
+/**
+ * Whether two collectProfileListings results describe the same files: every
+ * entry, and the listed folders inside it, by name, kind, size and modifiedAt.
+ * A folder's size counts all it holds, so a file written deeper still shows.
+ * Taken before and after the archive is written, a difference means the volume
+ * changed meanwhile (Syncthing delivering a save) and the archive may hold
+ * half of it.
+ */
+function sameListings(before, after) {
+  const describe = (listings) => {
+    const lines = [];
+    const add = (where, item) => {
+      if (!item) return;
+      lines.push([where, item.name, item.isDirectory ? 'd' : 'f', item.size, item.modifiedAt].join('|'));
+      if (Array.isArray(item.children)) item.children.forEach((child) => add(`${where}/${item.name}`, child));
+    };
+    Object.keys(listings).forEach((entryPath) => {
+      const listing = listings[entryPath];
+      if (Array.isArray(listing)) listing.forEach((item) => add(entryPath, item));
+      else if (listing) add(entryPath, listing);
+      else lines.push(`${entryPath}|missing`);
+    });
+    return lines.sort().join('\n');
+  };
+  return describe(before) === describe(after);
+}
+
 module.exports = {
   PROFILE_MARKER_DIR,
   MAX_CHILD_FOLDERS,
@@ -217,4 +248,5 @@ module.exports = {
   resolveComponentProfiles,
   collectProfileListings,
   planProfiledArchive,
+  sameListings,
 };

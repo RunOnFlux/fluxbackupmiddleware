@@ -43,7 +43,9 @@
  *                each archived child is replaced as a whole and the rest of the
  *                directory is left alone
  *   validate     (listing) => null when the listing is fit to archive, or the
- *                reason it is not
+ *                reason it is not: a string, or { reason, unsettled: true } when
+ *                the files are still arriving (a sync caught half-way), which is
+ *                worth listing again shortly before taking the full backup
  *
  * When a required path is missing, holds nothing that matches or fails its
  * `validate`, the app does not have the layout the profile was written for (an
@@ -54,47 +56,72 @@
  * container does not run, so nothing is written while the paths are archived.
  */
 
+/** Syncthing writes a file under one of these names and renames it when it is whole. */
+const SYNCTHING_TEMP = /^(\.syncthing\..*\.tmp|~syncthing~.*\.tmp)$/;
+const SYNC_CONFLICT = /\.sync-conflict-/;
+/** modifiedAt has whole seconds; a save writes all of its files within one. */
+const SAVE_TOLERANCE_MS = 5000;
+
 /**
  * Whether every Valheim world in worlds_local is a committed save.
  *
  * Since 1.0 a world is a folder of chunks whose save generation N is committed
  * by `_main.N.ok`, written last; `_main.N.db2`, `.chunks` and `.fwl2` are the
- * same generation. Backups are taken on the standby, which has been caught
- * holding a new `.ok` beside the previous generation's `.db2` (Syncthing
- * half-way through a save): archived, that loads as a brand new world. A world
- * from before 1.0 is the flat pair `<name>.db` + `<name>.fwl`.
+ * same generation, and the `*.chunk` files it rewrote are written before them
+ * (the server logs "Chunks writing done" before the DB2). Backups are taken on
+ * the standby, which has been caught holding a new `.ok` beside the previous
+ * generation's `.db2` (Syncthing half-way through a save): archived, that loads
+ * as a brand new world. The other half of the same race is a chunk of the next
+ * save that has arrived before its `.ok`: newer than the committed `.ok`. A
+ * world from before 1.0 is the flat pair `<name>.db` + `<name>.fwl`.
+ *
+ * Every refusal here but "no world" is a sync caught half-way, so `unsettled`:
+ * Syncthing finishes a save in seconds, and listing again shortly after
+ * usually finds it whole.
  *
  * Sync-conflict copies (`_main.890.sync-conflict-....db2`) match none of the
  * names below and are moved out of the folder by the spec's start hook.
  */
 function valheimWorldsCommitted(listing) {
+  const unsettled = (reason) => ({ reason, unsettled: true });
+  const time = (file) => Date.parse(file.modifiedAt);
   let worlds = 0;
   for (let i = 0; i < listing.length; i += 1) {
     const item = listing[i];
+    if (item.isFile && SYNCTHING_TEMP.test(String(item.name))) {
+      return unsettled(`${item.name} is still being synced`);
+    }
     if (item.isDirectory) {
-      const sizes = new Map((item.children || [])
-        .filter((file) => file && file.isFile)
-        .map((file) => [String(file.name), Number(file.size)]));
-      const generations = [...sizes.keys()]
+      const files = (item.children || []).filter((file) => file && file.isFile);
+      const syncing = files.find((file) => SYNCTHING_TEMP.test(String(file.name)));
+      if (syncing) return unsettled(`${item.name}/${syncing.name} is still being synced`);
+      const byName = new Map(files.map((file) => [String(file.name), file]));
+      const generations = [...byName.keys()]
         .map((name) => /^_main\.(\d+)\.ok$/.exec(name))
         .filter(Boolean)
         .map((found) => Number(found[1]));
       if (generations.length === 0) {
         // A folder with save files but no marker is a first save in progress.
-        if ([...sizes.keys()].some((name) => name.startsWith('_main.'))) {
-          return `${item.name} has save files but no _main.N.ok`;
+        if ([...byName.keys()].some((name) => name.startsWith('_main.'))) {
+          return unsettled(`${item.name} has save files but no _main.N.ok`);
         }
         // eslint-disable-next-line no-continue
         continue;
       }
       const n = Math.max(...generations);
-      const missing = ['db2', 'chunks', 'fwl2'].find((ext) => !(sizes.get(`_main.${n}.${ext}`) > 0));
-      if (missing) return `${item.name} has _main.${n}.ok but no _main.${n}.${missing} (a half-synced save)`;
+      const missing = ['db2', 'chunks', 'fwl2'].find((ext) => !(Number(byName.get(`_main.${n}.${ext}`)?.size) > 0));
+      if (missing) return unsettled(`${item.name} has _main.${n}.ok but no _main.${n}.${missing} (a half-synced save)`);
+      const committedAt = time(byName.get(`_main.${n}.ok`));
+      if (Number.isFinite(committedAt)) {
+        const newer = files.find((file) => !SYNC_CONFLICT.test(String(file.name))
+          && time(file) > committedAt + SAVE_TOLERANCE_MS);
+        if (newer) return unsettled(`${item.name}/${newer.name} is newer than _main.${n}.ok (the next save half-synced)`);
+      }
       worlds += 1;
     } else if (item.isFile && /\.db$/i.test(item.name) && Number(item.size) > 0) {
       const header = item.name.replace(/\.db$/i, '.fwl');
       if (!listing.some((file) => file.isFile && file.name === header && Number(file.size) > 0)) {
-        return `${item.name} has no ${header}`;
+        return unsettled(`${item.name} has no ${header}`);
       }
       worlds += 1;
     }
@@ -135,14 +162,15 @@ module.exports = [
     include: [
       // Each world, on its own: a 1.0 world folder or a pre-1.0 .db/.fwl pair.
       // Valheim's own automatic backups sit beside them (`<world>_backup_auto-*`)
-      // and are left out, as the image's hourly zip leaves them out. A restore
-      // replaces each world folder whole, which a chunked world needs: chunks
-      // left over from another save corrupt it.
+      // and are left out, as the image's hourly zip leaves them out, and so are
+      // Syncthing's conflict copies. A restore replaces each world folder
+      // whole, which a chunked world needs: chunks left over from another save
+      // corrupt it.
       {
         path: 'worlds_local',
         required: true,
         children: true,
-        excludeChildren: /_backup_auto-/,
+        excludeChildren: /_backup_auto-|\.sync-conflict-/,
         validate: valheimWorldsCommitted,
       },
       // The newest hourly zip: taken on the primary between two saves, so a
