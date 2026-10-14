@@ -29,7 +29,8 @@
  * from Steam. A path the app writes and nothing else can recreate belongs in
  * `include`.
  *
- *   path         the directory, relative to appdata
+ *   path         the directory, relative to appdata ('' for appdata itself,
+ *                with `children`)
  *   required     the profile does not fit this app unless the directory exists
  *   mustContain  a file name pattern at least one non-empty file must match,
  *                so a copy that holds no world is never taken as a backup
@@ -52,7 +53,7 @@
  *                also archive the newest settled entry of `<child>/<path>`
  *                whose name matches, as `latest` does (a folder when
  *                `directory`), even though `path` itself is left out
- *   validate     (listing) => null when the listing is fit to archive, or the
+ *   validate     (listing, now) => null when the listing is fit to archive, or the
  *                reason it is not: a string, or { reason, unsettled: true } when
  *                the files are still arriving (a sync caught half-way), which is
  *                worth listing again shortly before taking the full backup
@@ -147,6 +148,16 @@ const PALWORLD_SAVING = /\.new_tmp$|^\.atomic_save_update_manifest|^world_save_t
  * rewrites (deleted on the primary, kept on the standby), seen 4 h and 18 h old.
  */
 const PALWORLD_PREVIOUS_SAVE_MS = 15 * 60 * 1000;
+/**
+ * A world nothing in which has changed for this long is not being saved or
+ * synced: waiting will not change it, and the full backup would hold the same
+ * files. Its consistency checks are skipped. Seen 2026-10-14, all of them
+ * refused for good otherwise: a final shutdown save whose LevelMeta.sav landed
+ * 10 s and 30 s after Level.sav, a world_save_temp/ left by a save that died
+ * five hours earlier, and a world folder the owner set aside, whose players
+ * were never saved with it.
+ */
+const PALWORLD_QUIET_MS = 15 * 60 * 1000;
 
 /**
  * Whether every Palworld world in SaveGames/0 is one committed save.
@@ -163,9 +174,12 @@ const PALWORLD_PREVIOUS_SAVE_MS = 15 * 60 * 1000;
  * so `unsettled`.
  *
  * A world is a folder holding Level.sav. Folders without one (an unused GUID,
- * an empty world) are archived as they are and not checked.
+ * an empty world) are archived as they are and not checked, and so is a world
+ * that has been quiet for PALWORLD_QUIET_MS: these checks are about a save in
+ * flight. On a standby whose sync stopped half-way the live files can then be
+ * two saves apart; the restore point archived beside them is one whole save.
  */
-function palworldWorldsCommitted(listing) {
+function palworldWorldsCommitted(listing, now = Date.now()) {
   const unsettled = (reason) => ({ reason, unsettled: true });
   const time = (file) => Date.parse(file.modifiedAt);
   let worlds = 0;
@@ -176,6 +190,18 @@ function palworldWorldsCommitted(listing) {
     }
     if (item.isDirectory) {
       const inside = [...(item.children || []), ...(item.excludedChildren || [])].filter(Boolean);
+      const players = inside.find((entry) => entry.isDirectory && entry.name === 'Players');
+      const files = (players && players.children) || [];
+      // The restore points are left out: the game adds one every minute
+      // while it runs, whatever the state of the files around them.
+      const changes = [...inside.filter((entry) => entry.name !== 'backup'), ...files]
+        .map((entry) => time(entry)).filter(Number.isFinite);
+      if (inside.some((entry) => entry.isFile && entry.name === 'Level.sav')
+        && changes.length && now - Math.max(...changes) >= PALWORLD_QUIET_MS) {
+        worlds += 1;
+        // eslint-disable-next-line no-continue
+        continue;
+      }
       const byName = new Map(inside.filter((entry) => entry.isFile).map((entry) => [String(entry.name), entry]));
       const level = byName.get('Level.sav');
       const savedAt = level ? time(level) : NaN;
@@ -194,8 +220,6 @@ function palworldWorldsCommitted(listing) {
           if (Math.abs(time(meta) - savedAt) > SAVE_TOLERANCE_MS) {
             return unsettled(`${item.name}/LevelMeta.sav is not from the same save as Level.sav`);
           }
-          const players = inside.find((entry) => entry.isDirectory && entry.name === 'Players');
-          const files = (players && players.children) || [];
           const syncing = files.find((file) => SYNCTHING_TEMP.test(String(file.name)) && !abandoned(file));
           if (syncing) return unsettled(`${item.name}/Players/${syncing.name} is still being synced`);
           const mismatched = files.find((file) => file.isFile && /\.sav$/i.test(String(file.name)) && (
@@ -310,9 +334,17 @@ module.exports = [
         validate: palworldWorldsCommitted,
       },
       // PalWorldSettings.ini (the admin password the hub reads, every world
-      // rule) and GameUserSettings.ini (which world folder is loaded). The
-      // rest of Pal/Saved is crash reports, logs and flux-guard.log.
+      // rule) and GameUserSettings.ini (which world folder is loaded).
       { path: 'Config/LinuxServer' },
+      // Anything else the owner put in Pal/Saved (seen: a Mods folder, a
+      // UE4SS build, a world zip), which nothing else has a copy of. Left out
+      // is what the game and the image write again by themselves: crash
+      // reports, logs, ImGui, CrashReportClient and flux-guard.log.
+      {
+        path: '',
+        children: true,
+        excludeChildren: /^(SaveGames|Config|Crashes|ImGui|Logs|\.flux-backup)$|^flux-guard.*\.log$/,
+      },
     ],
   },
 ];

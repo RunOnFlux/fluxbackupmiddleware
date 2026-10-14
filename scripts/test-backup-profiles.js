@@ -602,6 +602,18 @@ async function main() {
     assert.match(unsettledReason(pWorlds.validate([pWorld(worldFiles([...players, pFile('.syncthing.DB2C1001000000000000000000000000.sav.tmp', 9, at(1))]))])), /Players\/\.syncthing\..* is still being synced/);
     assert.match(unsettledReason(pWorlds.validate([pWorld([pFile('Level.sav', 9, at(SAVED)), pFile('LevelMeta.sav', 1931, at(SAVED + 1))])])), /LevelMeta\.sav is not from the same save/);
     assert.match(unsettledReason(pWorlds.validate([pWorld([pFile('Level.sav', 9, at(SAVED))])])), /no LevelMeta\.sav/);
+    // A world nothing in which has changed for 15 minutes is not mid-save:
+    // waiting would not change it. All three were refused for good before.
+    const quiet = (minutesAgo, extra = [], playerFiles = []) => pWorld([
+      pFile('Level.sav', 4587627, at(minutesAgo)), pFile('LevelMeta.sav', 1931, at(minutesAgo, 10)),
+      pDir('Players', 1, { children: playerFiles, modifiedAt: at(minutesAgo) }), ...extra,
+    ]);
+    assert.strictEqual(pWorlds.validate([quiet(24000)]), null, 'a final save whose LevelMeta.sav landed 10 s later');
+    assert.match(unsettledReason(pWorlds.validate([quiet(3)])), /LevelMeta\.sav is not from the same save/, 'the same, still being saved');
+    assert.strictEqual(pWorlds.validate([quiet(300, [pDir('world_save_temp', 4914137, { modifiedAt: at(300, -2) })])]), null, 'a save that died hours ago');
+    assert.strictEqual(pWorlds.validate([quiet(600, [], [pFile('16B1C9F3000000000000000000000000.sav', 9, at(605))])]), null, 'a world set aside');
+    assert.match(unsettledReason(pWorlds.validate([quiet(600, [], [pFile('16B1C9F3000000000000000000000000.sav', 9, at(1))])])), /not from the same save/, 'quiet is every file, players too');
+    assert.match(unsettledReason(pWorlds.validate([quiet(600)], Date.now() - 590 * 60000)), /LevelMeta/, 'measured from `now`');
 
     // The volume, as listed on a standby.
     const W = 'C52D1EBB4AE561E5C1BF519CB56B3101';
@@ -611,6 +623,12 @@ async function main() {
     });
     const strip = (entries) => entries.map(({ children, ...rest }) => rest);
     const palworldVolume = (files = worldFiles()) => [
+      pRoute('appdata', [
+        pDir('Config', 9832), pDir('Crashes', 25304), pDir('ImGui', 61), pDir('SaveGames', 134795822),
+        pFile('flux-guard.log', 75994, at(1)), pFile('flux-guard.sync-conflict-20260920-190406-U3XHAR2.log', 9000, at(9000)),
+        pDir('Mods', 41030000), pFile('1717_AA9DD0E543D84265BF2E2947A1F66406.zip', 115000, at(9000)),
+      ]),
+      pRoute('appdata/Mods', [pFile('PalBoxGate.pak', 41030000, at(9000))]),
       pRoute('appdata/SaveGames/0', [pDir(W, 134795822), pDir('backup', 3862)]),
       pRoute(`appdata/SaveGames/0/${W}`, [...strip(files), pDir('backup', 129857180), pDir('world_save_bak', 4727876),
         pFile('.syncthing.Level.sav.new_tmp.tmp', 3032089, at(230))]),
@@ -648,10 +666,14 @@ async function main() {
       // The newest restore point at least ten minutes old.
       `appdata/SaveGames/0/${W}/backup/world/2026.10.14-11.59.42`,
       'appdata/Config/LinuxServer',
+      // What the owner put in Pal/Saved; not the crash reports, ImGui or logs.
+      'appdata/Mods',
+      'appdata/1717_AA9DD0E543D84265BF2E2947A1F66406.zip',
     ]);
     const pListed = calls.filter((r) => r.url.includes('/apps/getfolderinfo/')).map((r) => decodeURIComponent(r.url.split('/').pop()));
     assert(!pListed.includes('appdata/SaveGames/0/backup'), 'the stray restore point folder is not a world');
     assert(!pListed.some((folder) => folder.endsWith('world_save_bak')));
+    assert(!pListed.some((folder) => /^appdata\/(Crashes|ImGui|SaveGames)$/.test(folder)), 'left out at the top, never listed');
     assert.strictEqual(compressions(), 1, 'nothing changed: one archive');
 
     // The game writes a restore point every minute: a new one, or one more

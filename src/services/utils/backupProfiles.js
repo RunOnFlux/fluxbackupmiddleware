@@ -85,6 +85,8 @@ const parentOf = (entryPath) => {
   return slash === -1 ? '' : entryPath.slice(0, slash);
 };
 const baseName = (entryPath) => entryPath.slice(entryPath.lastIndexOf('/') + 1);
+/** A path under a profile entry's; an entry's path is '' for appdata itself. */
+const joinPath = (folder, name) => (folder ? `${folder}/${name}` : String(name));
 
 /**
  * One folder of a `children` entry with `excludeWithin`: what it holds less
@@ -160,7 +162,7 @@ async function collectProfileListings(profile, list) {
         const item = kept[j];
         if (item.isDirectory && folders < MAX_CHILD_FOLDERS) {
           folders += 1;
-          const folder = `${entry.path}/${item.name}`;
+          const folder = joinPath(entry.path, item.name);
           // eslint-disable-next-line no-await-in-loop
           const inside = (await listOnce(folder)) || [];
           if (entry.excludeWithin) {
@@ -235,7 +237,7 @@ function planProfiledArchive(profile, listings, now = Date.now()) {
       return { fits: false, reason: `${entry.path} holds more than ${MAX_CHILD_FOLDERS} folders to check` };
     }
     if (entry.validate) {
-      const problem = entry.validate(listing);
+      const problem = entry.validate(listing, now);
       if (problem) {
         const { reason, unsettled } = typeof problem === 'string' ? { reason: problem } : problem;
         return { fits: false, reason: `${entry.path}: ${reason}`, ...(unsettled ? { unsettled: true } : {}) };
@@ -248,7 +250,7 @@ function planProfiledArchive(profile, listings, now = Date.now()) {
     } else if (entry.children) {
       if (!listing.length && entry.required) return { fits: false, reason: `${entry.path} holds nothing to archive` };
       listing.forEach((item) => {
-        const itemPath = `${entry.path}/${item.name}`;
+        const itemPath = joinPath(entry.path, item.name);
         if (!(item.isDirectory && entry.excludeWithin)) {
           sources.push(`appdata/${itemPath}`);
           return;
