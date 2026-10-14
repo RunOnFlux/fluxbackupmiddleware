@@ -696,11 +696,14 @@ async function main() {
     // Mid-save on the standby -> waited for, then archived.
     calls.length = 0;
     let served = 0;
+    // Built once: worldFiles() stamps its files from Date.now(), and two
+    // listings a millisecond apart would read as a save in between.
+    const settledWorld = strip(worldFiles());
     routes = [{
       match: (r) => r.method === 'get' && r.url === `${NODE}/apps/getfolderinfo/${PAPP}/${PCOMP}/${encodeURIComponent(`appdata/SaveGames/0/${W}`)}`,
       reply: () => {
         served += 1;
-        return success(served === 1 ? [...strip(worldFiles()), pFile('.syncthing.LevelMeta.sav.new_tmp.tmp', 1931, at(0))] : strip(worldFiles()));
+        return success(served === 1 ? [...settledWorld, pFile('.syncthing.LevelMeta.sav.new_tmp.tmp', 1931, at(0))] : settledWorld);
       },
     }, ...palworldVolume()];
     outcome = await fluxOS.testHooks.createProfiledArchiveOnNode(NODE, 'auth', PAPP, PCOMP, palworld, []);
@@ -715,6 +718,92 @@ async function main() {
       return [];
     });
     assert.match(backupProfiles.planProfiledArchive(palworld, crowdedListings).reason, /more than 20 folders/);
+
+    // --- Minecraft -----------------------------------------------------------------
+    const mcProfile = (component, repotag = null, appname = 'minecraftserver1790000000000') => backupProfiles.profileForComponent({
+      appname, component, repotag, componentCount: 1,
+    });
+    assert.strictEqual(mcProfile('minecraft').id, 'minecraft-java-world', 'hub plan component');
+    assert.strictEqual(mcProfile('minecraftserver').id, 'minecraft-java-world');
+    assert.strictEqual(mcProfile('Minecraft', 'itzg/minecraft-server:java17', 'MinecraftPurePwnage').id, 'minecraft-java-world');
+    assert.strictEqual(mcProfile('minecraftbedrock', 'itzg/minecraft-bedrock-server:latest').id, 'minecraft-bedrock-world', 'Bedrock before Java');
+    assert.strictEqual(mcProfile('minecraftbedrockserver', null, 'minecraftbedrockserver1790000000000').id, 'minecraft-bedrock-world');
+    assert.strictEqual(mcProfile('web', 'itzg/minecraft-bedrock-server:latest', 'x').id, 'minecraft-bedrock-world', 'by image');
+
+    // What the Java image installs, from names seen on the fleet (2026-10-14), and
+    // what is the owner's.
+    const javaRoot = mcProfile('minecraft').include[0];
+    const installed = [
+      'libraries', 'versions', '.fabric', 'cache', '.cache', 'logs', 'crash-reports', 'debug',
+      '.fabric-manifest.json', '.forge-manifest.json', '.papermc-manifest.json', '.vanilla-manifest.json', '.neoforge-manifest.json', '.purpur-manifest.json',
+      '.install-fabric.env', '.install-vanilla.env', '.run-forge.env', '.run-neoforge.env', '.paper.env', '.purpur.env',
+      'run.sh', 'run.bat', 'user_jvm_args.txt', '.rcon-cli.env', '.rcon-cli.yaml', 'hs_err_pid297.log',
+      'minecraft_server.1.21.10.jar', 'minecraft_server.1.21.4.jar.download', 'paper-1.21.10-133.jar', 'paper-1.21.8-132.jar.download',
+      'purpur-1.21.8-2648.jar', 'fabric-server-mc.1.21.10-loader.0.17.3-launcher.1.1.0.jar',
+      'forge-1.20.1-47.4.10-installer.jar', 'forge-1.20.1-47.4.10-installer.jar.log', 'forge-26.3-66.0.11-shim.jar', 'forge-1.21.1-52.1.0-shim.jar',
+      '.papermc-manifest.sync-conflict-20260108-165032-EQDP3QP.json', '.rcon-cli.sync-conflict-20260907-095640-LR5NJ4S.env',
+      '.rcon-cli.sync-conflict-20260130-123102-4TFEYDV.yaml', '.mixin.out',
+    ];
+    installed.forEach((name) => assert(javaRoot.excludeChildren.test(name), `${name} is the install`));
+    const owners = [
+      'world', 'world_nether', 'world_the_end', 'season', 'Forever WOrld', 'trashcan', 'mods', 'plugins', 'config', 'datapacks', 'backup', 'cloud-backup',
+      'server.properties', 'ops.json', 'whitelist.json', 'banned-players.json', 'banned-ips.json', 'usercache.json', 'eula.txt', 'server-icon.png',
+      'bukkit.yml', 'spigot.yml', 'purpur.yml', 'log4j2.xml', 'Parties-3.2.18.jar', 'server.jar', 'paper.jar', 'playit', 'options.txt',
+      '.flux-empty-files-1791590881511.zip', 'server.sync-conflict-20260907-080318-LR5NJ4S.properties', '.paper', 'forge-installer-1.15.1-30.0.51.jar',
+    ];
+    owners.forEach((name) => assert(!javaRoot.excludeChildren.test(name), `${name} is kept`));
+    const bedrockRoot = mcProfile('minecraftbedrock').include[0];
+    ['bedrock_server-1.21.111.1', 'backup-pre-1.21.111.1', '.flux-backup'].forEach((name) => assert(bedrockRoot.excludeChildren.test(name), name));
+    ['worlds', 'behavior_packs', 'resource_packs', 'server.properties', 'allowlist.json', 'permissions.json', 'bedrock_server_how_to.html']
+      .forEach((name) => assert(!bedrockRoot.excludeChildren.test(name), name));
+
+    const mFile = (name, size, minutesAgo = 60) => ({
+      name, size, isFile: true, isDirectory: false, modifiedAt: new Date(Date.now() - minutesAgo * 60000).toISOString(),
+    });
+    const mDir = (name, size, children) => ({
+      name, size, isFile: false, isDirectory: true, ...(children ? { children } : {}),
+    });
+    const levelDat = mFile('level.dat', 2700);
+    assert.strictEqual(javaRoot.validate([mDir('Forever WOrld', 8e9, [levelDat, mDir('region', 1)]), mFile('server.properties', 1500)]), null, 'any level-name');
+    assert.strictEqual(javaRoot.validate([mDir('mods', 1, [mFile('a.jar', 9)]), mFile('server.properties', 1500)]), 'no world', 'not generated yet');
+    assert.strictEqual(javaRoot.validate([mDir('world', 1, [mFile('level.dat', 0)])]), 'no world', 'an empty level.dat');
+    assert.deepStrictEqual(javaRoot.validate([mDir('world', 1, [levelDat, mFile('.syncthing.level.dat.tmp', 9, 1)])]), {
+      reason: '.syncthing.level.dat.tmp is still being synced', unsettled: true,
+    });
+    assert.strictEqual(javaRoot.validate([mDir('world', 1, [levelDat, mFile('.syncthing.session.lock.tmp', 9, 600)])]), null, 'a sync given up on hours ago');
+    assert.strictEqual(bedrockRoot.validate([mDir('worlds', 9e6, [mDir('Bedrock level', 9e6)]), mDir('behavior_packs', 1, [])]), null);
+    assert.strictEqual(bedrockRoot.validate([mDir('worlds', 0, [])]), 'no world');
+
+    // The plan over appdata itself: the owner's entries, one by one.
+    const mcListing = await backupProfiles.collectProfileListings(mcProfile('minecraft'), async (folder) => {
+      if (folder === '') {
+        return [
+          mDir('world', 900e6), mDir('libraries', 120e6), mDir('versions', 50e6), mDir('mods', 300e6), mDir('config', 1e6), mDir('logs', 2e6),
+          mFile('server.properties', 1500), mFile('.forge-manifest.json', 900), mFile('run.sh', 300), mFile('.rcon-cli.env', 80),
+          mFile('forge-1.20.1-47.4.10-shim.jar', 30000), mFile('ops.json', 200),
+        ];
+      }
+      if (folder === 'world') return [levelDat, mDir('region', 900e6)];
+      if (folder === 'mods') return [mFile('create-1.20.1.jar', 15e6)];
+      if (folder === 'config') return [mFile('create-common.toml', 9000)];
+      throw new Error(`${folder} is left out and never listed`);
+    });
+    assert.deepStrictEqual(backupProfiles.planProfiledArchive(mcProfile('minecraft'), mcListing), {
+      fits: true,
+      sources: ['appdata/.flux-backup', 'appdata/world', 'appdata/mods', 'appdata/config', 'appdata/server.properties', 'appdata/ops.json'],
+    });
+    assert(!Object.keys(mcListing['']).includes('leftOut'), 'what is left out is not compared by sameListings');
+    assert(backupProfiles.sameListings(mcListing, { '': [...mcListing['']] }), 'nor does it count as a difference');
+
+    // A world so large that the install is a rounding error: the full backup,
+    // which pauses Syncthing (minecraftj1785625568533: 230 MB of 40 GB).
+    const bigWorld = await backupProfiles.collectProfileListings(mcProfile('minecraft'), async (folder) => {
+      if (folder === '') return [mDir('season', 35e9), mDir('libraries', 200e6), mDir('versions', 30e6), mFile('server.properties', 1500)];
+      return [levelDat];
+    });
+    assert.deepStrictEqual(backupProfiles.planProfiledArchive(mcProfile('minecraft'), bigWorld), {
+      fits: false, reason: 'it would leave out only 1% of the volume',
+    });
 
     // --- backupService ----------------------------------------------------------
     backupHooks.setDatabaseForTests({

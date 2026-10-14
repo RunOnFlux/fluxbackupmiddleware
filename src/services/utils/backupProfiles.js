@@ -155,9 +155,14 @@ async function collectProfileListings(profile, list) {
     // eslint-disable-next-line no-await-in-loop
     let listing = await listOnce(entry.path);
     if (Array.isArray(listing) && entry.children) {
-      const kept = listing.filter((item) => item && !(entry.excludeChildren && entry.excludeChildren.test(String(item.name))));
+      const excluded = (item) => Boolean(entry.excludeChildren && entry.excludeChildren.test(String(item.name)));
+      const kept = listing.filter((item) => item && !excluded(item));
+      const leftOut = listing.filter((item) => item && excluded(item));
       let folders = 0;
       listing = [];
+      // What was left out, for `minSavedShare`; not enumerable, so sameListings
+      // never compares it (logs and caches change all the time).
+      Object.defineProperty(listing, 'leftOut', { value: leftOut, enumerable: false });
       for (let j = 0; j < kept.length; j += 1) {
         const item = kept[j];
         if (item.isDirectory && folders < MAX_CHILD_FOLDERS) {
@@ -265,6 +270,22 @@ function planProfiledArchive(profile, listings, now = Date.now()) {
       });
     } else {
       sources.push(`appdata/${entry.path}`);
+    }
+  }
+  if (profile.minSavedShare) {
+    // Measured over the `children` entries, whose listings give the size of
+    // both what is kept and what is left out.
+    const sizeOf = (items) => items.reduce((sum, item) => sum + (Number(item.size) || 0), 0);
+    let saved = 0;
+    let total = 0;
+    profile.include.filter((entry) => entry.children && Array.isArray(listings[entry.path])).forEach((entry) => {
+      const listing = listings[entry.path];
+      const leftOut = sizeOf(listing.leftOut || []);
+      saved += leftOut;
+      total += leftOut + sizeOf(listing);
+    });
+    if (total > 0 && saved / total < profile.minSavedShare) {
+      return { fits: false, reason: `it would leave out only ${Math.round((100 * saved) / total)}% of the volume` };
     }
   }
   return { fits: true, sources };
