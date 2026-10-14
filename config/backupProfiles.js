@@ -234,6 +234,62 @@ function palworldWorldsCommitted(listing, now = Date.now()) {
   return worlds > 0 ? null : 'no world';
 }
 
+/**
+ * A Syncthing temporary file written to in the last ten minutes: a sync still
+ * arriving. An older one is one a sync gave up on (Syncthing keeps those for a
+ * day); it says nothing about the files around it.
+ */
+const SYNC_ARRIVING_MS = 10 * 60 * 1000;
+function syncArriving(entries, now) {
+  return entries.find((entry) => entry && SYNCTHING_TEMP.test(String(entry.name))
+    && !(now - Date.parse(entry.modifiedAt) >= SYNC_ARRIVING_MS));
+}
+
+/**
+ * Whether the top of a Minecraft volume holds a world, and no sync arriving in
+ * it or in the folders listed under it.
+ *
+ * A Java world is a folder holding level.dat, under whatever name `level-name`
+ * gives it (seen: world, season, Forever WOrld). A Bedrock one is a folder in
+ * worlds/. Minecraft has no save that spans files, so there is nothing to
+ * check across them: every region file arrives whole (Syncthing renames it
+ * into place), and one that changes while the archive is written makes tar
+ * fail, which takes the full backup.
+ */
+function minecraftWorldPresent(isWorld) {
+  return (listing, now = Date.now()) => {
+    const nested = listing.flatMap((item) => (Array.isArray(item.children) ? item.children : []));
+    const arriving = syncArriving([...listing, ...nested], now);
+    if (arriving) return { reason: `${arriving.name} is still being synced`, unsettled: true };
+    return listing.some(isWorld) ? null : 'no world';
+  };
+}
+const javaWorld = (item) => item.isDirectory && (item.children || [])
+  .some((file) => file.isFile && file.name === 'level.dat' && Number(file.size) > 0);
+const bedrockWorlds = (item) => item.isDirectory && item.name === 'worlds' && (item.children || [])
+  .some((world) => world.isDirectory && Number(world.size) > 0);
+
+/**
+ * What the itzg Java image puts at the top of /data by itself, from TYPE,
+ * VERSION and the loader variables, and fetches again on a node that lacks it:
+ * the server jar and its launcher, the libraries and game versions it runs on,
+ * download caches, and the files that record what is installed. Those records
+ * go with the install they describe: restored over a node that installed
+ * something else, a `.forge-manifest.json` would tell the image the wrong build
+ * is already there. Measured on 90 nodes (2026-10-14): 26 GB of 184.
+ */
+const MINECRAFT_JAVA_INSTALL = new RegExp([
+  '^(libraries|versions|\\.fabric|cache|\\.cache|logs|crash-reports|debug|\\.flux-backup)$',
+  // .forge-manifest.json, .papermc-manifest.json, .install-fabric.env, .run-forge.env, .paper.env
+  '^\\.([\\w-]+-manifest\\.json|install-[\\w-]+\\.env|run-[\\w-]+\\.env|paper\\.env|purpur\\.env)$',
+  '^(run\\.sh|run\\.bat|user_jvm_args\\.txt|\\.rcon-cli\\.env|\\.rcon-cli\\.yaml)$',
+  '^hs_err_pid\\d+\\.log$',
+  '^minecraft_server\\.[\\d.]+\\.jar(\\.download)?$',
+  '^(paper|purpur|folia)-[\\d.]+-\\d+\\.jar(\\.download)?$',
+  '^fabric-server-mc\\.[\\d.]+-loader\\.[\\d.]+-launcher\\.[\\d.]+\\.jar$',
+  '^(neo)?forge-[\\d.]+(-[\\d.]+)?-(shim|installer)\\.jar(\\.log)?$',
+].join('|'));
+
 module.exports = [
   {
     // RuneScape: Dragonwilds. The volume is the image's whole DepotDownloader
@@ -344,6 +400,47 @@ module.exports = [
         path: '',
         children: true,
         excludeChildren: /^(SaveGames|Config|Crashes|ImGui|Logs|\.flux-backup)$|^flux-guard.*\.log$/,
+      },
+    ],
+  },
+  {
+    // Minecraft Bedrock on itzg/minecraft-bedrock-server. First, because the
+    // Java profile's match would take it too. appdata is /data: the server
+    // as Mojang ships it, unzipped, beside the worlds and packs. The image
+    // downloads the server again when bedrock_server-<VERSION> is missing, and
+    // backup-pre-<version>/ is its own copy of the packs from before an
+    // upgrade (two kept; never the worlds). Everything else is kept: the
+    // behavior and resource packs mix Mojang's with the owner's.
+    id: 'minecraft-bedrock-world',
+    match: { name: 'bedrock', repotag: 'minecraft-bedrock', component: '^minecraftbedrock' },
+    include: [
+      {
+        path: '',
+        required: true,
+        children: true,
+        excludeChildren: /^(bedrock_server-[\d.]+|backup-pre-[\d.]+|\.flux-backup)$/,
+        validate: minecraftWorldPresent(bedrockWorlds),
+      },
+    ],
+  },
+  {
+    // Minecraft Java on itzg/minecraft-server, any TYPE. appdata is /data, so
+    // the volume is the server's whole working directory. Unlike the other
+    // games here most of a backup is the world itself (a 35 GB one has been
+    // seen), and that is all kept; what goes is what the image installs again
+    // (MINECRAFT_JAVA_INSTALL): 55% of the median server, 14% of the fleet.
+    // Mods, plugins and config are kept whole, the owner's or a modpack's.
+    id: 'minecraft-java-world',
+    // As in the hub's catalogue. Components are `minecraft`, `minecraftserver`
+    // and `Minecraft` (doubled in the marketplace's).
+    match: { name: 'minecraft', repotag: 'minecraft-server', component: '^minecraft' },
+    include: [
+      {
+        path: '',
+        required: true,
+        children: true,
+        excludeChildren: MINECRAFT_JAVA_INSTALL,
+        validate: minecraftWorldPresent(javaWorld),
       },
     ],
   },
