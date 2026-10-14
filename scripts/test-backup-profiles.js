@@ -253,6 +253,42 @@ async function main() {
     assert.notStrictEqual(result && result.status, 'completed');
     assert(!calls.some((r) => r.url.endsWith('/apps/appendbackuptask')));
     assert(!calls.some((r) => r.url.startsWith(`${NODE}/backup/getlocalbackuplist/`)));
+    const removeEndpoint = `${NODE}/apps/removeobject/${APP}/${COMPONENT}/${encodeURIComponent(stalePath)}`;
+    assert(result.diagnostics.some((d) => d.outcome === 'failed' && d.endpoint === removeEndpoint && /removeobject refused: Refused: volume busy/.test(d.detail || d.error || JSON.stringify(d))), 'the failure names removeobject, not appendbackuptask');
+
+    // removeobject answers like the other file operations: a 503 while another
+    // operation holds the volume is waited out, a 202 job is followed to its end.
+    const removeJob = (statuses) => {
+      let polls = 0;
+      return {
+        match: (r) => r.method === 'get' && r.url === `${NODE}/apps/operations/rm-1`,
+        reply: () => { const status = statuses[Math.min(polls, statuses.length - 1)]; polls += 1; return success({ status, error: status === 'Failed' ? { detail: 'rm: Permission denied' } : undefined }); },
+      };
+    };
+    const sequence = (...replies) => { let served = 0; return () => { const reply = replies[Math.min(served, replies.length - 1)]; served += 1; return reply(); }; };
+    const busy = () => ({ status: 503, headers: { 'retry-after': '1' }, data: { status: 'error', data: { message: 'busy' } } });
+    const accepted = () => ({ status: 202, headers: {}, data: { status: 'success', data: { jobId: 'rm-1' } } });
+
+    calls.length = 0;
+    routes = [...worldFolders([]), removeRoute(sequence(busy, () => success({}))), fullBackupRoute, ...listingRoutes];
+    result = await fluxOS.createBackupTaskOnNode(NODE, 'auth', APP, [COMPONENT], { [COMPONENT]: profile });
+    assert.strictEqual(result.status, 'completed', 'a busy volume is waited out');
+    assert.strictEqual(calls.filter((r) => r.url === removeEndpoint).length, 2);
+
+    calls.length = 0;
+    routes = [...worldFolders([]), removeRoute(accepted), removeJob(['Running', 'Succeeded']), fullBackupRoute, ...listingRoutes];
+    result = await fluxOS.createBackupTaskOnNode(NODE, 'auth', APP, [COMPONENT], { [COMPONENT]: profile });
+    assert.strictEqual(result.status, 'completed', 'a slow removal is followed to its end');
+    assert(clearedBeforeFullBackup());
+    const removalDone = calls.map((r) => r.url).lastIndexOf(`${NODE}/apps/operations/rm-1`);
+    assert(removalDone < calls.findIndex((r) => r.url.endsWith('/apps/appendbackuptask')), 'the full backup waits for the removal');
+
+    calls.length = 0;
+    routes = [...worldFolders([]), removeRoute(accepted), removeJob(['Failed']), fullBackupRoute, ...listingRoutes];
+    result = await fluxOS.createBackupTaskOnNode(NODE, 'auth', APP, [COMPONENT], { [COMPONENT]: profile });
+    assert.notStrictEqual(result && result.status, 'completed', 'a removal job that fails fails the attempt');
+    assert.match(result.error, /removeobject Failed: rm: Permission denied/);
+    assert(!calls.some((r) => r.url.endsWith('/apps/appendbackuptask')));
 
     // The node cannot write the partial archive -> the full backup, not no backup.
     calls.length = 0;

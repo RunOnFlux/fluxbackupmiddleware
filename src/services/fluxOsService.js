@@ -1043,46 +1043,26 @@ async function ensureVolumeFolder(node, zelidAuth, appname, component, folder) {
 }
 
 /**
- * Delete a file or folder of a component's volume; one already gone is fine.
+ * Run one of FluxOS's volume file operations and wait for it to finish.
  *
- * @param {string} object - path relative to the volume root
- * @throws when the node does not confirm the removal
- */
-async function removeVolumeObject(node, zelidAuth, appname, component, object) {
-  const endpoint = `${node}/apps/removeobject/${appname}/${component}/${encodeURIComponent(object)}`;
-  const response = await axios({
-    method: 'get',
-    url: endpoint,
-    headers: { zelidauth: zelidAuth },
-    timeout: 60000,
-    httpsAgent,
-    validateStatus: () => true,
-  });
-  const { data } = response;
-  if (data?.status === 'success') return;
-  if (data?.status === 'error' && isMissingPathResponse(data)) return;
-  const error = new Error(`Could not remove ${object}: ${getSafeApiMessage(data) || `HTTP ${response.status}`}`);
-  error.endpoint = endpoint;
-  throw error;
-}
-
-/**
- * Run compressobject and wait for it to finish.
- *
- * The node answers 200 when the archive was written inline, 202 with a job to
+ * The node answers 200 when the operation finished inline, 202 with a job to
  * poll when it continues in the background, and 503 with Retry-After when
  * another operation holds this app's volume. A job's outcome is its status
  * field, never the HTTP code: a failed job is a 200 that says Failed.
+ *
+ * @param {string} label - the operation's name, which starts every error message
+ * @param {object} request - the axios request, without headers or agent
+ * @param {function(object): void} [onAnswer] - sees the final non-503 answer
+ *   first, to throw for a status this operation gives its own meaning
+ * @throws when the node refuses, the job does not succeed, or it outlives
+ *   FILE_OPERATION_TIMEOUT_MS
  */
-async function compressOnNode(node, zelidAuth, payload) {
-  const endpoint = `${node}/apps/compressobject`;
+async function runVolumeOperation(node, zelidAuth, label, request, onAnswer = () => {}) {
   let response;
   for (let attempt = 0; ; attempt += 1) {
     response = await axios({
-      method: 'post',
-      url: endpoint,
-      headers: { 'Content-Type': 'application/json', zelidauth: zelidAuth },
-      data: payload,
+      ...request,
+      headers: { ...(request.data ? { 'Content-Type': 'application/json' } : {}), zelidauth: zelidAuth },
       timeout: 60000,
       httpsAgent,
       validateStatus: () => true,
@@ -1093,9 +1073,7 @@ async function compressOnNode(node, zelidAuth, payload) {
   }
 
   const body = response.data;
-  if (response.status === 404) {
-    throw new Error('Node does not support compressobject (FluxOS older than 8.18.0)');
-  }
+  onAnswer(response);
   if (response.status === 202 && body?.data?.jobId) {
     const offered = body.data.statusUrl;
     // Only a path on this node: an offered URL naming another host would carry the zelidauth there.
@@ -1117,19 +1095,51 @@ async function compressOnNode(node, zelidAuth, payload) {
         const view = poll.data?.data || {};
         if (FILE_OPERATION_TERMINAL_STATES.includes(view.status)) {
           if (view.status === 'Succeeded') return;
-          throw new Error(`compressobject ${view.status}: ${view.error?.detail || view.error?.title || 'no detail'}`);
+          const failed = new Error(`${label} ${view.status}: ${view.error?.detail || view.error?.title || 'no detail'}`);
+          failed.terminal = true;
+          throw failed;
         }
         failures = 0;
       } catch (error) {
-        if (/^compressobject /.test(error.message)) throw error;
+        if (error.terminal) throw error;
         failures += 1;
         if (failures >= 3) throw error;
       }
     }
-    throw new Error('compressobject did not finish within 10 minutes');
+    throw new Error(`${label} did not finish within ${FILE_OPERATION_TIMEOUT_MS / 60000} minutes`);
   }
   if (response.status < 200 || response.status >= 300 || body?.status === 'error') {
-    throw new Error(`compressobject refused: ${getSafeApiMessage(body) || `HTTP ${response.status}`}`);
+    throw new Error(`${label} refused: ${getSafeApiMessage(body) || `HTTP ${response.status}`}`);
+  }
+}
+
+/** Run compressobject and wait for it to finish. */
+async function compressOnNode(node, zelidAuth, payload) {
+  await runVolumeOperation(node, zelidAuth, 'compressobject', {
+    method: 'post',
+    url: `${node}/apps/compressobject`,
+    data: payload,
+  }, (response) => {
+    if (response.status === 404) {
+      throw new Error('Node does not support compressobject (FluxOS older than 8.18.0)');
+    }
+  });
+}
+
+/**
+ * Delete a file or folder of a component's volume. One already gone is fine:
+ * the node removes with rm -rf, which succeeds on a missing path.
+ *
+ * @param {string} object - path relative to the volume root
+ * @throws when the node does not confirm the removal
+ */
+async function removeVolumeObject(node, zelidAuth, appname, component, object) {
+  const endpoint = `${node}/apps/removeobject/${appname}/${component}/${encodeURIComponent(object)}`;
+  try {
+    await runVolumeOperation(node, zelidAuth, 'removeobject', { method: 'get', url: endpoint });
+  } catch (error) {
+    error.endpoint = endpoint;
+    throw error;
   }
 }
 
@@ -1260,6 +1270,7 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList, c
           let why = 'does not fit';
           if (outcome.archiveFailed) why = 'archive failed';
           else if (outcome.changing) why = 'kept changing';
+          else if (outcome.unsettled) why = 'still syncing';
           log.info(`Backup profile ${profile.id} ${why} for ${appname}/${component} (${outcome.reason}); taking the full backup instead`);
           diagnostics.push({
             check: `Backup profile (${component})`,
@@ -1541,7 +1552,8 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList, c
     diagnostics.push({
       check: 'Flux node backup creation',
       outcome: 'failed',
-      endpoint: createEndpoint,
+      // A profile's listing or the clearing of the archive slot names its own.
+      endpoint: error?.endpoint || createEndpoint,
       node,
       ...getRequestFailure(error),
     });
