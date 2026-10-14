@@ -1043,22 +1043,26 @@ async function ensureVolumeFolder(node, zelidAuth, appname, component, folder) {
 }
 
 /**
- * Run compressobject and wait for it to finish.
+ * Run one of FluxOS's volume file operations and wait for it to finish.
  *
- * The node answers 200 when the archive was written inline, 202 with a job to
+ * The node answers 200 when the operation finished inline, 202 with a job to
  * poll when it continues in the background, and 503 with Retry-After when
  * another operation holds this app's volume. A job's outcome is its status
  * field, never the HTTP code: a failed job is a 200 that says Failed.
+ *
+ * @param {string} label - the operation's name, which starts every error message
+ * @param {object} request - the axios request, without headers or agent
+ * @param {function(object): void} [onAnswer] - sees the final non-503 answer
+ *   first, to throw for a status this operation gives its own meaning
+ * @throws when the node refuses, the job does not succeed, or it outlives
+ *   FILE_OPERATION_TIMEOUT_MS
  */
-async function compressOnNode(node, zelidAuth, payload) {
-  const endpoint = `${node}/apps/compressobject`;
+async function runVolumeOperation(node, zelidAuth, label, request, onAnswer = () => {}) {
   let response;
   for (let attempt = 0; ; attempt += 1) {
     response = await axios({
-      method: 'post',
-      url: endpoint,
-      headers: { 'Content-Type': 'application/json', zelidauth: zelidAuth },
-      data: payload,
+      ...request,
+      headers: { ...(request.data ? { 'Content-Type': 'application/json' } : {}), zelidauth: zelidAuth },
       timeout: 60000,
       httpsAgent,
       validateStatus: () => true,
@@ -1069,9 +1073,7 @@ async function compressOnNode(node, zelidAuth, payload) {
   }
 
   const body = response.data;
-  if (response.status === 404) {
-    throw new Error('Node does not support compressobject (FluxOS older than 8.18.0)');
-  }
+  onAnswer(response);
   if (response.status === 202 && body?.data?.jobId) {
     const offered = body.data.statusUrl;
     // Only a path on this node: an offered URL naming another host would carry the zelidauth there.
@@ -1093,21 +1095,62 @@ async function compressOnNode(node, zelidAuth, payload) {
         const view = poll.data?.data || {};
         if (FILE_OPERATION_TERMINAL_STATES.includes(view.status)) {
           if (view.status === 'Succeeded') return;
-          throw new Error(`compressobject ${view.status}: ${view.error?.detail || view.error?.title || 'no detail'}`);
+          const failed = new Error(`${label} ${view.status}: ${view.error?.detail || view.error?.title || 'no detail'}`);
+          failed.terminal = true;
+          throw failed;
         }
         failures = 0;
       } catch (error) {
-        if (/^compressobject /.test(error.message)) throw error;
+        if (error.terminal) throw error;
         failures += 1;
         if (failures >= 3) throw error;
       }
     }
-    throw new Error('compressobject did not finish within 10 minutes');
+    throw new Error(`${label} did not finish within ${FILE_OPERATION_TIMEOUT_MS / 60000} minutes`);
   }
   if (response.status < 200 || response.status >= 300 || body?.status === 'error') {
-    throw new Error(`compressobject refused: ${getSafeApiMessage(body) || `HTTP ${response.status}`}`);
+    throw new Error(`${label} refused: ${getSafeApiMessage(body) || `HTTP ${response.status}`}`);
   }
 }
+
+/** Run compressobject and wait for it to finish. */
+async function compressOnNode(node, zelidAuth, payload) {
+  await runVolumeOperation(node, zelidAuth, 'compressobject', {
+    method: 'post',
+    url: `${node}/apps/compressobject`,
+    data: payload,
+  }, (response) => {
+    if (response.status === 404) {
+      throw new Error('Node does not support compressobject (FluxOS older than 8.18.0)');
+    }
+  });
+}
+
+/**
+ * Delete a file or folder of a component's volume. One already gone is fine:
+ * the node removes with rm -rf, which succeeds on a missing path.
+ *
+ * @param {string} object - path relative to the volume root
+ * @throws when the node does not confirm the removal
+ */
+async function removeVolumeObject(node, zelidAuth, appname, component, object) {
+  const endpoint = `${node}/apps/removeobject/${appname}/${component}/${encodeURIComponent(object)}`;
+  try {
+    await runVolumeOperation(node, zelidAuth, 'removeobject', { method: 'get', url: endpoint });
+  } catch (error) {
+    error.endpoint = endpoint;
+    throw error;
+  }
+}
+
+/**
+ * How long to wait before listing again a volume whose files were still
+ * arriving. Syncthing delivers a save in seconds; this leaves it a wide margin
+ * without holding the backup worker long.
+ */
+const PROFILE_UNSETTLED_WAIT_MS = 90 * 1000;
+/** Archives written before giving up on a volume that keeps changing under them. */
+const PROFILE_ARCHIVE_ATTEMPTS = 2;
 
 /**
  * Write a profile's partial archive where appendbackuptask writes the full one,
@@ -1115,22 +1158,39 @@ async function compressOnNode(node, zelidAuth, payload) {
  * readiness check, the download and the upload - is the same for both.
  *
  * No stop is needed: backups are taken on the secondary, where a g: app's
- * container does not run, and the archive is written in well under a second.
+ * container does not run. Syncthing still writes there, though, so the paths
+ * are listed again once the archive is written: when anything changed, the
+ * archive may hold half of a save, and it is written again from the new
+ * listing. A listing whose `validate` finds a save still arriving (unsettled)
+ * is listed again after PROFILE_UNSETTLED_WAIT_MS before giving up: the full
+ * backup would only archive the same half-synced files, and fifty times more.
  *
- * @returns {Promise<{fits: boolean, archiveFailed?: boolean, reason?: string}>}
- *   fits:false when the app does not have the profile's layout, or (archiveFailed)
- *   when the node could not write the partial archive; the caller then takes the
- *   full backup either way
+ * @returns {Promise<{fits: boolean, archiveFailed?: boolean, changing?: boolean, reason?: string}>}
+ *   fits:false when the app does not have the profile's layout, when the node
+ *   could not write the partial archive (archiveFailed), or when the volume
+ *   changed under every attempt (changing); the caller then takes the full
+ *   backup in every case
  * @throws when the profile's paths cannot be listed, so a transient failure is
  *   retried on another node rather than read as a missing layout
  */
 async function createProfiledArchiveOnNode(node, zelidAuth, appname, component, profile, diagnostics) {
-  const listings = {};
-  for (let i = 0; i < profile.include.length; i += 1) {
-    const entry = profile.include[i];
-    listings[entry.path] = await listVolumeFolder(node, zelidAuth, appname, component, `appdata/${entry.path}`);
-  }
-  const plan = backupProfiles.planProfiledArchive(profile, listings);
+  const listAll = () => backupProfiles.collectProfileListings(
+    profile,
+    (folder) => listVolumeFolder(node, zelidAuth, appname, component, folder ? `appdata/${folder}` : 'appdata'),
+  );
+  // The plan for a listing, listed once more after a wait when its files were still arriving.
+  const settle = async (first) => {
+    let listed = first;
+    let planned = backupProfiles.planProfiledArchive(profile, listed);
+    if (!planned.fits && planned.unsettled) {
+      log.info(`Backup profile ${profile.id} found ${appname}/${component} still syncing (${planned.reason}); listing again in ${PROFILE_UNSETTLED_WAIT_MS / 1000}s`);
+      await new Promise((resolve) => { setTimeout(resolve, PROFILE_UNSETTLED_WAIT_MS); });
+      listed = await listAll();
+      planned = backupProfiles.planProfiledArchive(profile, listed);
+    }
+    return { listed, planned };
+  };
+  let { listed: listings, planned: plan } = await settle(await listAll());
   if (!plan.fits) return plan;
 
   // From here on a failure is the node not writing the partial archive: a
@@ -1142,15 +1202,31 @@ async function createProfiledArchiveOnNode(node, zelidAuth, appname, component, 
     // appendbackuptask makes backup/local itself; on a node that never ran one it is not there yet.
     await ensureVolumeFolder(node, zelidAuth, appname, component, 'backup');
     await ensureVolumeFolder(node, zelidAuth, appname, component, 'backup/local');
-    await compressOnNode(node, zelidAuth, {
-      appname,
-      component,
-      source: plan.sources,
-      destination: `backup/local/backup_${component.toLowerCase()}.tar.gz`,
-      overwrite: true,
-    });
   } catch (error) {
     return { fits: false, archiveFailed: true, reason: error?.message || String(error) };
+  }
+
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      await compressOnNode(node, zelidAuth, {
+        appname,
+        component,
+        source: plan.sources,
+        destination: `backup/local/backup_${component.toLowerCase()}.tar.gz`,
+        overwrite: true,
+      });
+    } catch (error) {
+      return { fits: false, archiveFailed: true, reason: error?.message || String(error) };
+    }
+
+    const after = await listAll();
+    if (backupProfiles.sameListings(listings, after)) break;
+    if (attempt >= PROFILE_ARCHIVE_ATTEMPTS) {
+      return { fits: false, changing: true, reason: `the files changed while archiving, ${attempt} times` };
+    }
+    log.info(`Backup profile ${profile.id}: ${appname}/${component} changed while archiving; writing the archive again`);
+    ({ listed: listings, planned: plan } = await settle(after));
+    if (!plan.fits) return plan;
   }
 
   diagnostics.push({
@@ -1191,7 +1267,10 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList, c
         if (outcome.fits) {
           usedProfiles[component] = profile.id;
         } else {
-          const why = outcome.archiveFailed ? 'archive failed' : 'does not fit';
+          let why = 'does not fit';
+          if (outcome.archiveFailed) why = 'archive failed';
+          else if (outcome.changing) why = 'kept changing';
+          else if (outcome.unsettled) why = 'still syncing';
           log.info(`Backup profile ${profile.id} ${why} for ${appname}/${component} (${outcome.reason}); taking the full backup instead`);
           diagnostics.push({
             check: `Backup profile (${component})`,
@@ -1204,6 +1283,18 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList, c
       }
       if (!profiled) {
         Object.keys(usedProfiles).forEach((component) => { delete usedProfiles[component]; });
+        // A partial archive may already sit where the full one goes: written by
+        // this attempt before the volume changed under it, or by an earlier run
+        // on this node. appendbackuptask only replaces it once it has stopped
+        // the app, and it can refuse before that in its streamed answer, which
+        // reads as success here; what follows would then upload the partial
+        // archive as a full one, and a full one is restored over a wiped
+        // appdata. Cleared first, so a refusal leaves nothing to pick up. A
+        // node that cannot clear it fails this attempt, which moves on to
+        // another node.
+        for (let i = 0; i < componentList.length; i += 1) {
+          await removeVolumeObject(node, zelidAuth, appname, componentList[i], `backup/local/backup_${componentList[i].toLowerCase()}.tar.gz`);
+        }
       }
     }
 
@@ -1461,7 +1552,8 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList, c
     diagnostics.push({
       check: 'Flux node backup creation',
       outcome: 'failed',
-      endpoint: createEndpoint,
+      // A profile's listing or the clearing of the archive slot names its own.
+      endpoint: error?.endpoint || createEndpoint,
       node,
       ...getRequestFailure(error),
     });
@@ -1589,6 +1681,7 @@ module.exports = {
   testHooks: {
     listVolumeFolder,
     ensureVolumeFolder,
+    removeVolumeObject,
     compressOnNode,
     createProfiledArchiveOnNode,
   },
