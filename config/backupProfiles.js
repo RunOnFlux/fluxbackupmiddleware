@@ -42,6 +42,16 @@
  *                folders are listed one level deeper for `validate`. On restore
  *                each archived child is replaced as a whole and the rest of the
  *                directory is left alone
+ *   excludeWithin  with `children`: a child FOLDER is archived as what it
+ *                holds, each entry on its own, leaving out those matching; the
+ *                folders kept inside it are listed in turn for `validate`, and
+ *                what is left out is passed to it as `excludedChildren`. On
+ *                restore only the archived entries are replaced, so what was
+ *                left out stays as the node has it
+ *   latestWithin { path, name, settledMs, directory }: with `excludeWithin`,
+ *                also archive the newest settled entry of `<child>/<path>`
+ *                whose name matches, as `latest` does (a folder when
+ *                `directory`), even though `path` itself is left out
  *   validate     (listing) => null when the listing is fit to archive, or the
  *                reason it is not: a string, or { reason, unsettled: true } when
  *                the files are still arriving (a sync caught half-way), which is
@@ -129,6 +139,77 @@ function valheimWorldsCommitted(listing) {
   return worlds > 0 ? null : 'no world';
 }
 
+/** Files a Palworld save exists under only while it is being written. */
+const PALWORLD_SAVING = /\.new_tmp$|^\.atomic_save_update_manifest|^world_save_temp$/;
+/**
+ * A player's file from the save before the world's: older than Level.sav but
+ * by less than this. Older still, it is a character the world no longer
+ * rewrites (deleted on the primary, kept on the standby), seen 4 h and 18 h old.
+ */
+const PALWORLD_PREVIOUS_SAVE_MS = 15 * 60 * 1000;
+
+/**
+ * Whether every Palworld world in SaveGames/0 is one committed save.
+ *
+ * A save (every AutoSaveSpan, 30 to 60 s on our servers) writes every file of
+ * Players/ - every character, online or not - then `Level.sav.new_tmp` and
+ * `LevelMeta.sav.new_tmp` beside a `world_save_temp/` folder and an
+ * `.atomic_save_update_manifest_world.json`, and renames them over the old
+ * ones, all within the same second (seen on 20 nodes, 2026-10-14). Syncthing
+ * keeps those times on the standby, where backups are taken and where a save
+ * is often caught half-arrived (half the standbys listed): `.syncthing.*.tmp`
+ * files, the in-progress names above, or a world from one save beside players
+ * from another. Every refusal but "no world" is such a sync caught half-way,
+ * so `unsettled`.
+ *
+ * A world is a folder holding Level.sav. Folders without one (an unused GUID,
+ * an empty world) are archived as they are and not checked.
+ */
+function palworldWorldsCommitted(listing) {
+  const unsettled = (reason) => ({ reason, unsettled: true });
+  const time = (file) => Date.parse(file.modifiedAt);
+  let worlds = 0;
+  for (let i = 0; i < listing.length; i += 1) {
+    const item = listing[i];
+    if (item.isFile && SYNCTHING_TEMP.test(String(item.name))) {
+      return unsettled(`${item.name} is still being synced`);
+    }
+    if (item.isDirectory) {
+      const inside = [...(item.children || []), ...(item.excludedChildren || [])].filter(Boolean);
+      const byName = new Map(inside.filter((entry) => entry.isFile).map((entry) => [String(entry.name), entry]));
+      const level = byName.get('Level.sav');
+      const savedAt = level ? time(level) : NaN;
+      // A temporary file last touched before the save now in place is one a
+      // sync or a save gave up on: Syncthing leaves those for up to 24 hours,
+      // and they were on most standbys listed (2026-10-14).
+      const abandoned = (entry) => Number.isFinite(savedAt) && time(entry) < savedAt - SAVE_TOLERANCE_MS;
+      const busy = inside.find((entry) => (SYNCTHING_TEMP.test(String(entry.name)) || PALWORLD_SAVING.test(String(entry.name)))
+        && !abandoned(entry));
+      if (busy) return unsettled(`${item.name}/${busy.name}: a save is still being written or synced`);
+      if (level) {
+        if (!(Number(level.size) > 0)) return unsettled(`${item.name}/Level.sav is empty`);
+        const meta = byName.get('LevelMeta.sav');
+        if (!(Number(meta?.size) > 0)) return unsettled(`${item.name} has Level.sav but no LevelMeta.sav`);
+        if (Number.isFinite(savedAt)) {
+          if (Math.abs(time(meta) - savedAt) > SAVE_TOLERANCE_MS) {
+            return unsettled(`${item.name}/LevelMeta.sav is not from the same save as Level.sav`);
+          }
+          const players = inside.find((entry) => entry.isDirectory && entry.name === 'Players');
+          const files = (players && players.children) || [];
+          const syncing = files.find((file) => SYNCTHING_TEMP.test(String(file.name)) && !abandoned(file));
+          if (syncing) return unsettled(`${item.name}/Players/${syncing.name} is still being synced`);
+          const mismatched = files.find((file) => file.isFile && /\.sav$/i.test(String(file.name)) && (
+            time(file) > savedAt + SAVE_TOLERANCE_MS
+            || (time(file) < savedAt - SAVE_TOLERANCE_MS && time(file) > savedAt - PALWORLD_PREVIOUS_SAVE_MS)));
+          if (mismatched) return unsettled(`${item.name}/Players/${mismatched.name} is not from the same save as Level.sav`);
+        }
+        worlds += 1;
+      }
+    }
+  }
+  return worlds > 0 ? null : 'no world';
+}
+
 module.exports = [
   {
     // RuneScape: Dragonwilds. The volume is the image's whole DepotDownloader
@@ -187,6 +268,51 @@ module.exports = [
       { path: 'adminlist.txt', file: true },
       { path: 'bannedlist.txt', file: true },
       { path: 'permittedlist.txt', file: true },
+    ],
+  },
+  {
+    // Palworld on thijsvanloef/palworld-server-docker or our layer over it,
+    // runonflux/palworld-server-flux. appdata is Pal/Saved; the server itself
+    // is in /palworld, off the volume, and the image's own backups are off
+    // (BACKUP_ENABLED=false) and would be in /palworld/backups anyway. What
+    // makes the full backup large is the game's own restore points:
+    // SaveGames/0/<world>/backup/world/<time>/, a whole copy of the world
+    // each, 25 to 35 of them (one a minute for the last few minutes, every ten
+    // for the last hour, hourly for a day, daily for a week). Measured on 8
+    // servers 2026-10-14: 13 to 129 MB full, 0.9 to 4.7 MB of live world.
+    id: 'palworld-world',
+    // As in the hub's catalogue. Components are `palworld` in the hub's plans
+    // and `palworldpalworld` in the marketplace app.
+    match: { name: 'palworld', repotag: 'palworld', component: '^palworld' },
+    include: [
+      // Each world: Level.sav, LevelMeta.sav, LocalData.sav, Players/,
+      // WorldOption.sav and whatever else the owner put there (the hub's
+      // `.pre-restore-*` undo copies), but not the game's restore points in
+      // backup/, nor world_save_bak/ (the save before the last, as large as the
+      // world), nor temporary files. A restore replaces those entries and leaves the node's restore
+      // points alone. The stray SaveGames/0/backup some volumes have is a
+      // restore point folder, not a world.
+      {
+        path: 'SaveGames/0',
+        required: true,
+        children: true,
+        excludeChildren: /^backup$|\.sync-conflict-/,
+        // Also what a save or a sync is writing, or gave up on: never part of
+        // the world, and `validate` still sees it.
+        excludeWithin: /^(backup|world_save_bak|world_save_temp)$|\.new_tmp$|^\.atomic_save_update_manifest|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/,
+        // Plus the newest restore point at least ten minutes old: from the
+        // ten-minute tier, so the game keeps it for the hour, and taken on the
+        // primary as one whole save, so it is a committed world even if the
+        // standby's live files above were caught between two saves.
+        latestWithin: {
+          path: 'backup/world', name: /^\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}$/, settledMs: 10 * 60 * 1000, directory: true,
+        },
+        validate: palworldWorldsCommitted,
+      },
+      // PalWorldSettings.ini (the admin password the hub reads, every world
+      // rule) and GameUserSettings.ini (which world folder is loaded). The
+      // rest of Pal/Saved is crash reports, logs and flux-guard.log.
+      { path: 'Config/LinuxServer' },
     ],
   },
 ];
