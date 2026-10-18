@@ -352,6 +352,25 @@ function satisfactoryWorldPresent(listing, now = Date.now()) {
 }
 
 /**
+ * Whether the top of a Rust server identity holds a world, and no sync
+ * arriving in it.
+ *
+ * The world is `proceduralmap.<size>.<seed>.<version>.sav` (or the custom
+ * map's name), which the server writes as `.sav.new` and renames, after
+ * moving the previous ones to `.sav.1` and `.sav.2`. Beside it are the SQLite
+ * databases of players, blueprints, clans and signs, each with its `-wal`.
+ * A server still generating its first map has no save yet, and the full
+ * backup of a volume that is a whole install (littlestache/rust-server) has
+ * none at its top either.
+ */
+function rustWorldPresent(listing, now = Date.now()) {
+  const arriving = syncArriving([...listing, ...(listing.leftOut || [])], now);
+  if (arriving) return { reason: `${arriving.name} is still being synced`, unsettled: true };
+  const world = listing.some((item) => item.isFile && /\.sav$/i.test(String(item.name)) && Number(item.size) > 0);
+  return world ? null : 'no world';
+}
+
+/**
  * What the itzg Java image puts at the top of /data by itself, from TYPE,
  * VERSION and the loader variables, and fetches again on a node that lacks it:
  * the server jar and its launcher, the libraries and game versions it runs on,
@@ -554,6 +573,31 @@ module.exports = [
         path: '',
         children: true,
         excludeChildren: /^(Saves|backups|Logs|server-console\.txt|\.flux-backup)$/i,
+      },
+    ],
+  },
+  {
+    // Rust on pfeiffermax/rust-game-server (vanilla) and our
+    // runonflux/rust-carbon-server. appdata is the server identity,
+    // /srv/rust/server/<identity>; the server is in the image and Carbon's
+    // plugins on their own (m:) mount. What makes the full backup large is
+    // what the server works out from the map again: the AI's navmesh (160 to
+    // 233 MB on the network, 2026-10-18, and one more per game version since
+    // the last wipe) and the occlusion cache, beside a world of about 7 MB
+    // and the two saves before it.
+    id: 'rust-world',
+    // As in the hub's catalogue.
+    match: { name: 'rust', repotag: 'rust|carbon|oxide', component: '^rust' },
+    include: [
+      // The world, the procedural or custom map it is on (generating it again
+      // takes up to half an hour, and a custom map's URL may be gone), the
+      // databases with their -wal, cfg/ (server.cfg, users.cfg, bans.cfg) and
+      // whatever else the owner keeps there.
+      {
+        path: '',
+        children: true,
+        excludeChildren: /\.navmesh$|_occlusion_\d+\.dat$|\.sav\.(\d+|new)$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$|^\.flux-backup$/i,
+        validate: rustWorldPresent,
       },
     ],
   },

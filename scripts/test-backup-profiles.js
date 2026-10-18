@@ -1031,6 +1031,50 @@ async function main() {
     const noSaves = await backupProfiles.collectProfileListings(zomboid, async (folder) => (folder === '' ? [zDir('Server', 1)] : null));
     assert.strictEqual(backupProfiles.planProfiledArchive(zomboid, noSaves).fits, false, 'a server that never made a world');
 
+    // --- Rust ------------------------------------------------------------------------
+    const rust = backupProfiles.profileForComponent({
+      appname: 'rustserver1790000000000', component: 'rust', repotag: null, componentCount: 1,
+    });
+    assert.strictEqual(rust.id, 'rust-world', 'marketplace component');
+    assert.strictEqual(byComponent('rustcarbon', { repotag: 'runonflux/rust-carbon-server:latest' }).id, 'rust-world', 'Carbon');
+    assert.strictEqual(byComponent('server', { repotag: 'pfeiffermax/rust-game-server:latest' }).id, 'rust-world', 'by image');
+
+    // A Carbon server on the network (2026-10-18) a wipe after its first, as
+    // its standby lists it.
+    const rFile = (name, size, minutesAgo = 30) => ({
+      name, size, isFile: true, isDirectory: false, modifiedAt: at(minutesAgo),
+    });
+    const rDir = (name, size) => ({
+      name, size, isFile: false, isDirectory: true, modifiedAt: at(30),
+    });
+    const RMAP = 'proceduralmap.4500.1337';
+    const rustKept = [
+      rFile(`${RMAP}.289.map`, 46500000), rFile(`${RMAP}.289.sav`, 6800000, 3), rFile(`${RMAP}.288.sav`, 6800000, 23000),
+      rFile('sv.files.289.db', 5900000), rFile('sv.files.289.db-wal', 6600000), rFile('player.states.289.db', 4096),
+      rFile('player.states.289.db-wal', 12392), rFile('player.tokens.db', 4096), rFile('carbon.id', 36),
+      rDir('cfg', 2000), rDir('command_history', 200000), rDir('serveremoji', 0),
+    ];
+    const rustLeftOut = [
+      rFile(`${RMAP}.289.navmesh`, 199600000, 3), rFile(`${RMAP}.288.navmesh`, 159000000, 23000),
+      rFile(`${RMAP}.289_occlusion_3.dat`, 15400000), rFile(`${RMAP}.288_occlusion_3.dat`, 15400000, 60000),
+      rFile(`${RMAP}.289.sav.1`, 6800000, 13), rFile(`${RMAP}.289.sav.2`, 6800000, 23), rFile(`${RMAP}.289.sav.new`, 6800000, 3),
+      rFile('sv.files.289.sync-conflict-20261008-224504-XWI5FWK.db-wal', 200000, 15000),
+    ];
+    const rPlanOf = async (top) => backupProfiles.planProfiledArchive(
+      rust,
+      await backupProfiles.collectProfileListings(rust, async (folder) => (folder === '' ? top : [])),
+    );
+    assert.deepStrictEqual((await rPlanOf([...rustKept, ...rustLeftOut])).sources, [
+      'appdata/.flux-backup', ...rustKept.map((kept) => `appdata/${kept.name}`),
+    ]);
+    assert.match((await rPlanOf([rFile(`${RMAP}.289.map`, 46500000), ...rustLeftOut, rDir('cfg', 2000)])).reason, /no world/, 'a server still generating its map, or only the saves before it');
+    assert.match((await rPlanOf([...rustKept.filter((kept) => !/\.sav$/.test(kept.name)), rFile(`${RMAP}.289.sav`, 0)])).reason, /no world/, 'an empty save');
+    const rArriving = await rPlanOf([...rustKept, rFile(`.syncthing.${RMAP}.289.sav.tmp`, 9, 1)]);
+    assert(rArriving.unsettled && /still being synced/.test(rArriving.reason), 'a save arriving');
+    assert.deepStrictEqual((await rPlanOf([...rustKept, rFile(`.syncthing.${RMAP}.289.sav.tmp`, 9, 600)])).sources.length, rustKept.length + 1, 'a sync given up on hours ago, left out');
+    // littlestache/rust-server: the volume is the whole install, the world deep inside it.
+    assert.match((await rPlanOf([rDir('RustDedicated_Data', 1), rFile('RustDedicated', 1), rDir('server', 1)])).reason, /no world/, 'a whole install');
+
     // --- Satisfactory ---------------------------------------------------------------
     const satisfactory = backupProfiles.profileForComponent({
       appname: 'satisfactory1790000000000', component: 'satisfactory', repotag: null, componentCount: 1,
