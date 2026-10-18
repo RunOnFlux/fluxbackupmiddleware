@@ -52,7 +52,9 @@
  *   latestWithin { path, name, settledMs, directory }: with `excludeWithin`,
  *                also archive the newest settled entry of `<child>/<path>`
  *                whose name matches, as `latest` does (a folder when
- *                `directory`), even though `path` itself is left out
+ *                `directory`), even though `path` itself is left out. With
+ *                `path: ''` it is picked from the child folder itself, among
+ *                the entries `excludeWithin` leaves out
  *   validate     (listing, now) => null when the listing is fit to archive, or the
  *                reason it is not: a string, or { reason, unsettled: true } when
  *                the files are still arriving (a sync caught half-way), which is
@@ -275,6 +277,43 @@ const bedrockWorlds = (item) => item.isDirectory && item.name === 'worlds' && (i
   .some((world) => world.isDirectory && Number(world.size) > 0);
 
 /**
+ * A file ARK: Survival Ascended writes on every save: a byte copy of the world
+ * as that save left it, `<MAP>_DD.MM.YYYY_HH.MM.SS.arkrbf` (the time in the
+ * server's timezone). The game keeps the newest four and deletes the rest.
+ */
+const ARK_ROLLBACK = /\.arkrbf$/i;
+/**
+ * The world copy ARK: Survival Ascended also leaves every nine saves (two hours
+ * and a quarter), `<MAP>_DD.MM.YYYY_HH.MM.SS.ark`, which it does not delete:
+ * 21 of them on a test server two days after a restart (2026-10-18).
+ */
+const ARK_DATED_COPY = /_\d{2}\.\d{2}\.\d{4}_\d{2}\.\d{2}\.\d{2}\.ark$/i;
+
+/**
+ * Whether SavedArks holds an ARK: Survival Ascended world, and no sync
+ * arriving in it.
+ *
+ * A world is a map folder (TheIsland_WP, ScorchedEarth_WP, ...) holding a
+ * non-empty `<MAP>.ark`, a SQLite file the game writes in place, beside a
+ * `.arkprofile` per player and a `.arktribe` per tribe. Those are saved with
+ * the world, and also each on its own as players come and go, so there is no
+ * single save to check them against. What a sync can still have half-way is a
+ * file Syncthing is writing under a temporary name; one written to in the last
+ * ten minutes is a sync still arriving. The newest `.arkrbf` archived beside
+ * the world is the whole save the game wrote at once, kept for the case the
+ * standby's `.ark` was copied while the primary was writing it.
+ */
+function arkWorldPresent(listing, now = Date.now()) {
+  const inside = listing.flatMap((item) => [...(item.children || []), ...(item.excludedChildren || [])]);
+  const arriving = syncArriving([...listing, ...inside], now);
+  if (arriving) return { reason: `${arriving.name} is still being synced`, unsettled: true };
+  const world = listing.some((item) => item.isDirectory && (item.children || [])
+    .some((file) => file.isFile && /\.ark$/i.test(String(file.name)) && !ARK_DATED_COPY.test(String(file.name))
+      && Number(file.size) > 0));
+  return world ? null : 'no world';
+}
+
+/**
  * What the itzg Java image puts at the top of /data by itself, from TYPE,
  * VERSION and the loader variables, and fetches again on a node that lacks it:
  * the server jar and its launcher, the libraries and game versions it runs on,
@@ -409,6 +448,42 @@ module.exports = [
         path: '',
         children: true,
         excludeChildren: /^(SaveGames|Config|Crashes|ImGui|Logs|\.flux-backup)$|^flux-guard.*\.log$/,
+      },
+    ],
+  },
+  {
+    // ARK: Survival Ascended on acekorneya/asa_server (POK). appdata is
+    // ShooterGame/Saved; the server and the mods it downloads are on local
+    // (ml:) mounts. What makes the full backup large is the world over and
+    // over: every save leaves a `.arkrbf` copy of the `.ark` (the game keeps
+    // 4), every ninth a dated `.ark` copy it never deletes, and there is an
+    // AntiCorruptionBackup.bak copy as well. On a test server two days after a
+    // restart that was 26 worlds, 1.69 GB, against 130 MB archived here.
+    id: 'ark-ascended-world',
+    // As in the hub's catalogue.
+    match: { name: 'arksurvivalascended', repotag: 'asa_server', component: '^arksurvivalascended' },
+    include: [
+      // Each map folder: the world, every player's .arkprofile and tribe's
+      // .arktribe and whatever else is there, but not the game's own copies,
+      // plus the newest of those copies that has settled. On restore the game
+      // loads the .ark; the copies already on the node are left alone and are
+      // not loaded in its place.
+      {
+        path: 'SavedArks',
+        required: true,
+        children: true,
+        excludeChildren: /\.sync-conflict-/,
+        excludeWithin: /\.arkrbf$|_\d{2}\.\d{2}\.\d{4}_\d{2}\.\d{2}\.\d{2}\.ark$|_AntiCorruptionBackup\.bak$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+        latestWithin: { path: '', name: ARK_ROLLBACK, settledMs: 5 * 60 * 1000 },
+        validate: arkWorldPresent,
+      },
+      // Config/WindowsServer (GameUserSettings.ini, Game.ini) and anything else
+      // the owner keeps in Saved (cluster transfers, a copied save). Left out
+      // is what the game and the image write again by themselves.
+      {
+        path: '',
+        children: true,
+        excludeChildren: /^(SavedArks|Logs|Crashes|webcache.*|\.flux-backup)$/i,
       },
     ],
   },
