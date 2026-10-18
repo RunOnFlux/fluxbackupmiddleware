@@ -279,10 +279,15 @@ const bedrockWorlds = (item) => item.isDirectory && item.name === 'worlds' && (i
 /**
  * A file ARK: Survival Ascended writes on every save: a byte copy of the world
  * as that save left it, `<MAP>_DD.MM.YYYY_HH.MM.SS.arkrbf` (the time in the
- * server's timezone). The game keeps the newest few (4 seen) and deletes the
- * rest.
+ * server's timezone). The game keeps the newest four and deletes the rest.
  */
 const ARK_ROLLBACK = /\.arkrbf$/i;
+/**
+ * The world copy ARK: Survival Ascended also leaves every nine saves (two hours
+ * and a quarter), `<MAP>_DD.MM.YYYY_HH.MM.SS.ark`, which it does not delete:
+ * 21 of them on a test server two days after a restart (2026-10-18).
+ */
+const ARK_DATED_COPY = /_\d{2}\.\d{2}\.\d{4}_\d{2}\.\d{2}\.\d{2}\.ark$/i;
 
 /**
  * Whether SavedArks holds an ARK: Survival Ascended world, and no sync
@@ -303,7 +308,8 @@ function arkWorldPresent(listing, now = Date.now()) {
   const arriving = syncArriving([...listing, ...inside], now);
   if (arriving) return { reason: `${arriving.name} is still being synced`, unsettled: true };
   const world = listing.some((item) => item.isDirectory && (item.children || [])
-    .some((file) => file.isFile && /\.ark$/i.test(String(file.name)) && Number(file.size) > 0));
+    .some((file) => file.isFile && /\.ark$/i.test(String(file.name)) && !ARK_DATED_COPY.test(String(file.name))
+      && Number(file.size) > 0));
   return world ? null : 'no world';
 }
 
@@ -450,8 +456,9 @@ module.exports = [
     // ShooterGame/Saved; the server and the mods it downloads are on local
     // (ml:) mounts. What makes the full backup large is the world over and
     // over: every save leaves a `.arkrbf` copy of the `.ark` (the game keeps
-    // 4) and there is an AntiCorruptionBackup.bak copy as well, so a full
-    // backup is about six worlds.
+    // 4), every ninth a dated `.ark` copy it never deletes, and there is an
+    // AntiCorruptionBackup.bak copy as well. On a test server two days after a
+    // restart that was 26 worlds, 1.69 GB, against 130 MB archived here.
     id: 'ark-ascended-world',
     // As in the hub's catalogue.
     match: { name: 'arksurvivalascended', repotag: 'asa_server', component: '^arksurvivalascended' },
@@ -466,7 +473,7 @@ module.exports = [
         required: true,
         children: true,
         excludeChildren: /\.sync-conflict-/,
-        excludeWithin: /\.arkrbf$|_AntiCorruptionBackup\.bak$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+        excludeWithin: /\.arkrbf$|_\d{2}\.\d{2}\.\d{4}_\d{2}\.\d{2}\.\d{2}\.ark$|_AntiCorruptionBackup\.bak$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
         latestWithin: { path: '', name: ARK_ROLLBACK, settledMs: 5 * 60 * 1000 },
         validate: arkWorldPresent,
       },

@@ -892,6 +892,8 @@ async function main() {
       aFile(`${MAP}_18.10.2026_15.20.12.arkrbf`, 148373504, 33),
       aFile(`${MAP}_18.10.2026_15.35.12.arkrbf`, 148635648, 18),
       aFile(`${MAP}_18.10.2026_15.50.12.arkrbf`, 148897792, 3),
+      aFile(`${MAP}_17.10.2026_21.19.11.ark`, 146800640, 1100),
+      aFile(`${MAP}_18.10.2026_13.35.12.ark`, 148635648, 138),
     ];
     const aWorlds = ark.include[0];
     const mapFolder = (kept = arkWorld, leftOut = arkCopies) => aDir(MAP, 1000000000, { children: kept, excludedChildren: leftOut });
@@ -899,6 +901,7 @@ async function main() {
     assert.strictEqual(aWorlds.validate([]), 'no world');
     assert.strictEqual(aWorlds.validate([mapFolder(arkWorld.slice(1))]), 'no world', 'profiles without a world');
     assert.strictEqual(aWorlds.validate([mapFolder([aFile(`${MAP}.ark`, 0, 3)])]), 'no world', 'an empty .ark');
+    assert.strictEqual(aWorlds.validate([mapFolder([arkCopies[6]], [])]), 'no world', 'only a dated copy');
     assert.match(unsettledReason(aWorlds.validate([mapFolder(arkWorld, [...arkCopies, aFile(`.syncthing.${MAP}.ark.tmp`, 9, 1)])])), /\.syncthing\..* is still being synced/);
     assert.strictEqual(aWorlds.validate([mapFolder(arkWorld, [...arkCopies, aFile(`.syncthing.${MAP}.ark.tmp`, 9, 600)])]), null, 'a sync given up on hours ago');
 
