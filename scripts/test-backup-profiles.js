@@ -1114,6 +1114,58 @@ async function main() {
     // beardedio/terraria keeps its worlds below /config, not at its top.
     assert.match((await tPlanOf([tFile('serverconfig.txt', 300), tFile('banlist.txt', 0)])).reason, /no world/, 'another image');
 
+    // --- Hytale ----------------------------------------------------------------------
+    const hytale = backupProfiles.profileForComponent({
+      appname: 'hytale1790000000000', component: 'hytale', repotag: null, componentCount: 1,
+    });
+    assert.strictEqual(hytale.id, 'hytale-world', 'marketplace component');
+    assert.strictEqual(byComponent('server', { repotag: 'indifferentbroccoli/hytale-server-docker:latest' }).id, 'hytale-world', 'by image');
+
+    // A modded server on the network (2026-10-18), as its standby lists it.
+    const hFile = (name, size, minutesAgo = 30) => ({
+      name, size, isFile: true, isDirectory: false, modifiedAt: at(minutesAgo),
+    });
+    const hDir = (name, size) => ({
+      name, size, isFile: false, isDirectory: true, modifiedAt: at(30),
+    });
+    const hytaleTopKept = [
+      hDir('.machine-id', 200), hFile('auth.enc', 4000), hFile('bans.json', 2), hFile('bans.json.bak', 2),
+      hFile('config.json', 1500), hFile('config.json.bak', 1500), hDir('earlyplugins', 0), hFile('hstats-server-uuid.txt', 36),
+      hDir('mods', 15400000), hFile('permissions.json', 300),
+    ];
+    const hytaleTopLeftOut = [
+      hFile('Assets.zip', 3942800000), hDir('Server', 231700000), hDir('backups', 859100000), hDir('.cache', 53400000),
+      hDir('downloader', 17600000), hDir('logs', 3500000), hDir('telemetry', 200000), hFile('start.sh', 2000), hFile('start.bat', 2000),
+      hFile('.server-version', 30), hFile('game.zip', 1200000000), hFile('config.sync-conflict-20261017-182622-ABCDEFG.json', 1500, 2000),
+    ];
+    const hytaleVolume = ({ hWorlds = [hDir('default', 107400000)], extra = [] } = {}) => async (folder) => {
+      switch (folder) {
+        case '': return [hDir('universe', 107500000), ...hytaleTopKept, ...hytaleTopLeftOut];
+        case 'universe': return [hFile('events.json', 20), hFile('events.json.bak', 20), hDir('players', 100000), hDir('resources', 10000), hDir('worlds', 107400000), ...extra];
+        case 'universe/worlds': return hWorlds;
+        case 'universe/players': return [hFile('96f82292-00bd-4112-b81b-041d0361b363.json', 9000)];
+        case 'universe/resources': return [hFile('GameFlags.json', 100), hDir('Instances', 500)];
+        default: return [];
+      }
+    };
+    const hPlanOf = async (options) => backupProfiles.planProfiledArchive(
+      hytale,
+      await backupProfiles.collectProfileListings(hytale, hytaleVolume(options)),
+    );
+    assert.deepStrictEqual((await hPlanOf()).sources, [
+      'appdata/.flux-backup',
+      'appdata/universe/events.json', 'appdata/universe/events.json.bak', 'appdata/universe/players', 'appdata/universe/resources', 'appdata/universe/worlds',
+      ...hytaleTopKept.map((kept) => `appdata/${kept.name}`),
+    ]);
+    assert.match((await hPlanOf({ hWorlds: [] })).reason, /no world/, 'a server that has not made its world');
+    assert.match((await hPlanOf({ hWorlds: [hDir('default', 0)] })).reason, /no world/, 'an empty world folder');
+    const hArriving = await hPlanOf({ extra: [hFile('.syncthing.events.json.tmp', 9, 1)] });
+    assert(hArriving.unsettled && /still being synced/.test(hArriving.reason), 'a sync arriving');
+    assert(!(await hPlanOf({ extra: [hFile('.syncthing.events.json.tmp', 9, 600)] })).reason, 'a sync given up on hours ago');
+    // An owner who never approved the downloader's code: no universe.
+    const hNoUniverse = await backupProfiles.collectProfileListings(hytale, async (folder) => (folder === '' ? [hDir('downloader', 17600000), hDir('.machine-id', 200)] : null));
+    assert(backupProfiles.planProfiledArchive(hytale, hNoUniverse).reason, 'never installed');
+
     // --- Satisfactory ---------------------------------------------------------------
     const satisfactory = backupProfiles.profileForComponent({
       appname: 'satisfactory1790000000000', component: 'satisfactory', repotag: null, componentCount: 1,

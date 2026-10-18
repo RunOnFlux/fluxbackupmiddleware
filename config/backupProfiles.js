@@ -388,6 +388,24 @@ function terrariaWorldPresent(listing, now = Date.now()) {
 }
 
 /**
+ * Whether universe/ holds a Hytale world, and no sync arriving at its top.
+ *
+ * A world is a folder in universe/worlds (`default` unless the owner made
+ * others) with its region files in chunks/ and its config.json; players/ and
+ * resources/ sit beside worlds/. A server whose owner never approved the
+ * downloader's code has no universe at all, so its volume keeps the full
+ * backup.
+ */
+function hytaleWorldPresent(listing, now = Date.now()) {
+  const inside = listing.flatMap((item) => (Array.isArray(item.children) ? item.children : []));
+  const arriving = syncArriving([...listing, ...inside], now);
+  if (arriving) return { reason: `${arriving.name} is still being synced`, unsettled: true };
+  const world = listing.some((item) => item.isDirectory && item.name === 'worlds' && (item.children || [])
+    .some((folder) => folder.isDirectory && Number(folder.size) > 0));
+  return world ? null : 'no world';
+}
+
+/**
  * What the itzg Java image puts at the top of /data by itself, from TYPE,
  * VERSION and the loader variables, and fetches again on a node that lacks it:
  * the server jar and its launcher, the libraries and game versions it runs on,
@@ -637,6 +655,43 @@ module.exports = [
         children: true,
         excludeChildren: /^(backups|logs|crashes|tshock\.pid|\.flux-backup)$|\.wld\.bak2$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
         validate: terrariaWorldPresent,
+      },
+    ],
+  },
+  {
+    // Hytale on indifferentbroccoli/hytale-server-docker. appdata is
+    // server-files, and almost all of it is the game: Assets.zip (3.5 to
+    // 3.9 GB) and Server/ (230 MB) beside a world of up to about 100 MB, plus
+    // the server's own hourly zips of the whole universe in backups/ (860 MB
+    // on one app on the network, 2026-10-18).
+    //
+    // The image downloads the game again when Server/HytaleServer.jar is
+    // missing, with the downloader's credentials in downloader/. Those are
+    // left out too: Hytale's refresh tokens are single-use, so the ones in a
+    // backup were spent by the live server long before a restore, and with a
+    // spent token and no game the image exits on every start without asking
+    // for a code. Without them a restore starts like a new server: the owner
+    // approves the downloader's code (the hub's Account tab shows it), the
+    // game downloads, and the world loads.
+    id: 'hytale-world',
+    // As in the hub's catalogue.
+    match: { name: 'hytale', repotag: 'hytale-server', component: '^hytale' },
+    include: [
+      // The worlds, the players and the universe's resources.
+      {
+        path: 'universe',
+        required: true,
+        children: true,
+        excludeChildren: /\.sync-conflict-/,
+        validate: hytaleWorldPresent,
+      },
+      // config.json, permissions, bans, whitelist, mods/ and earlyplugins/,
+      // the server's own account (auth.enc, readable only with .machine-id)
+      // and whatever else the owner keeps there.
+      {
+        path: '',
+        children: true,
+        excludeChildren: /^(universe|Assets\.zip|Server|downloader|\.cache|backups|logs|telemetry|start\.(sh|bat)|\.server-version|game\.zip|hytale-downloader\.zip|\.flux-backup)$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
       },
     ],
   },
