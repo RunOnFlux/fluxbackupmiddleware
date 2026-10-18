@@ -1288,6 +1288,60 @@ async function main() {
     }));
     assert(!backupProfiles.sameListings(dListings, dPlayed, sdtd.ignoreChanges), 'a region saved');
 
+    // --- Windrose --------------------------------------------------------------------
+    const windrose = backupProfiles.profileForComponent({
+      appname: 'windrose1790000000000', component: 'windrosewindrose', repotag: null, componentCount: 1,
+    });
+    assert.strictEqual(windrose.id, 'windrose-world', 'marketplace component');
+    assert.strictEqual(byComponent('server', { repotag: 'indifferentbroccoli/windrose-server-docker:latest' }).id, 'windrose-world', 'by image');
+
+    // A Windrose+ server on the network (2026-10-18), as its standby lists it.
+    const wFile = (name, size, minutesAgo = 30) => ({
+      name, size, isFile: true, isDirectory: false, modifiedAt: at(minutesAgo),
+    });
+    const wDir = (name, size) => ({
+      name, size, isFile: false, isDirectory: true, modifiedAt: at(30),
+    });
+    const windroseTopKept = [
+      wDir('windrose_plus', 60500000), wDir('windrose_plus_data', 30200000), wDir('windrose_plus_mods', 0), wDir('WindrosePlus', 300000),
+      wDir('config', 200000), wDir('cpp-mods', 500000), wDir('docs', 7900000), wDir('server', 44300000), wDir('tools', 19800000),
+      wFile('windrose_plus.json', 259), wFile('install.ps1', 9000), wFile('UE4SS-settings.ini', 3000), wFile('README.md', 2000),
+    ];
+    const windroseTopLeftOut = [
+      wDir('R5', 3077100000), wDir('Engine', 70000000), wDir('linux64', 52900000), wDir('.DepotDownloader', 200000),
+      wFile('steamclient.so', 47400000), wFile('steamclient64.dll', 26300000), wFile('steamclient.dll', 21400000),
+      wFile('steamwebrtc64.dll', 13000000), wFile('steamwebrtc.dll', 4800000), wFile('libsteamwebrtc.so', 7600000),
+      wFile('tier0_s64.dll', 900000), wFile('tier0_s.dll', 400000), wFile('vstdlib_s64.dll', 500000), wFile('vstdlib_s.dll', 600000),
+      wFile('Manifest_UFSFiles_Win64.txt', 6700000), wFile('Manifest_NonUFSFiles_Win64.txt', 9000), wFile('Manifest_DebugFiles_Win64.txt', 9000),
+      wFile('WindroseServer.exe', 300000), wFile('R5WorldDescriptionUpdater.exe', 400000), wFile('DedicatedServer.md', 9000),
+      wFile('SaveWorkflow.md', 9000), wFile('StartServerForeground.bat', 300), wFile('.windroseplus_version', 8),
+    ];
+    const windroseVolume = ({ profileFolder = [wDir('RocksDB_v2', 22683654), wDir('RocksDB_v2_Backups', 24190077)], extra = [] } = {}) => async (folder) => {
+      switch (folder) {
+        case '': return [...windroseTopKept, ...windroseTopLeftOut];
+        case 'R5': return [wDir('Binaries', 308400000), wDir('Content', 2513500000), wDir('Saved', 93400000), wFile('ServerDescription.json', 673)];
+        case 'R5/Saved/SaveProfiles': return [wDir('Default', 46873731), ...extra];
+        case 'R5/Saved/SaveProfiles/Default': return profileFolder;
+        case 'R5/Saved/Config': return [wDir('CrashReportClient', 494)];
+        default: return [];
+      }
+    };
+    const wPlanOf = async (options) => backupProfiles.planProfiledArchive(
+      windrose,
+      await backupProfiles.collectProfileListings(windrose, windroseVolume(options)),
+    );
+    assert.deepStrictEqual((await wPlanOf()).sources, [
+      'appdata/.flux-backup',
+      'appdata/R5/Saved/SaveProfiles/Default', 'appdata/R5/ServerDescription.json', 'appdata/R5/Saved/Config',
+      ...windroseTopKept.map((kept) => `appdata/${kept.name}`),
+    ]);
+    assert.match((await wPlanOf({ profileFolder: [] })).reason, /no world/, 'a server that has not made its world');
+    assert.match((await wPlanOf({ profileFolder: [wDir('RocksDB_v2', 0)] })).reason, /no world/, 'an empty database');
+    assert.match((await wPlanOf({ profileFolder: [wDir('RocksDB_v2_Backups', 24190077)] })).reason, /no world/, 'only the copies');
+    const wArriving = await wPlanOf({ profileFolder: [wDir('RocksDB_v2', 22683654), wFile('.syncthing.x.tmp', 9, 1)] });
+    assert(wArriving.unsettled && /still being synced/.test(wArriving.reason), 'a sync arriving');
+    assert(!(await wPlanOf({ profileFolder: [wDir('RocksDB_v2', 22683654), wFile('.syncthing.x.tmp', 9, 600)] })).reason, 'a sync given up on hours ago');
+
     // --- Satisfactory ---------------------------------------------------------------
     const satisfactory = backupProfiles.profileForComponent({
       appname: 'satisfactory1790000000000', component: 'satisfactory', repotag: null, componentCount: 1,
