@@ -1075,6 +1075,45 @@ async function main() {
     // littlestache/rust-server: the volume is the whole install, the world deep inside it.
     assert.match((await rPlanOf([rDir('RustDedicated_Data', 1), rFile('RustDedicated', 1), rDir('server', 1)])).reason, /no world/, 'a whole install');
 
+    // --- Terraria --------------------------------------------------------------------
+    const terraria = backupProfiles.profileForComponent({
+      appname: 'terraria1790000000000', component: 'terrariaterraria', repotag: null, componentCount: 1,
+    });
+    assert.strictEqual(terraria.id, 'terraria-world', 'marketplace component');
+    assert.strictEqual(byComponent('server', { repotag: 'ghcr.io/pryaxis/tshock:6' }).id, 'terraria-world', 'official image');
+    assert.strictEqual(byComponent('server', { repotag: 'ryshe/terraria:tshock-latest' }).id, 'terraria-world', 'legacy image');
+
+    // A server on the network (2026-10-18), as its standby lists it.
+    const tFile = (name, size, minutesAgo = 30) => ({
+      name, size, isFile: true, isDirectory: false, modifiedAt: at(minutesAgo),
+    });
+    const tDir = (name, size) => ({
+      name, size, isFile: false, isDirectory: true, modifiedAt: at(30),
+    });
+    const terrariaKept = [
+      tFile('Chinese_Trading_Market (3).wld', 12300000, 600), tFile('FluxWorld.wld', 12200000, 2), tFile('FluxWorld.wld.bak', 12200000, 2),
+      tFile('config.json', 4911), tFile('motd.txt', 386), tFile('rules.txt', 34), tFile('setup.lock', 1),
+      tFile('sscconfig.json', 598), tFile('tshock.sqlite', 77824), tFile('whitelist.txt', 121),
+    ];
+    const terrariaLeftOut = [
+      tDir('backups', 158800000), tDir('logs', 200000), tDir('crashes', 0), tFile('tshock.pid', 1),
+      tFile('FluxWorld.wld.bak2', 12200000, 12), tFile('config.sync-conflict-20261003-144230-ABCDEFG.json', 4911, 20000),
+    ];
+    const tPlanOf = async (top) => backupProfiles.planProfiledArchive(
+      terraria,
+      await backupProfiles.collectProfileListings(terraria, async (folder) => (folder === '' ? top : [])),
+    );
+    assert.deepStrictEqual((await tPlanOf([...terrariaKept, ...terrariaLeftOut])).sources, [
+      'appdata/.flux-backup', ...terrariaKept.map((kept) => `appdata/${kept.name}`),
+    ]);
+    assert.match((await tPlanOf(terrariaKept.filter((kept) => !/\.wld$/.test(kept.name)))).reason, /no world/, 'only the save before the last');
+    assert.match((await tPlanOf([tFile('FluxWorld.wld', 0), tFile('config.json', 4911)])).reason, /no world/, 'an empty world');
+    const tArriving = await tPlanOf([...terrariaKept, tFile('.syncthing.FluxWorld.wld.tmp', 9, 1)]);
+    assert(tArriving.unsettled && /still being synced/.test(tArriving.reason), 'a world arriving');
+    assert.deepStrictEqual((await tPlanOf([...terrariaKept, tFile('.syncthing.FluxWorld.wld.tmp', 9, 600)])).sources.length, terrariaKept.length + 1, 'a sync given up on hours ago, left out');
+    // beardedio/terraria keeps its worlds below /config, not at its top.
+    assert.match((await tPlanOf([tFile('serverconfig.txt', 300), tFile('banlist.txt', 0)])).reason, /no world/, 'another image');
+
     // --- Satisfactory ---------------------------------------------------------------
     const satisfactory = backupProfiles.profileForComponent({
       appname: 'satisfactory1790000000000', component: 'satisfactory', repotag: null, componentCount: 1,
