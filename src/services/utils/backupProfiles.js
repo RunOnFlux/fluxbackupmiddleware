@@ -271,8 +271,18 @@ function planProfiledArchive(profile, listings, now = Date.now()) {
           return;
         }
         // Only what is kept inside, each on its own, so a restore replaces
-        // those and leaves what was left out where it is.
-        item.children.forEach((child) => sources.push(`appdata/${itemPath}/${child.name}`));
+        // those and leaves what was left out where it is. With `splitWithin`
+        // a kept folder goes in as what it holds too, so tar never reads a
+        // folder whose files the game renames while it is being archived.
+        item.children.forEach((child) => {
+          if (entry.splitWithin && child.isDirectory) {
+            child.children
+              .filter((inner) => inner && !entry.excludeWithin.test(String(inner.name)))
+              .forEach((inner) => sources.push(`appdata/${itemPath}/${child.name}/${inner.name}`));
+            return;
+          }
+          sources.push(`appdata/${itemPath}/${child.name}`);
+        });
         if (entry.latestWithin) {
           const newest = newestSettledFile(item.latestCandidates || [], entry.latestWithin, now);
           if (newest) sources.push(`appdata/${withinPath(itemPath, entry.latestWithin.path)}/${newest.name}`);
@@ -315,12 +325,17 @@ function planProfiledArchive(profile, listings, now = Date.now()) {
  * Taken before and after the archive is written, a difference means the volume
  * changed meanwhile (Syncthing delivering a save) and the archive may hold
  * half of it.
+ *
+ * A file whose name matches `ignore` (a profile's `ignoreChanges`) is left out
+ * of the comparison: one the game replaces whole every few seconds whatever
+ * happens in the world, which would otherwise never let two listings agree.
  */
-function sameListings(before, after) {
+function sameListings(before, after, ignore = null) {
   const describe = (listings) => {
     const lines = [];
     const add = (where, item) => {
       if (!item) return;
+      if (ignore && !item.isDirectory && ignore.test(String(item.name))) return;
       if (Array.isArray(item.children)) {
         lines.push([where, item.name, 'd'].join('|'));
         item.children.forEach((child) => add(`${where}/${item.name}`, child));

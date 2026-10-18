@@ -1281,7 +1281,7 @@ async function createProfiledArchiveOnNode(node, zelidAuth, appname, component, 
     }
 
     const after = await listAll();
-    if (backupProfiles.sameListings(listings, after)) break;
+    if (backupProfiles.sameListings(listings, after, profile.ignoreChanges)) break;
     if (attempt >= PROFILE_ARCHIVE_ATTEMPTS) {
       return { fits: false, changing: true, reason: `the files changed while archiving, ${attempt} times` };
     }

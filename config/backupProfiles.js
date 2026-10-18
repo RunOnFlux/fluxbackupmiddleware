@@ -49,6 +49,12 @@
  *                what is left out is passed to it as `excludedChildren`. On
  *                restore only the archived entries are replaced, so what was
  *                left out stays as the node has it
+ *   splitWithin  with `excludeWithin`: the folders kept inside a child folder
+ *                are archived as what they hold too, each entry on its own
+ *                (less what `excludeWithin` matches), rather than whole. For a
+ *                folder where the game renames a file every few seconds: tar
+ *                reading the folder itself fails with "file changed as we read
+ *                it", while each file in it is read whole
  *   latestWithin { path, name, settledMs, directory }: with `excludeWithin`,
  *                also archive the newest settled entry of `<child>/<path>`
  *                whose name matches, as `latest` does (a folder when
@@ -64,6 +70,11 @@
  * `validate`, the app does not have the layout the profile was written for (an
  * older image, a server that has not saved yet, a save caught half-synced), and
  * the backup falls back to the full archive.
+ *
+ * `ignoreChanges` (a profile option, a RegExp): files of these names may change
+ * while the archive is written without it being written again. Only for a
+ * file the game replaces whole (written aside and renamed) every few seconds
+ * whatever happens in the world, so the archive still holds one whole copy.
  *
  * `minSavedShare` (a profile option, 0 to 1): take the full backup when what
  * the profile leaves out is a smaller share of the volume than this. The full
@@ -436,6 +447,25 @@ function vrisingWorldPresent(listing, now = Date.now()) {
 }
 
 /**
+ * Whether Saves holds a 7 Days to Die world, and no sync arriving in it.
+ *
+ * A world is Saves/<world>/<game> (GameWorld and GameName, `MyGame` unless the
+ * owner renamed it) holding main.ttw, beside Region/, Player/ and the .dat
+ * files. The game writes them as it plays, a region at a time, so there is no
+ * generation to check them against; what a sync can still have half-way is a
+ * file Syncthing is writing under a temporary name.
+ */
+function sdtdWorldPresent(listing, now = Date.now()) {
+  const games = listing.flatMap((item) => (Array.isArray(item.children) ? item.children : []));
+  const inside = games.flatMap((item) => (Array.isArray(item.children) ? item.children : []));
+  const arriving = syncArriving([...listing, ...games, ...inside], now);
+  if (arriving) return { reason: `${arriving.name} is still being synced`, unsettled: true };
+  const world = games.some((game) => game.isDirectory && (game.children || [])
+    .some((file) => file.isFile && file.name === 'main.ttw' && Number(file.size) > 0));
+  return world ? null : 'no world';
+}
+
+/**
  * What the itzg Java image puts at the top of /data by itself, from TYPE,
  * VERSION and the loader variables, and fetches again on a node that lacks it:
  * the server jar and its launcher, the libraries and game versions it runs on,
@@ -754,6 +784,48 @@ module.exports = [
         path: '',
         children: true,
         excludeChildren: /^(Saves|\.flux-backup)$|-VRisingServer\.log$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+      },
+    ],
+  },
+  {
+    // 7 Days to Die on runonflux/7dtd-server-flux. appdata is /mnt/7dtd/data
+    // (the install is an ml: mount, the mods an m: one): serverconfig.xml,
+    // Saves, GeneratedWorlds, the image's own backups and the logs. The
+    // weight is backups/, a world.tar.gz of Saves and GeneratedWorlds taken
+    // before every start, several kept (1.08 GB beside a 420 MB world on one
+    // app on the network, 2026-10-18).
+    id: '7dtd-world',
+    // As in the hub's catalogue.
+    match: { name: '7daystodie', repotag: '7dtd-server', component: '^7daystodie' },
+    // The game writes main.ttw (the world's clock and counters) every 30
+    // seconds even with nobody on, moving the previous one to main.ttw.bak,
+    // which no archive of a few hundred MB would ever get past. The regions,
+    // players and the rest change only when someone plays.
+    ignoreChanges: /^main\.ttw(\.bak)?$/,
+    include: [
+      // Each world's save folders, entry by entry, and the files beside them
+      // (serveradmin.xml, sdcs_profiles.sdf).
+      {
+        path: 'Saves',
+        required: true,
+        children: true,
+        excludeChildren: /\.sync-conflict-/,
+        excludeWithin: /\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+        // The game folder is where main.ttw is renamed every 30 seconds.
+        splitWithin: true,
+        validate: sdtdWorldPresent,
+      },
+      // The newest of the image's backups: taken with nothing running, it is
+      // the one copy of the world that is consistent for certain, and the
+      // hub's Rollback restores from it.
+      { path: 'backups', latest: { name: /^\d{8}-\d{6}-world\.tar\.gz$/, settledMs: 2 * 60 * 1000 } },
+      // serverconfig.xml, GeneratedWorlds (a random world takes a long time
+      // to generate again, and only from the same seed and version), the
+      // hub's flux/ and whatever else the owner keeps there.
+      {
+        path: '',
+        children: true,
+        excludeChildren: /^(Saves|backups|logs|\.flux-backup)$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
       },
     ],
   },
