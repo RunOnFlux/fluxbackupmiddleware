@@ -1221,6 +1221,73 @@ async function main() {
     assert(vArriving.unsettled && /still being synced/.test(vArriving.reason), 'a save arriving');
     assert(!(await vPlanOf({ saves: [...vSaves, vFile('.syncthing.AutoSave_5114.save.gz.tmp', 9, 600)] })).reason, 'a sync given up on hours ago');
 
+    // --- 7 Days to Die ---------------------------------------------------------------
+    const sdtd = backupProfiles.profileForComponent({
+      appname: '7daystodie1790000000000', component: '7daystodie7daystodie', repotag: null, componentCount: 1,
+    });
+    assert.strictEqual(sdtd.id, '7dtd-world', 'marketplace component');
+    assert.strictEqual(byComponent('server', { repotag: 'runonflux/7dtd-server-flux:latest' }).id, '7dtd-world', 'by image');
+
+    // A server on the network (2026-10-18), as its standby lists it.
+    const dFile = (name, size, minutesAgo = 30) => ({
+      name, size, isFile: true, isDirectory: false, modifiedAt: at(minutesAgo),
+    });
+    const dDir = (name, size) => ({
+      name, size, isFile: false, isDirectory: true, modifiedAt: at(30),
+    });
+    const WORLD = 'Nataroha Territory';
+    const dGame = [
+      dFile('main.ttw', 1600000, 1), dFile('main.ttw.bak', 1600000, 2), dFile('players.xml', 900), dFile('power.dat', 40),
+      dDir('Region', 230000000), dDir('Player', 6400000), dDir('ConfigsDump', 16500000),
+    ];
+    const dBackups = [
+      dFile('20261011-050026-world.tar.gz', 221100000, 11000), dFile('20261012-091803-world.tar.gz', 223200000, 9000),
+      dFile('20261018-210000-world.tar.gz.part', 90000000, 1),
+    ];
+    const sdtdVolume = ({ game = dGame, extra = [], backups = dBackups } = {}) => async (folder) => {
+      switch (folder) {
+        case '': return [
+          dDir('Saves', 278600000), dDir('GeneratedWorlds', 156700000), dDir('backups', 1082600000), dDir('logs', 9300000),
+          dDir('flux', 100), dDir('titlestorage', 0), dDir('RfsCache', 0), dFile('serverconfig.xml', 9000),
+        ];
+        case 'Saves': return [dDir(WORLD, 259400000), dFile('sdcs_profiles.sdf', 100), dFile('serveradmin.xml', 900)];
+        case `Saves/${WORLD}`: return [dDir('MyGame', 259400000), ...extra];
+        case `Saves/${WORLD}/MyGame`: return game;
+        case 'backups': return backups;
+        case 'GeneratedWorlds': return [dDir(WORLD, 156700000)];
+        default: return [];
+      }
+    };
+    const dPlanOf = async (options) => backupProfiles.planProfiledArchive(
+      sdtd,
+      await backupProfiles.collectProfileListings(sdtd, sdtdVolume(options)),
+    );
+    assert.deepStrictEqual((await dPlanOf()).sources, [
+      'appdata/.flux-backup',
+      ...dGame.map((entry) => `appdata/Saves/${WORLD}/MyGame/${entry.name}`), 'appdata/Saves/sdcs_profiles.sdf', 'appdata/Saves/serveradmin.xml',
+      'appdata/backups/20261012-091803-world.tar.gz',
+      'appdata/GeneratedWorlds', 'appdata/flux', 'appdata/titlestorage', 'appdata/RfsCache', 'appdata/serverconfig.xml',
+    ]);
+    assert.deepStrictEqual((await dPlanOf({ backups: [] })).sources.filter((source) => /backups/.test(source)), [], 'backups turned off');
+    assert.match((await dPlanOf({ game: dGame.filter((entry) => entry.name !== 'main.ttw') })).reason, /no world/, 'no main.ttw');
+    assert.match((await dPlanOf({ game: [dFile('main.ttw', 0)] })).reason, /no world/, 'an empty main.ttw');
+    const dArriving = await dPlanOf({ game: [...dGame, dFile('.syncthing.main.ttw.tmp', 9, 1)] });
+    assert(dArriving.unsettled && /still being synced/.test(dArriving.reason), 'a save arriving');
+    const dGivenUp = await dPlanOf({ game: [...dGame, dFile('.syncthing.main.ttw.tmp', 9, 600)] });
+    assert(!dGivenUp.reason && !dGivenUp.sources.some((source) => /syncthing/.test(source)), 'a sync given up on hours ago, left out');
+
+    // main.ttw every 30 seconds, with nobody on: not a change. A region is.
+    const dListings = await backupProfiles.collectProfileListings(sdtd, sdtdVolume());
+    const dTicked = await backupProfiles.collectProfileListings(sdtd, sdtdVolume({
+      game: [dFile('main.ttw', 1600100, 0), dFile('main.ttw.bak', 1600000, 1), ...dGame.slice(2)],
+    }));
+    assert(!backupProfiles.sameListings(dListings, dTicked), 'a change without ignoreChanges');
+    assert(backupProfiles.sameListings(dListings, dTicked, sdtd.ignoreChanges), 'only main.ttw ticked');
+    const dPlayed = await backupProfiles.collectProfileListings(sdtd, sdtdVolume({
+      game: [...dGame.filter((entry) => entry.name !== 'Region'), dDir('Region', 230100000)],
+    }));
+    assert(!backupProfiles.sameListings(dListings, dPlayed, sdtd.ignoreChanges), 'a region saved');
+
     // --- Satisfactory ---------------------------------------------------------------
     const satisfactory = backupProfiles.profileForComponent({
       appname: 'satisfactory1790000000000', component: 'satisfactory', repotag: null, componentCount: 1,
