@@ -1166,6 +1166,61 @@ async function main() {
     const hNoUniverse = await backupProfiles.collectProfileListings(hytale, async (folder) => (folder === '' ? [hDir('downloader', 17600000), hDir('.machine-id', 200)] : null));
     assert(backupProfiles.planProfiledArchive(hytale, hNoUniverse).reason, 'never installed');
 
+    // --- V Rising --------------------------------------------------------------------
+    const vrising = backupProfiles.profileForComponent({
+      appname: 'vrising1790000000000', component: 'vrisingvrising', repotag: null, componentCount: 1,
+    });
+    assert.strictEqual(vrising.id, 'vrising-world', 'marketplace component');
+    assert.strictEqual(byComponent('server', { repotag: 'runonflux/vrising-server-flux:latest' }).id, 'vrising-world', 'by image');
+
+    // A server on the network (2026-10-18), as its standby lists it: an
+    // autosave every 2 minutes, the game keeping 20 of them.
+    const vFile = (name, size, minutesAgo = 30) => ({
+      name, size, isFile: true, isDirectory: false, modifiedAt: at(minutesAgo),
+    });
+    const vDir = (name, size) => ({
+      name, size, isFile: false, isDirectory: true, modifiedAt: at(30),
+    });
+    const vSaves = [
+      vFile('AutoSave_383.save.gz', 8300000, 9300), vFile('AutoSave_5108.save.gz', 11500000, 11),
+      vFile('AutoSave_5112.save.gz', 11500000, 3), vFile('AutoSave_5113.save.gz', 11500000, 1),
+    ];
+    const vrisingVolume = ({ saves = vSaves, vWorlds = ['world1'] } = {}) => async (folder) => {
+      switch (folder) {
+        case '': return [
+          vDir('Saves', 224300000), vDir('Settings', 20000), vDir('flux', 100), vFile('archive.zip', 100000),
+          vFile('20261017-070019-VRisingServer.log', 500000), vFile('20261018-070021-VRisingServer.log', 300000, 1),
+        ];
+        case 'Saves/v4': return vWorlds.map((world) => vDir(world, 224300000));
+        case 'Settings': return [vFile('ServerHostSettings.json', 2000), vFile('ServerGameSettings.json', 9000), vFile('adminlist.txt', 20)];
+        case 'flux': return [vFile('restart.json', 100)];
+        default:
+          if (/^Saves\/v4\/[^/]+$/.test(folder)) {
+            return [vDir('.TEMP', 0), vFile('SessionId.json', 60), vFile('StartDate.json', 40), ...saves];
+          }
+          return [];
+      }
+    };
+    const vPlanOf = async (options) => backupProfiles.planProfiledArchive(
+      vrising,
+      await backupProfiles.collectProfileListings(vrising, vrisingVolume(options)),
+    );
+    assert.deepStrictEqual((await vPlanOf()).sources, [
+      'appdata/.flux-backup',
+      'appdata/Saves/v4/world1/SessionId.json', 'appdata/Saves/v4/world1/StartDate.json', 'appdata/Saves/v4/world1/AutoSave_5112.save.gz',
+      'appdata/Settings', 'appdata/flux', 'appdata/archive.zip',
+    ], 'the newest autosave that has settled');
+    assert.deepStrictEqual((await vPlanOf({ vWorlds: ['world1', 'old'] })).sources.filter((source) => /AutoSave/.test(source)), [
+      'appdata/Saves/v4/world1/AutoSave_5112.save.gz', 'appdata/Saves/v4/old/AutoSave_5112.save.gz',
+    ], 'every world');
+    assert.match((await vPlanOf({ saves: [] })).reason, /no world/, 'a server that has not saved');
+    assert.match((await vPlanOf({ saves: [vFile('AutoSave_1.save.gz', 0, 60)] })).reason, /no world/, 'an empty save');
+    const vYoung = await vPlanOf({ saves: [vFile('AutoSave_1.save.gz', 900000, 1)] });
+    assert(vYoung.unsettled && /no settled autosave/.test(vYoung.reason), 'a world made a minute ago');
+    const vArriving = await vPlanOf({ saves: [...vSaves, vFile('.syncthing.AutoSave_5114.save.gz.tmp', 9, 1)] });
+    assert(vArriving.unsettled && /still being synced/.test(vArriving.reason), 'a save arriving');
+    assert(!(await vPlanOf({ saves: [...vSaves, vFile('.syncthing.AutoSave_5114.save.gz.tmp', 9, 600)] })).reason, 'a sync given up on hours ago');
+
     // --- Satisfactory ---------------------------------------------------------------
     const satisfactory = backupProfiles.profileForComponent({
       appname: 'satisfactory1790000000000', component: 'satisfactory', repotag: null, componentCount: 1,
