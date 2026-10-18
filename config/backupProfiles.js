@@ -371,6 +371,23 @@ function rustWorldPresent(listing, now = Date.now()) {
 }
 
 /**
+ * Whether the top of a TShock config directory holds a world, and no sync
+ * arriving in it.
+ *
+ * The world is `<name>.wld` (FluxWorld.wld unless the owner renamed it or
+ * uploaded another beside it). Terraria writes it whole on every save after
+ * moving the previous one to `.wld.bak`, and that one to `.wld.bak2`. A volume
+ * whose image keeps its worlds elsewhere (beardedio's /config, littlestache)
+ * has none at its top.
+ */
+function terrariaWorldPresent(listing, now = Date.now()) {
+  const arriving = syncArriving([...listing, ...(listing.leftOut || [])], now);
+  if (arriving) return { reason: `${arriving.name} is still being synced`, unsettled: true };
+  const world = listing.some((item) => item.isFile && /\.wld$/i.test(String(item.name)) && Number(item.size) > 0);
+  return world ? null : 'no world';
+}
+
+/**
  * What the itzg Java image puts at the top of /data by itself, from TYPE,
  * VERSION and the loader variables, and fetches again on a node that lacks it:
  * the server jar and its launcher, the libraries and game versions it runs on,
@@ -598,6 +615,28 @@ module.exports = [
         children: true,
         excludeChildren: /\.navmesh$|_occlusion_\d+\.dat$|\.sav\.(\d+|new)$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$|^\.flux-backup$/i,
         validate: rustWorldPresent,
+      },
+    ],
+  },
+  {
+    // Terraria on TShock: the official ghcr.io/pryaxis/tshock and the older
+    // ryshe/terraria both mount the TShock config directory as appdata, with
+    // the world, config.json and tshock.sqlite at its top. The weight is
+    // TShock's own rolling backup, a whole copy of the world every 10 minutes
+    // kept for 4 hours (13 copies of a 12 MB world, 159 MB, in backups/ on
+    // the network, 2026-10-18), and the copies stay there for good once the
+    // server stops.
+    id: 'terraria-world',
+    // As in the hub's catalogue.
+    match: { name: 'terraria', repotag: 'terraria|tshock', component: '^terraria' },
+    include: [
+      // Every world, the save before the last (.wld.bak), the TShock config,
+      // its accounts and regions, and whatever else the owner keeps there.
+      {
+        path: '',
+        children: true,
+        excludeChildren: /^(backups|logs|crashes|tshock\.pid|\.flux-backup)$|\.wld\.bak2$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+        validate: terrariaWorldPresent,
       },
     ],
   },
