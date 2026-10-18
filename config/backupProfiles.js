@@ -466,6 +466,33 @@ function sdtdWorldPresent(listing, now = Date.now()) {
 }
 
 /**
+ * What DepotDownloader puts at the top of a Windrose volume (app 4129620, the
+ * Windows server), beside R5.
+ */
+const WINDROSE_INSTALL = new RegExp([
+  '^(R5|Engine|linux64|\\.DepotDownloader|Manifest_\\w+\\.txt',
+  'steamclient(64)?\\.(so|dll)|steamwebrtc(64)?\\.dll|libsteamwebrtc\\.so|tier0_s(64)?\\.dll|vstdlib_s(64)?\\.dll',
+  'WindroseServer\\.exe|R5WorldDescriptionUpdater\\.exe|DedicatedServer\\.md|SaveWorkflow\\.md|StartServerForeground\\.bat)$',
+].join('|'), 'i');
+
+/**
+ * Whether R5/Saved/SaveProfiles holds a Windrose world, and no sync arriving
+ * in it.
+ *
+ * A save profile (`Default`) holds RocksDB_v2, the live database of every
+ * world, and RocksDB_v2_Backups, the game's own copies of it. RocksDB writes
+ * the database in place, so the copies are archived with it: they are what is
+ * left if a standby's copy of the live one was caught half-synced.
+ */
+function windroseWorldPresent(listing, now = Date.now()) {
+  const inside = listing.flatMap((item) => (Array.isArray(item.children) ? item.children : []));
+  const arriving = syncArriving([...listing, ...inside], now);
+  if (arriving) return { reason: `${arriving.name} is still being synced`, unsettled: true };
+  const world = inside.some((item) => item.isDirectory && item.name === 'RocksDB_v2' && Number(item.size) > 0);
+  return world ? null : 'no world';
+}
+
+/**
  * What the itzg Java image puts at the top of /data by itself, from TYPE,
  * VERSION and the loader variables, and fetches again on a node that lacks it:
  * the server jar and its launcher, the libraries and game versions it runs on,
@@ -826,6 +853,40 @@ module.exports = [
         path: '',
         children: true,
         excludeChildren: /^(Saves|backups|logs|\.flux-backup)$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+      },
+    ],
+  },
+  {
+    // Windrose on indifferentbroccoli/windrose-server-docker. appdata is
+    // server-files, the whole Windows install that DepotDownloader fetches
+    // again (anonymously) on every start with UPDATE_ON_START, as the hub
+    // deploys it: 3.3 GB, almost all of it R5/Content, beside a world of a
+    // few to 25 MB (2026-10-18). Windrose+ (WINDROSE_PLUS_ENABLED) unpacks
+    // its release into the top and into R5/Binaries and R5/Content/Paks, and
+    // installs itself again when .windroseplus_version is missing.
+    id: 'windrose-world',
+    // As in the hub's catalogue.
+    match: { name: 'windrose', repotag: 'windrose', component: '^windrose' },
+    include: [
+      // The worlds and the game's own copies of them.
+      {
+        path: 'R5/Saved/SaveProfiles',
+        required: true,
+        children: true,
+        excludeChildren: /\.sync-conflict-/,
+        validate: windroseWorldPresent,
+      },
+      // The server's identity, invite code and world choice.
+      { path: 'R5/ServerDescription.json', file: true },
+      { path: 'R5/Saved/Config' },
+      // Windrose+'s config, data and the owner's mods, and whatever else the
+      // owner keeps there; not the game's own files at the top, nor
+      // Windrose+'s version marker, so that it installs itself again into the
+      // R5 the image downloads.
+      {
+        path: '',
+        children: true,
+        excludeChildren: new RegExp(`${WINDROSE_INSTALL.source}|^(\\.windroseplus_version|\\.flux-backup)$|\\.sync-conflict-|^\\.syncthing\\..*\\.tmp$|^~syncthing~.*\\.tmp$`, 'i'),
       },
     ],
   },
