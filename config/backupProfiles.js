@@ -314,6 +314,26 @@ function arkWorldPresent(listing, now = Date.now()) {
 }
 
 /**
+ * Whether Saves/Multiplayer holds a Project Zomboid world, and no sync
+ * arriving in it.
+ *
+ * A world is a folder named after the server (SERVERNAME, `projectzomboid` on
+ * the hub) holding a non-empty `players.db`, written when the world is made,
+ * beside `vehicles.db` and the map in `map/` and `chunkdata/`. The game writes
+ * chunks as they unload rather than in one save, so there is no generation to
+ * check them against; what a sync can still have half-way is a file Syncthing
+ * is writing under a temporary name.
+ */
+function zomboidWorldPresent(listing, now = Date.now()) {
+  const inside = listing.flatMap((item) => (Array.isArray(item.children) ? item.children : []));
+  const arriving = syncArriving([...listing, ...inside], now);
+  if (arriving) return { reason: `${arriving.name} is still being synced`, unsettled: true };
+  const world = listing.some((item) => item.isDirectory && (item.children || [])
+    .some((file) => file.isFile && file.name === 'players.db' && Number(file.size) > 0));
+  return world ? null : 'no world';
+}
+
+/**
  * What the itzg Java image puts at the top of /data by itself, from TYPE,
  * VERSION and the loader variables, and fetches again on a node that lacks it:
  * the server jar and its launcher, the libraries and game versions it runs on,
@@ -484,6 +504,38 @@ module.exports = [
         path: '',
         children: true,
         excludeChildren: /^(SavedArks|Logs|Crashes|webcache.*|\.flux-backup)$/i,
+      },
+    ],
+  },
+  {
+    // Project Zomboid (Build 41 and 42) on danixu86/project-zomboid-dedicated-server.
+    // appdata is the game's Zomboid folder; the server is in the image and the
+    // Workshop mods on a local (ml:) mount. What makes the full backup large is
+    // the game's own backups: on every start it zips the whole world, with the
+    // server's settings and accounts, into backups/startup (5 kept), and once
+    // more into backups/version when the game updates. Its old logs are moved
+    // into Logs/logs_<date> and never deleted. On a server a week old
+    // (2026-10-18) that was 4.47 GB of backups and 146 MB of logs beside an
+    // 839 MB world.
+    id: 'zomboid-world',
+    // As in the hub's catalogue.
+    match: { name: 'zomboid', repotag: 'zomboid', component: '^projectzomboid' },
+    include: [
+      // Each world, whole: the map, players.db and vehicles.db.
+      {
+        path: 'Saves/Multiplayer',
+        required: true,
+        children: true,
+        excludeChildren: /\.sync-conflict-/,
+        validate: zomboidWorldPresent,
+      },
+      // Server (the .ini, SandboxVars, spawn regions), db (accounts, admins,
+      // bans, whitelist), Lua, mods and anything else the owner keeps there.
+      // Left out are the game's backups and logs, and Saves, archived above.
+      {
+        path: '',
+        children: true,
+        excludeChildren: /^(Saves|backups|Logs|server-console\.txt|\.flux-backup)$/i,
       },
     ],
   },

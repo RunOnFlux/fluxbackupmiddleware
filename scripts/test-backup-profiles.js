@@ -984,6 +984,53 @@ async function main() {
     });
     assert.match(backupProfiles.planProfiledArchive(ark, crowdedArk).reason, /more than compressobject takes \(1000\)/);
 
+    // --- Project Zomboid -----------------------------------------------------------
+    const ZAPP = 'projectzomboid1790000000000';
+    const zomboid = backupProfiles.profileForComponent({
+      appname: ZAPP, component: 'projectzomboid', repotag: null, componentCount: 1,
+    });
+    assert.strictEqual(zomboid.id, 'zomboid-world', 'marketplace component');
+    assert.strictEqual(byComponent('server', { repotag: 'danixu86/project-zomboid-dedicated-server:42.20.0-release' }).id, 'zomboid-world', 'by image');
+
+    // The volume of the B42 image after two starts (local run, 2026-10-18).
+    const zFile = (name, size, minutesAgo = 30) => ({
+      name, size, isFile: true, isDirectory: false, modifiedAt: at(minutesAgo),
+    });
+    const zDir = (name, size) => ({
+      name, size, isFile: false, isDirectory: true, modifiedAt: at(30),
+    });
+    const zWorld = [
+      zFile('players.db', 16384), zFile('vehicles.db', 16384), zFile('WorldDictionary.bin', 51200),
+      zDir('map', 900000), zDir('chunkdata', 4000), zDir('zpop', 2000), zDir('isoregiondata', 1000),
+    ];
+    const zomboidVolume = (world = zWorld, extra = []) => async (folder) => {
+      if (folder === '') {
+        return [
+          zDir('Saves', 2200000), zDir('Server', 72000), zDir('db', 88000), zDir('backups', 900000000),
+          zDir('Logs', 40000000), zDir('Lua', 4000), zDir('Crafting', 28000), zDir('messaging', 44000),
+          zDir('Workshop', 0), zDir('Recording', 0), zFile('options.ini', 3432), zFile('server-console.txt', 248000),
+        ];
+      }
+      if (folder === 'Saves/Multiplayer') return [zDir('projectzomboid', 2200000)];
+      if (folder === 'Saves/Multiplayer/projectzomboid') return [...world, ...extra];
+      return [];
+    };
+    const zPlan = backupProfiles.planProfiledArchive(zomboid, await backupProfiles.collectProfileListings(zomboid, zomboidVolume()));
+    assert.deepStrictEqual(zPlan.sources, [
+      'appdata/.flux-backup',
+      'appdata/Saves/Multiplayer/projectzomboid',
+      'appdata/Server', 'appdata/db', 'appdata/Lua', 'appdata/Crafting', 'appdata/messaging',
+      'appdata/Workshop', 'appdata/Recording', 'appdata/options.ini',
+    ]);
+    const zPlanOf = async (world, extra) => backupProfiles.planProfiledArchive(zomboid, await backupProfiles.collectProfileListings(zomboid, zomboidVolume(world, extra)));
+    assert.match((await zPlanOf(zWorld.slice(1))).reason, /no world/, 'a world folder without players.db');
+    assert.match((await zPlanOf([zFile('players.db', 0), ...zWorld.slice(1)])).reason, /no world/, 'an empty players.db');
+    const zArriving = await zPlanOf(zWorld, [zFile('.syncthing.players.db.tmp', 9, 1)]);
+    assert(zArriving.unsettled && /still being synced/.test(zArriving.reason), 'a sync arriving');
+    assert(!(await zPlanOf(zWorld, [zFile('.syncthing.players.db.tmp', 9, 600)])).reason, 'a sync given up on hours ago');
+    const noSaves = await backupProfiles.collectProfileListings(zomboid, async (folder) => (folder === '' ? [zDir('Server', 1)] : null));
+    assert.strictEqual(backupProfiles.planProfiledArchive(zomboid, noSaves).fits, false, 'a server that never made a world');
+
     // --- Minecraft -----------------------------------------------------------------
     const mcProfile = (component, repotag = null, appname = 'minecraftserver1790000000000') => backupProfiles.profileForComponent({
       appname, component, repotag, componentCount: 1,
