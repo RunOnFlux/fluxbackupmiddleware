@@ -87,6 +87,16 @@ const parentOf = (entryPath) => {
 const baseName = (entryPath) => entryPath.slice(entryPath.lastIndexOf('/') + 1);
 /** A path under a profile entry's; an entry's path is '' for appdata itself. */
 const joinPath = (folder, name) => (folder ? `${folder}/${name}` : String(name));
+/** `latestWithin`'s folder inside a child folder: the child itself when its path is ''. */
+const withinPath = (folder, latestPath) => (latestPath ? `${folder}/${latestPath}` : folder);
+
+/**
+ * The most entries FluxOS's compressobject takes in one list
+ * (fileSystemManager.js MAX_ARCHIVE_SOURCES). A plan naming more is refused
+ * here, so the backup goes straight to the full archive rather than through a
+ * request the node would turn down.
+ */
+const MAX_ARCHIVE_SOURCES = 1000;
 
 /**
  * One folder of a `children` entry with `excludeWithin`: what it holds less
@@ -113,7 +123,7 @@ async function listWithin(entry, folder, item, inside, listOnce) {
   }
   const result = { ...item, children, excludedChildren: inside.filter((child) => child && leftOut(child)) };
   if (entry.latestWithin) {
-    result.latestCandidates = (await listOnce(`${folder}/${entry.latestWithin.path}`)) || [];
+    result.latestCandidates = (await listOnce(withinPath(folder, entry.latestWithin.path))) || [];
   }
   return result;
 }
@@ -265,7 +275,7 @@ function planProfiledArchive(profile, listings, now = Date.now()) {
         item.children.forEach((child) => sources.push(`appdata/${itemPath}/${child.name}`));
         if (entry.latestWithin) {
           const newest = newestSettledFile(item.latestCandidates || [], entry.latestWithin, now);
-          if (newest) sources.push(`appdata/${itemPath}/${entry.latestWithin.path}/${newest.name}`);
+          if (newest) sources.push(`appdata/${withinPath(itemPath, entry.latestWithin.path)}/${newest.name}`);
         }
       });
     } else {
@@ -287,6 +297,9 @@ function planProfiledArchive(profile, listings, now = Date.now()) {
     if (total > 0 && saved / total < profile.minSavedShare) {
       return { fits: false, reason: `it would leave out only ${Math.round((100 * saved) / total)}% of the volume` };
     }
+  }
+  if (sources.length > MAX_ARCHIVE_SOURCES) {
+    return { fits: false, reason: `it would archive ${sources.length} entries, more than compressobject takes (${MAX_ARCHIVE_SOURCES})` };
   }
   return { fits: true, sources };
 }
@@ -329,6 +342,7 @@ function sameListings(before, after) {
 module.exports = {
   PROFILE_MARKER_DIR,
   MAX_CHILD_FOLDERS,
+  MAX_ARCHIVE_SOURCES,
   matchesComponent,
   profileForComponent,
   resolveComponentProfiles,

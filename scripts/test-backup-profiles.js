@@ -860,6 +860,127 @@ async function main() {
     });
     assert.match(backupProfiles.planProfiledArchive(palworld, crowdedListings).reason, /more than 20 folders/);
 
+    // --- ARK: Survival Ascended ---------------------------------------------------
+    const AAPP = 'arksurvivalascended1790000000000';
+    const ACOMP = 'arksurvivalascended';
+    const ark = backupProfiles.profileForComponent({
+      appname: AAPP, component: ACOMP, repotag: null, componentCount: 1,
+    });
+    assert.strictEqual(ark.id, 'ark-ascended-world', 'marketplace component');
+    assert.strictEqual(byComponent('server', { repotag: 'acekorneya/asa_server:2_1_latest' }).id, 'ark-ascended-world', 'by image');
+    assert.strictEqual(backupProfiles.profileForComponent({
+      appname: 'arksurvivalevolved1790000000000', component: 'arksurvivalevolved', repotag: 'runonflux/ase-server-flux:latest', componentCount: 1,
+    }), null, 'ARK: Survival Evolved has another layout');
+
+    // A save on the local ASA 94.15 run (2026-10-05): the world, a player and a
+    // tribe, the game's copies of the last saves and the anti-corruption copy.
+    const aFile = (name, size, minutesAgo) => ({
+      name, size, isFile: true, isDirectory: false, modifiedAt: at(minutesAgo),
+    });
+    const aDir = (name, size, extra = {}) => ({
+      name, size, isFile: false, isDirectory: true, modifiedAt: at(3), ...extra,
+    });
+    const MAP = 'TheIsland_WP';
+    const arkWorld = [
+      aFile(`${MAP}.ark`, 148897792, 3),
+      aFile('00025d8a8e154f73a1b29a5bfbc8c3f1.arkprofile', 61440, 3),
+      aFile('1415497718.arktribe', 4096, 3),
+    ];
+    const arkCopies = [
+      aFile(`${MAP}_AntiCorruptionBackup.bak`, 148897792, 900),
+      aFile(`${MAP}_18.10.2026_15.05.12.arkrbf`, 147849216, 48),
+      aFile(`${MAP}_18.10.2026_15.20.12.arkrbf`, 148373504, 33),
+      aFile(`${MAP}_18.10.2026_15.35.12.arkrbf`, 148635648, 18),
+      aFile(`${MAP}_18.10.2026_15.50.12.arkrbf`, 148897792, 3),
+    ];
+    const aWorlds = ark.include[0];
+    const mapFolder = (kept = arkWorld, leftOut = arkCopies) => aDir(MAP, 1000000000, { children: kept, excludedChildren: leftOut });
+    assert.strictEqual(aWorlds.validate([mapFolder()]), null);
+    assert.strictEqual(aWorlds.validate([]), 'no world');
+    assert.strictEqual(aWorlds.validate([mapFolder(arkWorld.slice(1))]), 'no world', 'profiles without a world');
+    assert.strictEqual(aWorlds.validate([mapFolder([aFile(`${MAP}.ark`, 0, 3)])]), 'no world', 'an empty .ark');
+    assert.match(unsettledReason(aWorlds.validate([mapFolder(arkWorld, [...arkCopies, aFile(`.syncthing.${MAP}.ark.tmp`, 9, 1)])])), /\.syncthing\..* is still being synced/);
+    assert.strictEqual(aWorlds.validate([mapFolder(arkWorld, [...arkCopies, aFile(`.syncthing.${MAP}.ark.tmp`, 9, 600)])]), null, 'a sync given up on hours ago');
+
+    // The volume, as listed on a standby.
+    const aRoute = (folder, entries) => ({
+      match: (r) => r.method === 'get' && r.url === `${NODE}/apps/getfolderinfo/${AAPP}/${ACOMP}/${encodeURIComponent(folder)}`,
+      reply: () => (entries ? success(entries) : missing()),
+    });
+    const arkVolume = (copies = arkCopies) => [
+      aRoute('appdata', [
+        aDir('Config', 21000), aDir('Logs', 9000000), aDir('Crashes', 300000), aDir('SavedArks', 1000000000),
+        aDir('webcache_6613', 2000000), aFile('notes.txt', 120, 9000),
+      ]),
+      aRoute('appdata/Config', [aDir('WindowsServer', 20000), aDir('FirstLaunchFlags', 10)]),
+      aRoute('appdata/Config/WindowsServer', [aFile('GameUserSettings.ini', 9000, 60), aFile('Game.ini', 11000, 60)]),
+      aRoute('appdata/Config/FirstLaunchFlags', [aFile('done', 1, 9000)]),
+      aRoute('appdata/SavedArks', [aDir(MAP, 1000000000)]),
+      aRoute(`appdata/SavedArks/${MAP}`, [...arkWorld, ...copies]),
+      {
+        match: (r) => r.url.startsWith(`${NODE}/apps/createfolder/`),
+        reply: () => ({ status: 200, headers: {}, data: { status: 'success', data: {} } }),
+      },
+      {
+        match: (r) => r.method === 'post' && r.url === `${NODE}/apps/compressobject`,
+        reply: () => ({ status: 202, headers: {}, data: { status: 'success', data: { jobId: 'job-a' } } }),
+      },
+      {
+        match: (r) => r.url === `${NODE}/apps/operations/job-a`,
+        reply: () => success({ status: 'Succeeded' }),
+      },
+    ];
+    calls.length = 0;
+    routes = arkVolume();
+    outcome = await fluxOS.testHooks.createProfiledArchiveOnNode(NODE, 'auth', AAPP, ACOMP, ark, []);
+    assert.deepStrictEqual(outcome, { fits: true });
+    assert.deepStrictEqual(calls.find((r) => r.url.endsWith('/apps/compressobject')).data.source, [
+      'appdata/.flux-backup',
+      `appdata/SavedArks/${MAP}/${MAP}.ark`,
+      `appdata/SavedArks/${MAP}/00025d8a8e154f73a1b29a5bfbc8c3f1.arkprofile`,
+      `appdata/SavedArks/${MAP}/1415497718.arktribe`,
+      // The newest copy at least five minutes old, not the one written 3 minutes ago.
+      `appdata/SavedArks/${MAP}/${MAP}_18.10.2026_15.35.12.arkrbf`,
+      'appdata/Config',
+      'appdata/notes.txt',
+    ]);
+    const aListed = calls.filter((r) => r.url.includes('/apps/getfolderinfo/')).map((r) => decodeURIComponent(r.url.split('/').pop()));
+    assert(!aListed.some((folder) => /^appdata\/(Logs|Crashes|webcache)/.test(folder)), 'left out at the top, never listed');
+    assert.strictEqual(aListed.filter((folder) => folder === `appdata/SavedArks/${MAP}`).length, 2, 'the map folder: once before, once after the archive; its copies come from the same listing');
+
+    // A server that has not written a copy yet still archives its world.
+    const firstSave = await backupProfiles.collectProfileListings(ark, async (folder) => {
+      if (folder === 'SavedArks') return [aDir(MAP, 1)];
+      if (folder === `SavedArks/${MAP}`) return [...arkWorld, arkCopies[4]];
+      return folder === '' ? [aDir('SavedArks', 1)] : [];
+    });
+    assert.deepStrictEqual(backupProfiles.planProfiledArchive(ark, firstSave).sources, [
+      'appdata/.flux-backup', ...arkWorld.map((saved) => `appdata/SavedArks/${MAP}/${saved.name}`),
+    ]);
+
+    // A new save adds a copy and prunes one: not a change to what was archived.
+    const arkListings = await backupProfiles.collectProfileListings(ark, (folder) => {
+      const route = arkVolume().find((r) => r.match({ method: 'get', url: `${NODE}/apps/getfolderinfo/${AAPP}/${ACOMP}/${encodeURIComponent(folder ? `appdata/${folder}` : 'appdata')}` }));
+      return route ? route.reply().data.data || null : null;
+    });
+    const nextCopy = JSON.parse(JSON.stringify(arkListings));
+    nextCopy.SavedArks[0].excludedChildren.splice(1, 1, aFile(`${MAP}_18.10.2026_16.05.12.arkrbf`, 1, 0));
+    nextCopy.SavedArks[0].latestCandidates.push(aFile(`${MAP}_18.10.2026_16.05.12.arkrbf`, 1, 0));
+    assert(backupProfiles.sameListings(arkListings, nextCopy), 'only the copies changed');
+    const resavedArk = JSON.parse(JSON.stringify(arkListings));
+    resavedArk.SavedArks[0].children[0].modifiedAt = at(0);
+    assert(!backupProfiles.sameListings(arkListings, resavedArk), 'a new save is a change');
+
+    // More players than compressobject takes in one list -> the full backup.
+    const crowdedArk = await backupProfiles.collectProfileListings(ark, async (folder) => {
+      if (folder === 'SavedArks') return [aDir(MAP, 1)];
+      if (folder === `SavedArks/${MAP}`) {
+        return [arkWorld[0], ...Array.from({ length: backupProfiles.MAX_ARCHIVE_SOURCES }, (_, i) => aFile(`${String(i).padStart(32, '0')}.arkprofile`, 1, 3))];
+      }
+      return [];
+    });
+    assert.match(backupProfiles.planProfiledArchive(ark, crowdedArk).reason, /more than compressobject takes \(1000\)/);
+
     // --- Minecraft -----------------------------------------------------------------
     const mcProfile = (component, repotag = null, appname = 'minecraftserver1790000000000') => backupProfiles.profileForComponent({
       appname, component, repotag, componentCount: 1,
