@@ -1031,6 +1031,59 @@ async function main() {
     const noSaves = await backupProfiles.collectProfileListings(zomboid, async (folder) => (folder === '' ? [zDir('Server', 1)] : null));
     assert.strictEqual(backupProfiles.planProfiledArchive(zomboid, noSaves).fits, false, 'a server that never made a world');
 
+    // --- Satisfactory ---------------------------------------------------------------
+    const satisfactory = backupProfiles.profileForComponent({
+      appname: 'satisfactory1790000000000', component: 'satisfactory', repotag: null, componentCount: 1,
+    });
+    assert.strictEqual(satisfactory.id, 'satisfactory-world', 'marketplace component');
+    assert.strictEqual(byComponent('server', { repotag: 'wolveix/satisfactory-server:latest' }).id, 'satisfactory-world', 'by image');
+
+    // A modded server on the network (2026-10-18), as its standby lists it.
+    const sFile = (name, size, minutesAgo = 30) => ({
+      name, size, isFile: true, isDirectory: false, modifiedAt: at(minutesAgo),
+    });
+    const sDir = (name, size) => ({
+      name, size, isFile: false, isDirectory: true, modifiedAt: at(30),
+    });
+    const sSaves = [
+      sFile('FluxManualSave.sav', 84236), sFile('FluxManualSave_continue.sav', 84492), sFile('probe_autosave_0.sav', 84212),
+    ];
+    const satisfactoryVolume = ({ saves = sSaves, extra = [], mods = true } = {}) => async (folder) => {
+      switch (folder) {
+        case '': return [sDir('backups', 252932), sDir('flux', 20), sDir('gamefiles', 2893128873), sDir('logs', 27403), sDir('saved', 258078)];
+        case 'saved': return [sFile('ServerSettings.64804.sav', 5138), sDir('blueprints', 0), sDir('server', 252940)];
+        case 'saved/server': return [...saves, ...extra];
+        case 'saved/blueprints': return [];
+        case 'gamefiles/FactoryGame/Saved/Config': return [sDir('CrashReportClient', 407), sDir('LinuxServer', 6909)];
+        case 'gamefiles/FactoryGame/Mods': return mods ? [sDir('SML', 3482527), sDir('InfiniteZoop', 335416)] : null;
+        case 'gamefiles/FactoryGame/Configs': return mods ? [sFile('InfiniteZoop.cfg', 130)] : null;
+        default: return [];
+      }
+    };
+    const sPlanOf = async (options) => backupProfiles.planProfiledArchive(
+      satisfactory,
+      await backupProfiles.collectProfileListings(satisfactory, satisfactoryVolume(options)),
+    );
+    assert.deepStrictEqual((await sPlanOf()).sources, [
+      'appdata/.flux-backup',
+      'appdata/saved/ServerSettings.64804.sav', 'appdata/saved/blueprints', 'appdata/saved/server',
+      'appdata/gamefiles/FactoryGame/Saved/Config',
+      'appdata/gamefiles/FactoryGame/Mods',
+      'appdata/gamefiles/FactoryGame/Configs',
+      'appdata/flux',
+    ]);
+    assert.deepStrictEqual((await sPlanOf({ mods: false })).sources, [
+      'appdata/.flux-backup',
+      'appdata/saved/ServerSettings.64804.sav', 'appdata/saved/blueprints', 'appdata/saved/server',
+      'appdata/gamefiles/FactoryGame/Saved/Config',
+      'appdata/flux',
+    ], 'an unmodded server');
+    assert.match((await sPlanOf({ saves: [] })).reason, /no world/, 'a server nobody has created a session on');
+    assert.match((await sPlanOf({ saves: [sFile('FluxManualSave.sav', 0)] })).reason, /no world/, 'an empty save');
+    const sArriving = await sPlanOf({ extra: [sFile('.syncthing.probe_autosave_1.sav.tmp', 9, 1)] });
+    assert(sArriving.unsettled && /still being synced/.test(sArriving.reason), 'a save arriving');
+    assert(!(await sPlanOf({ extra: [sFile('.syncthing.probe_autosave_1.sav.tmp', 9, 600)] })).reason, 'a sync given up on hours ago');
+
     // --- Minecraft -----------------------------------------------------------------
     const mcProfile = (component, repotag = null, appname = 'minecraftserver1790000000000') => backupProfiles.profileForComponent({
       appname, component, repotag, componentCount: 1,

@@ -334,6 +334,24 @@ function zomboidWorldPresent(listing, now = Date.now()) {
 }
 
 /**
+ * Whether `saved` holds a Satisfactory world, and no sync arriving in it.
+ *
+ * The saves are `.sav` files in saved/server, each a whole session the game
+ * writes at once (autosaves rotate through `<session>_autosave_N.sav`). Beside
+ * `server` is `ServerSettings.<port>.sav`: the server's name, admin password
+ * and options. A server nobody has created a session on has no save, and gets
+ * the full backup.
+ */
+function satisfactoryWorldPresent(listing, now = Date.now()) {
+  const inside = listing.flatMap((item) => (Array.isArray(item.children) ? item.children : []));
+  const arriving = syncArriving([...listing, ...inside], now);
+  if (arriving) return { reason: `${arriving.name} is still being synced`, unsettled: true };
+  const world = listing.some((item) => item.isDirectory && item.name === 'server' && (item.children || [])
+    .some((file) => file.isFile && /\.sav$/i.test(String(file.name)) && Number(file.size) > 0));
+  return world ? null : 'no world';
+}
+
+/**
  * What the itzg Java image puts at the top of /data by itself, from TYPE,
  * VERSION and the loader variables, and fetches again on a node that lacks it:
  * the server jar and its launcher, the libraries and game versions it runs on,
@@ -536,6 +554,39 @@ module.exports = [
         path: '',
         children: true,
         excludeChildren: /^(Saves|backups|Logs|server-console\.txt|\.flux-backup)$/i,
+      },
+    ],
+  },
+  {
+    // Satisfactory on wolveix/satisfactory-server. appdata is /config, and
+    // almost all of it is the server's install in gamefiles (2.9 to 4.3 GB on
+    // the network's 14 apps, 2026-10-18) beside saves of a few MB. The image
+    // installs the server again on start when FactoryServer.sh is missing, even
+    // with SKIPUPDATE, so a restore onto an empty volume still starts.
+    id: 'satisfactory-world',
+    // As in the hub's catalogue.
+    match: { name: 'satisfactory', repotag: 'satisfactory-server', component: '^satisfactory' },
+    include: [
+      // server/ (the sessions' saves), blueprints/ and ServerSettings.<port>.sav.
+      {
+        path: 'saved',
+        required: true,
+        children: true,
+        excludeChildren: /\.sync-conflict-/,
+        validate: satisfactoryWorldPresent,
+      },
+      // Inside the install, but not downloaded again: the server's ini files,
+      // the ficsit.app mods the owner installed (with SML) and their settings.
+      { path: 'gamefiles/FactoryGame/Saved/Config' },
+      { path: 'gamefiles/FactoryGame/Mods' },
+      { path: 'gamefiles/FactoryGame/Configs' },
+      // The hub's flux/ folder and anything else the owner keeps there. Left
+      // out are the install, the copy of saved/server the image makes in
+      // backups/ on every start, and Steam's logs.
+      {
+        path: '',
+        children: true,
+        excludeChildren: /^(gamefiles|saved|backups|logs|\.flux-backup)$/i,
       },
     ],
   },
