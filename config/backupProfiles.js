@@ -405,6 +405,36 @@ function hytaleWorldPresent(listing, now = Date.now()) {
   return world ? null : 'no world';
 }
 
+/** A V Rising autosave: the whole world, `AutoSave_<n>.save.gz` (`.save` before 1.0). */
+const VRISING_AUTOSAVE = /^AutoSave_\d+\.save(\.gz)?$/i;
+
+/** How old the newest V Rising autosave must be to be taken (one comes every 2 minutes). */
+const VRISING_SETTLED_MS = 3 * 60 * 1000;
+
+/**
+ * Whether Saves/v4 holds a V Rising world whose newest autosave has settled,
+ * and no sync arriving in it.
+ *
+ * A world is a folder named after VR_SAVE_NAME (`world1` on the hub) holding
+ * AutoSave_<n>.save.gz files, each the whole world, beside SessionId.json and
+ * StartDate.json. The game writes a save into .TEMP and moves it in, and keeps
+ * the last 20 (AutoSaveCount). Only the newest settled one is archived, so a
+ * world whose saves are all younger than VRISING_SETTLED_MS (a server that has
+ * only just made it) is not ready yet.
+ */
+function vrisingWorldPresent(listing, now = Date.now()) {
+  const inside = listing.flatMap((item) => [...(item.children || []), ...(item.excludedChildren || [])]);
+  const arriving = syncArriving([...listing, ...inside], now);
+  if (arriving) return { reason: `${arriving.name} is still being synced`, unsettled: true };
+  const saves = (item) => (item.excludedChildren || [])
+    .filter((file) => file.isFile && VRISING_AUTOSAVE.test(String(file.name)) && Number(file.size) > 0);
+  const worlds = listing.filter((item) => item.isDirectory && saves(item).length > 0);
+  if (worlds.length === 0) return 'no world';
+  const young = worlds.find((item) => !saves(item).some((file) => now - Date.parse(file.modifiedAt) >= VRISING_SETTLED_MS));
+  if (young) return { reason: `${young.name} has no settled autosave yet`, unsettled: true };
+  return null;
+}
+
 /**
  * What the itzg Java image puts at the top of /data by itself, from TYPE,
  * VERSION and the loader variables, and fetches again on a node that lacks it:
@@ -692,6 +722,38 @@ module.exports = [
         path: '',
         children: true,
         excludeChildren: /^(universe|Assets\.zip|Server|downloader|\.cache|backups|logs|telemetry|start\.(sh|bat)|\.server-version|game\.zip|hytale-downloader\.zip|\.flux-backup)$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+      },
+    ],
+  },
+  {
+    // V Rising on runonflux/vrising-server-flux. appdata is persistentdata
+    // (the install and the mods are m: mounts, outside the backup): Settings,
+    // the logs and Saves/v4/<world>. The weight is the game's own 20 autosaves
+    // per world, each the whole world (8 to 12 MB, 140 to 225 MB per app on
+    // the network, 2026-10-18).
+    id: 'vrising-world',
+    // As in the hub's catalogue.
+    match: { name: 'vrising', repotag: 'vrising', component: '^vrising' },
+    include: [
+      // Each world folder: SessionId.json, StartDate.json and whatever else is
+      // there, plus its newest settled autosave, which is what the server
+      // loads when it is the only one.
+      {
+        path: 'Saves/v4',
+        required: true,
+        children: true,
+        excludeChildren: /\.sync-conflict-/,
+        excludeWithin: /^AutoSave_\d+\.save(\.gz)?$|^\.TEMP$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+        latestWithin: { path: '', name: VRISING_AUTOSAVE, settledMs: VRISING_SETTLED_MS },
+        validate: vrisingWorldPresent,
+      },
+      // Settings (ServerHostSettings.json, ServerGameSettings.json, the admin
+      // and ban lists), the hub's flux/ and whatever else the owner keeps
+      // there, but not the game's logs.
+      {
+        path: '',
+        children: true,
+        excludeChildren: /^(Saves|\.flux-backup)$|-VRisingServer\.log$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
       },
     ],
   },
