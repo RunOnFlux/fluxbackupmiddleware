@@ -269,6 +269,8 @@ function planProfiledArchive(profile, listings, now = Date.now()) {
         return { fits: false, reason: `${entry.path}: ${reason}`, ...(unsettled ? { unsettled: true } : {}) };
       }
     }
+    // eslint-disable-next-line no-continue
+    if (entry.checkOnly) continue;
     if (entry.latest) {
       const newest = newestSettledFile(listing, entry.latest, now);
       if (newest) add(`appdata/${entry.path}/${newest.name}`, newest.size);
