@@ -826,7 +826,7 @@ async function enforceAppBackupRetention(owner, appname) {
     }
     const tasks = await dbCli.execute(`
       SELECT retained.taskId, retained.appname, retained.timestamp, retained.hash,
-        retained.filesize
+        retained.filesize, retained.backup_profile
       FROM tasks retained
       WHERE retained.owner = ? AND retained.appname = ?
         AND retained.uploaded = 1 AND retained.finishTime > 0
@@ -841,7 +841,14 @@ async function enforceAppBackupRetention(owner, appname) {
         )
     `, [owner, appname]);
     const batches = groupBackupTasksByAge(tasks);
-    const excess = batches.slice(0, Math.max(0, batches.length - limit));
+    // The newest whole backup is kept whatever its age: past it there are only
+    // partial ("World & settings") ones, and what a profile leaves out (the
+    // install, the owner's own files in it) would be in no backup at all.
+    const isFull = (batch) => batch.tasks.every((task) => !task.backup_profile);
+    const newestFull = [...batches].reverse().find(isFull);
+    const excess = batches
+      .filter((batch) => batch !== newestFull)
+      .slice(0, Math.max(0, batches.length - limit));
     for (let i = 0; i < excess.length; i += 1) {
       const batch = excess[i];
       for (let j = 0; j < batch.tasks.length; j += 1) {
@@ -1958,6 +1965,37 @@ async function cleanupIncompleteAutomaticBackupTasks(taskIds) {
  * @async
  * @returns {Promise<Object>} - Summary of cleanup results
  */
+/** How long a node keeps backup/local files itself (FluxOS cleanLocalBackup). */
+const NODE_LOCAL_BACKUP_TTL_SECONDS = 24 * 60 * 60;
+const LEFTOVER_ARCHIVES_PER_RUN = 50;
+
+/**
+ * Remove again the archives an automatic backup uploaded but could not remove
+ * from its node. Left there, a partial archive sits in the owner's local
+ * backups until the node reaps it a day later, and from there can be uploaded
+ * to FluxDrive as a manual backup with no profile. Only while the node may
+ * still hold it: after that it is gone, and the node would only answer that
+ * the path does not exist.
+ */
+async function removeLeftoverNodeArchives() {
+  const since = Math.floor(Date.now() / 1000) - NODE_LOCAL_BACKUP_TTL_SECONDS;
+  const leftovers = await dbCli.execute(`
+    SELECT taskId, host FROM tasks
+    WHERE backup_type = 'automatic' AND uploaded = 1 AND remoteRemoved = 0
+      AND finishTime > ? AND host IS NOT NULL AND host <> ''
+    ORDER BY finishTime DESC
+    LIMIT ${LEFTOVER_ARCHIVES_PER_RUN}
+  `, [since]);
+  let removed = 0;
+  for (let i = 0; i < leftovers.length; i += 1) {
+    // eslint-disable-next-line no-use-before-define
+    if (await removeBackupFromRemoteHost(leftovers[i].host, leftovers[i].taskId)) removed += 1;
+  }
+  if (leftovers.length > 0) {
+    log.info(`Leftover node archives: ${removed}/${leftovers.length} removed`);
+  }
+}
+
 async function cleanupOldAutomaticBackups() {
   try {
     log.info('Running periodic cleanup for incomplete automatic backups...');
@@ -1982,6 +2020,7 @@ async function cleanupOldAutomaticBackups() {
     const incompleteResult = await cleanupIncompleteAutomaticBackupTasks(
       incompleteTasks.map((task) => task.taskId),
     );
+    await removeLeftoverNodeArchives();
 
     log.info(`Incomplete automatic backup cleanup summary: ${incompleteResult.removed} removed, ${incompleteResult.failed} failed, ${incompleteResult.inProgress} still in progress`);
     return {
@@ -3111,6 +3150,7 @@ module.exports = {
     enforceAppBackupRetention,
     resolveBackupProfiles,
     canRetryOnPrimary,
+    removeLeftoverNodeArchives,
     checkpointComponent,
     claimNextAutomaticBackup,
     persistAutomaticBackupCompletion,
