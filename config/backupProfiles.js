@@ -81,11 +81,28 @@
  * backup pauses Syncthing while it archives and the profiled one does not, so
  * a profile that saves almost nothing is not worth a world caught changing.
  *
+ * `primarySafe` (a profile option, true): when the secondaries fail, the last
+ * attempt may take this profile's archive on the primary, with the server
+ * running. Only for a game whose saves the listings see change: every file a
+ * save writes sits in a folder that is listed (an entry, or a folder one level
+ * inside a `children` entry), or the save is written aside and renamed, or the
+ * profile also keeps a settled copy. A folder deeper than that is compared
+ * only by its own time and total size, which a file rewritten in place at the
+ * same size changes neither of (Minecraft's regions, Zomboid's map chunks), so
+ * such a game would be archived half before and half after a save without
+ * anything failing. `ignoreChanges` is no use there either: on the primary the
+ * game writes the file in place, not whole.
+ *
+ * `restoreClear` (a profile option, [{ folder, name }]): what a restore of
+ * this profile's archive removes besides the entries it replaces, in each
+ * folder matching `folder` (relative to appdata, `*` for one path segment)
+ * that the archive restores entries into: the files whose name matches `name`
+ * and that the archive does not hold. For game state a split folder leaves
+ * out that the game would load in place of the restored files (V Rising's
+ * newer autosaves). The hub and the cloud UI read it from /getrestorerules.
+ *
  * A profile assumes a g: app: backups are taken on the secondary, where the
  * container does not run, so nothing is written while the paths are archived.
- * When the secondaries fail, the last attempt takes the profiled archive on the
- * primary, with the server running: a file the game writes meanwhile changes
- * the listing or fails the tar, and that attempt fails rather than keep it.
  */
 
 /** Syncthing writes a file under one of these names and renames it when it is whole. */
@@ -530,6 +547,8 @@ module.exports = [
     // plans and `dragonwildsdragonwilds` in the marketplace app; the image is
     // indifferentbroccoli/runescape-dragonwilds-server-docker today.
     match: { name: 'dragonwilds', repotag: 'dragonwilds', component: '^dragonwilds' },
+    // The .sav files sit in the listed SaveGames folder.
+    primarySafe: true,
     include: [
       // The world .sav files.
       { path: 'RSDragonwilds/Saved/SaveGames', required: true, mustContain: /\.sav$/i },
@@ -550,6 +569,9 @@ module.exports = [
     // As in the hub's catalogue. Components are `valheim` in the hub's plans
     // and `valheimvalheim` in the marketplace app.
     match: { name: 'valheim', repotag: 'valheim|lloesche', component: '^valheim' },
+    // A save writes a new generation of files, listed in the world folder,
+    // and the newest settled hourly zip goes in too.
+    primarySafe: true,
     include: [
       // Each world, on its own: a 1.0 world folder or a pre-1.0 .db/.fwl pair.
       // Valheim's own automatic backups sit beside them (`<world>_backup_auto-*`)
@@ -594,6 +616,12 @@ module.exports = [
     // As in the hub's catalogue. Components are `palworld` in the hub's plans
     // and `palworldpalworld` in the marketplace app.
     match: { name: 'palworld', repotag: 'palworld', component: '^palworld' },
+    // The world's files and Players/ are listed, saves are written aside and
+    // renamed, and a settled restore point goes in too.
+    primarySafe: true,
+    // A WorldOption.sav the archive does not hold (one uploaded after the
+    // backup) would override PalWorldSettings.ini over the restored world.
+    restoreClear: [{ folder: 'SaveGames/0/*', name: /^WorldOption\.sav$/ }],
     include: [
       // Each world: Level.sav, LevelMeta.sav, LocalData.sav, Players/,
       // WorldOption.sav and whatever else the owner put there (the hub's
@@ -644,6 +672,8 @@ module.exports = [
     id: 'ark-ascended-world',
     // As in the hub's catalogue.
     match: { name: 'arksurvivalascended', repotag: 'asa_server', component: '^arksurvivalascended' },
+    // The map folder's files are listed, and a settled .arkrbf goes in too.
+    primarySafe: true,
     include: [
       // Each map folder: the world, every player's .arkprofile and tribe's
       // .arktribe and whatever else is there, but not the game's own copies,
@@ -713,6 +743,8 @@ module.exports = [
     id: 'rust-world',
     // As in the hub's catalogue.
     match: { name: 'rust', repotag: 'rust|carbon|oxide', component: '^rust' },
+    // The world, the map and the databases sit at the listed top.
+    primarySafe: true,
     include: [
       // The world, the procedural or custom map it is on (generating it again
       // takes up to half an hour, and a custom map's URL may be gone), the
@@ -737,6 +769,8 @@ module.exports = [
     id: 'terraria-world',
     // As in the hub's catalogue.
     match: { name: 'terraria', repotag: 'terraria|tshock', component: '^terraria' },
+    // The worlds and tshock.sqlite sit at the listed top.
+    primarySafe: true,
     include: [
       // Every world, the save before the last (.wld.bak), the TShock config,
       // its accounts and regions, and whatever else the owner keeps there.
@@ -794,6 +828,11 @@ module.exports = [
     id: 'vrising-world',
     // As in the hub's catalogue.
     match: { name: 'vrising', repotag: 'vrising', component: '^vrising' },
+    // Each autosave is a new file, and only a settled one goes in.
+    primarySafe: true,
+    // The archive holds one autosave per world, loose; the newer ones on the
+    // node would be loaded in its place, so the restore would change nothing.
+    restoreClear: [{ folder: 'Saves/v4/*', name: VRISING_AUTOSAVE }],
     include: [
       // Each world folder: SessionId.json, StartDate.json and whatever else is
       // there, plus its newest settled autosave, which is what the server
@@ -902,6 +941,9 @@ module.exports = [
     id: 'satisfactory-world',
     // As in the hub's catalogue.
     match: { name: 'satisfactory', repotag: 'satisfactory-server', component: '^satisfactory' },
+    // The saves sit in saved/server, listed one level inside saved, and each
+    // autosave is a new file.
+    primarySafe: true,
     include: [
       // server/ (the sessions' saves), blueprints/ and ServerSettings.<port>.sav.
       {
