@@ -218,12 +218,19 @@ function newestSettledFile(listing, { name, settledMs = 0, directory = false }, 
  * @param {object} profile
  * @param {Object<string, Array|object|null>} listings - from collectProfileListings
  * @param {number} [now] - the time `latest` measures settledMs from
- * @returns {{fits: true, sources: string[]} | {fits: false, reason: string, unsettled?: true}}
- *   sources are relative to the VOLUME root, as compressobject takes them;
+ * @returns {{fits: true, sources: string[], bytes: number} | {fits: false, reason: string, unsettled?: true}}
+ *   sources are relative to the VOLUME root, as compressobject takes them, and
+ *   bytes what they hold as listed;
  *   unsettled when an entry's `validate` found its files still arriving
  */
 function planProfiledArchive(profile, listings, now = Date.now()) {
   const sources = [`appdata/${PROFILE_MARKER_DIR}`];
+  // What the sources hold, as listed: a folder's size counts all it holds.
+  let bytes = 0;
+  const add = (source, size) => {
+    sources.push(source);
+    bytes += Number(size) || 0;
+  };
   for (let i = 0; i < profile.include.length; i += 1) {
     const entry = profile.include[i];
     const listing = listings[entry.path];
@@ -236,7 +243,7 @@ function planProfiledArchive(profile, listings, now = Date.now()) {
       continue;
     }
     if (entry.file) {
-      sources.push(`appdata/${entry.path}`);
+      add(`appdata/${entry.path}`, listing.size);
       // eslint-disable-next-line no-continue
       continue;
     }
@@ -260,14 +267,14 @@ function planProfiledArchive(profile, listings, now = Date.now()) {
     }
     if (entry.latest) {
       const newest = newestSettledFile(listing, entry.latest, now);
-      if (newest) sources.push(`appdata/${entry.path}/${newest.name}`);
+      if (newest) add(`appdata/${entry.path}/${newest.name}`, newest.size);
       else if (entry.required) return { fits: false, reason: `${entry.path} holds no settled file matching ${entry.latest.name}` };
     } else if (entry.children) {
       if (!listing.length && entry.required) return { fits: false, reason: `${entry.path} holds nothing to archive` };
       listing.forEach((item) => {
         const itemPath = joinPath(entry.path, item.name);
         if (!(item.isDirectory && entry.excludeWithin)) {
-          sources.push(`appdata/${itemPath}`);
+          add(`appdata/${itemPath}`, item.size);
           return;
         }
         // Only what is kept inside, each on its own, so a restore replaces
@@ -278,18 +285,18 @@ function planProfiledArchive(profile, listings, now = Date.now()) {
           if (entry.splitWithin && child.isDirectory) {
             child.children
               .filter((inner) => inner && !entry.excludeWithin.test(String(inner.name)))
-              .forEach((inner) => sources.push(`appdata/${itemPath}/${child.name}/${inner.name}`));
+              .forEach((inner) => add(`appdata/${itemPath}/${child.name}/${inner.name}`, inner.size));
             return;
           }
-          sources.push(`appdata/${itemPath}/${child.name}`);
+          add(`appdata/${itemPath}/${child.name}`, child.size);
         });
         if (entry.latestWithin) {
           const newest = newestSettledFile(item.latestCandidates || [], entry.latestWithin, now);
-          if (newest) sources.push(`appdata/${withinPath(itemPath, entry.latestWithin.path)}/${newest.name}`);
+          if (newest) add(`appdata/${withinPath(itemPath, entry.latestWithin.path)}/${newest.name}`, newest.size);
         }
       });
     } else {
-      sources.push(`appdata/${entry.path}`);
+      add(`appdata/${entry.path}`, listing.reduce((sum, item) => sum + (Number(item?.size) || 0), 0));
     }
   }
   if (profile.minSavedShare) {
@@ -311,7 +318,7 @@ function planProfiledArchive(profile, listings, now = Date.now()) {
   if (sources.length > MAX_ARCHIVE_SOURCES) {
     return { fits: false, reason: `it would archive ${sources.length} entries, more than compressobject takes (${MAX_ARCHIVE_SOURCES})` };
   }
-  return { fits: true, sources };
+  return { fits: true, sources, bytes };
 }
 
 /**
@@ -354,6 +361,19 @@ function sameListings(before, after, ignore = null) {
   return describe(before) === describe(after);
 }
 
+/**
+ * A profile's `restoreClear`, as the restore side takes it: plain strings.
+ *
+ * @returns {Array<{folder: string, name: string, flags: string}>}
+ */
+function restoreClearRules(profile) {
+  return (profile.restoreClear || []).map((rule) => ({
+    folder: rule.folder,
+    name: rule.name.source,
+    flags: rule.name.flags.replace(/[gy]/g, ''),
+  }));
+}
+
 module.exports = {
   PROFILE_MARKER_DIR,
   MAX_CHILD_FOLDERS,
@@ -364,4 +384,5 @@ module.exports = {
   collectProfileListings,
   planProfiledArchive,
   sameListings,
+  restoreClearRules,
 };

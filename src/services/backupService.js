@@ -2390,32 +2390,43 @@ function parseJsonList(value) {
  * narrows what is archived, so when it cannot be resolved the full backup is
  * the safe answer.
  */
+/**
+ * An app's component names and their images: from the enterprise discovery
+ * cache (an enterprise spec hides its compose), else from the spec.
+ *
+ * @returns {Promise<{names: string[]|null, repotags: Object<string, string>}>}
+ */
+async function lookupAppComponents(appname) {
+  let specComponentNames = null;
+  let specRepotags = null;
+  const rows = await dbCli.execute(
+    'SELECT components, repotags FROM enterprise_app_discovery WHERE appname = ?',
+    [appname],
+  );
+  if (rows.length > 0) {
+    specComponentNames = parseJsonList(rows[0].components);
+    specRepotags = parseJsonList(rows[0].repotags);
+  }
+  if (!specComponentNames || specComponentNames.length === 0) {
+    const spec = await fluxOS.getAppSpecs(appname);
+    if (spec && Array.isArray(spec.compose) && spec.compose.length > 0) {
+      specComponentNames = spec.compose.map((component) => component.name);
+      specRepotags = spec.compose.map((component) => component.repotag);
+    } else if (spec && spec.repotag) {
+      specComponentNames = [spec.name];
+      specRepotags = [spec.repotag];
+    }
+  }
+  const repotags = {};
+  (specComponentNames || []).forEach((name, index) => {
+    if (specRepotags && specRepotags[index]) repotags[name] = specRepotags[index];
+  });
+  return { names: specComponentNames, repotags };
+}
+
 async function resolveBackupProfiles(appname, componentList) {
   try {
-    let specComponentNames = null;
-    let specRepotags = null;
-    const rows = await dbCli.execute(
-      'SELECT components, repotags FROM enterprise_app_discovery WHERE appname = ?',
-      [appname],
-    );
-    if (rows.length > 0) {
-      specComponentNames = parseJsonList(rows[0].components);
-      specRepotags = parseJsonList(rows[0].repotags);
-    }
-    if (!specComponentNames || specComponentNames.length === 0) {
-      const spec = await fluxOS.getAppSpecs(appname);
-      if (spec && Array.isArray(spec.compose) && spec.compose.length > 0) {
-        specComponentNames = spec.compose.map((component) => component.name);
-        specRepotags = spec.compose.map((component) => component.repotag);
-      } else if (spec && spec.repotag) {
-        specComponentNames = [spec.name];
-        specRepotags = [spec.repotag];
-      }
-    }
-    const repotags = {};
-    (specComponentNames || []).forEach((name, index) => {
-      if (specRepotags && specRepotags[index]) repotags[name] = specRepotags[index];
-    });
+    const { names: specComponentNames, repotags } = await lookupAppComponents(appname);
     const profiles = backupProfiles.resolveComponentProfiles(appname, componentList, {
       repotags,
       componentCount: specComponentNames ? specComponentNames.length : null,
@@ -2430,20 +2441,73 @@ async function resolveBackupProfiles(appname, componentList) {
   }
 }
 
+/**
+ * What a restore of a partial ("World & settings") archive must clear besides
+ * the entries it replaces, per component of the app: the game state a profile
+ * leaves out of a folder it splits, which would otherwise stay beside the
+ * restored files and be loaded in their place (V Rising's newer autosaves).
+ * The hub and the cloud UI ask for it before every partial restore.
+ *
+ * Answers { status: 'success', data: { <component>: { profile, clear: [{ folder, name, flags }] } } },
+ * with only the components that have a profile; `folder` is relative to
+ * appdata, `*` standing for one path segment, and name/flags a RegExp.
+ */
+async function getRestoreRules(req, res) {
+  let { appname } = req.body || {};
+  appname = appname || (req.query || {}).appname;
+  try {
+    const owner = await idService.verifyUserSession(req.headers);
+    if (owner === false) {
+      throw new Error('Unauthorized access. Session expired.');
+    }
+    if (!appname) {
+      throw new Error('Invalid appname.');
+    }
+    if (!await fluxOS.verifyAppOwner(owner, appname)) {
+      throw new Error('Unauthorized. Access denied.');
+    }
+    // Not resolveBackupProfiles, which reads any failure as "no profile": an
+    // answer with no rules would let a restore leave the newer saves in place.
+    const { names, repotags } = await lookupAppComponents(appname);
+    if (!names || names.length === 0) {
+      throw new Error(`Could not read the components of ${appname}.`);
+    }
+    const profiles = backupProfiles.resolveComponentProfiles(appname, names, {
+      repotags,
+      componentCount: names.length,
+    }) || {};
+    const data = {};
+    Object.entries(profiles).forEach(([component, profile]) => {
+      data[component] = { profile: profile.id, clear: backupProfiles.restoreClearRules(profile) };
+    });
+    res.set('Cache-Control', 'no-store');
+    res.json({ status: 'success', data });
+  } catch (error) {
+    log.error(`getrestorerules failed: app=${appname || 'missing'}, message=${error.message}`);
+    const errMessage = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    if (!res.headersSent) {
+      res.json(errMessage);
+    }
+  }
+}
+
 /** Failures of the secondary node itself, which the primary may not share. */
 const PRIMARY_FALLBACK_STAGES = ['node_selection', 'node_auth', 'create_backup'];
 
 /**
- * Whether the last attempt goes to the primary: only for an app with a backup
- * profile, whose partial archive is taken without stopping the server, and
- * only after a failure of the secondary node. A file that could not be queued
- * would fail on the primary the same way.
+ * Whether the last attempt goes to the primary: only for an app whose every
+ * component has a backup profile marked `primarySafe`, whose partial archive
+ * is taken without stopping the server and cannot be caught half-way through
+ * a save there, and only after a failure of the secondary node. A file that
+ * the node made but that could not be queued would fail on the primary the
+ * same way; one the node never made is the node's failure.
  */
 function canRetryOnPrimary(componentProfiles, lastFailure) {
   return Boolean(componentProfiles)
+    && Object.values(componentProfiles).every((profile) => profile && profile.primarySafe === true)
     && Boolean(lastFailure)
     && PRIMARY_FALLBACK_STAGES.includes(lastFailure.stage)
-    && (lastFailure.taskFailures || []).length === 0;
+    && (lastFailure.taskFailures || []).every((failure) => failure.nodeSide === true);
 }
 
 async function processAutomaticBackupInternal() {
@@ -2651,6 +2715,7 @@ async function processAutomaticBackupInternal() {
               component: componentData.component,
               message: componentData.error || 'Backup file was not found on the Flux node after creation',
               fails: 0,
+              nodeSide: true,
             });
           }
         }
@@ -2997,6 +3062,7 @@ module.exports = {
   getDatabase: () => dbCli,
   registerBackupTask,
   getBackupList,
+  getRestoreRules,
   getTaskStatus,
   removeCheckpoint,
   syncSyncthingApps,

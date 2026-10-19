@@ -13,10 +13,17 @@ const markerAbsent = {
     data: { status: 'error', data: { code: 'ENOENT', message: "ENOENT: no such file or directory, realpath '/x'" } },
   }),
 };
+// Clearing a partial archive's own slot before a fallback: removeobject
+// answers success whether or not the file was there.
+const profileSlotCleared = {
+  match: (r) => r.method === 'get' && /\/apps\/removeobject\/[^/]+\/[^/]+\/backup%2Flocal%2Fflux-profile_[^/]+\.tar\.gz$/.test(r.url),
+  reply: () => ({ status: 200, headers: {}, data: { status: 'success', data: {} } }),
+};
 async function axiosMock(request) {
   calls.push(request);
   const route = routes.find((candidate) => candidate.match(request))
-    || (markerAbsent.match(request) ? markerAbsent : null);
+    || (markerAbsent.match(request) ? markerAbsent : null)
+    || (profileSlotCleared.match(request) ? profileSlotCleared : null);
   if (!route) throw new Error(`Unexpected request in test: ${request.method} ${request.url}`);
   return route.reply(request);
 }
@@ -47,8 +54,12 @@ require.cache[fakeSecrets] = {
 
 const log = require('../src/lib/log');
 const backupProfiles = require('../src/services/utils/backupProfiles');
+const allProfiles = require('../config/backupProfiles');
+const idService = require('../src/services/idService');
 const fluxOS = require('../src/services/fluxOsService');
-const { testHooks: backupHooks } = require('../src/services/backupService');
+const backupService = require('../src/services/backupService');
+
+const { testHooks: backupHooks } = backupService;
 
 const NODE = 'http://10.0.0.2:16127';
 const APP = 'dragonwilds1790000000000';
@@ -141,6 +152,7 @@ async function main() {
     assert.deepStrictEqual(plan, {
       fits: true,
       sources: ['appdata/.flux-backup', 'appdata/RSDragonwilds/Saved/SaveGames', 'appdata/RSDragonwilds/Saved/Config'],
+      bytes: 10,
     });
     assert.strictEqual(backupProfiles.planProfiledArchive(profile, { 'RSDragonwilds/Saved/SaveGames': null }).fits, false);
     assert.strictEqual(backupProfiles.planProfiledArchive(profile, {
@@ -160,7 +172,7 @@ async function main() {
       appname: APP,
       component: COMPONENT,
       source: ['appdata/.flux-backup', 'appdata/RSDragonwilds/Saved/SaveGames', 'appdata/RSDragonwilds/Saved/Config'],
-      destination: `backup/local/backup_${COMPONENT}.tar.gz`,
+      destination: `backup/local/flux-profile_${COMPONENT}.tar.gz`,
       overwrite: true,
     });
     const created = calls.filter((r) => r.url.includes('/apps/createfolder/')).map((r) => decodeURIComponent(r.url.split('/').pop()));
@@ -210,7 +222,13 @@ async function main() {
       },
       {
         match: (r) => r.url.startsWith(`${NODE}/backup/getlocalbackuplist/`),
-        reply: () => success([{ name: `backup_${COMPONENT}.tar.gz`, create: 1760000000000, size: 74125 }]),
+        // The partial archive under its own name, and the owner's own local
+        // backup where the full one goes, newer.
+        reply: () => success([
+          { name: `flux-profile_${COMPONENT}.tar.gz`, create: 1760000000000, size: 74125 },
+          { name: `backup_${COMPONENT}.tar.gz`, create: 1760000009999, size: 9990000 },
+          { name: `my_backup_${COMPONENT}.tar.gz.old`, create: 1760000099999, size: 1 },
+        ]),
       },
     ];
     // Clearing the archive slot before a fallback: removeobject answers success
@@ -231,7 +249,7 @@ async function main() {
     let result = await fluxOS.createBackupTaskOnNode(NODE, 'auth', APP, [COMPONENT], { [COMPONENT]: profile });
     assert.strictEqual(result.status, 'completed');
     assert.strictEqual(result.components[0].profile, 'dragonwilds-world');
-    assert.strictEqual(result.components[0].backups.size, 74125);
+    assert.strictEqual(result.components[0].backups.size, 74125, 'the partial archive, by its own name');
     assert(!calls.some((r) => r.url.endsWith('/apps/appendbackuptask')), 'a profiled backup never stops the app for a full archive');
     assert(!calls.some((r) => r.url.includes('/apps/removeobject/')), 'a profiled backup keeps its archive');
 
@@ -245,6 +263,7 @@ async function main() {
     result = await fluxOS.createBackupTaskOnNode(NODE, 'auth', APP, [COMPONENT], { [COMPONENT]: profile });
     assert.strictEqual(result.status, 'completed');
     assert.strictEqual(result.components[0].profile, null);
+    assert.strictEqual(result.components[0].backups.name, `backup_${COMPONENT}.tar.gz`, 'the full archive, by its exact name');
     const full = calls.find((r) => r.url.endsWith('/apps/appendbackuptask'));
     assert.deepStrictEqual(full.data, { appname: APP, backup: [{ component: COMPONENT, backup: true }] });
     assert(result.diagnostics.some((d) => d.outcome === 'skipped' && /dragonwilds-world does not fit/.test(d.detail)));
@@ -341,9 +360,13 @@ async function main() {
     assert.strictEqual(typeof seen[0][5], 'function', 'a standby can still reach the primary for its marker');
 
     // --- the last attempt, on the primary ---------------------------------------
+    const freeSpace = (available) => ({
+      match: (r) => r.url === `${NODE}/backup/getvolumedataofcomponent/${APP}/${COMPONENT}/B/0/available`,
+      reply: () => success({ available }),
+    });
     // The profiled archive is taken while the server runs.
     calls.length = 0;
-    routes = [...worldFolders(), anyCreateFolder, ...compressRoute(['Succeeded']), ...listingRoutes];
+    routes = [...worldFolders(), anyCreateFolder, ...compressRoute(['Succeeded']), freeSpace(20 * 1024 ** 3), ...listingRoutes];
     result = await fluxOS.createBackupTaskOnNode(NODE, 'auth', APP, [COMPONENT], { [COMPONENT]: profile }, null, { onPrimary: true });
     assert.strictEqual(result.status, 'completed');
     assert.strictEqual(result.components[0].profile, 'dragonwilds-world');
@@ -353,7 +376,9 @@ async function main() {
     // stop the server. The partial archive slot is still cleared.
     const failingOnPrimary = [
       [...worldFolders([]), removeRoute(), fullBackupRoute, ...listingRoutes],
-      [...worldFolders(), anyCreateFolder, ...compressRoute(['Failed']), removeRoute(), fullBackupRoute, ...listingRoutes],
+      [...worldFolders(), anyCreateFolder, ...compressRoute(['Failed']), freeSpace(20 * 1024 ** 3), removeRoute(), fullBackupRoute, ...listingRoutes],
+      // A volume with too little room beside the running game: not written.
+      [...worldFolders(), anyCreateFolder, ...compressRoute(['Succeeded']), freeSpace(1024 ** 3 + 1000), removeRoute(), fullBackupRoute, ...listingRoutes],
     ];
     for (let i = 0; i < failingOnPrimary.length; i += 1) {
       calls.length = 0;
@@ -363,9 +388,13 @@ async function main() {
       assert.strictEqual(result.status, 'failed');
       assert.match(result.error, /could not be used on the primary \(dragonwilds-world .*\); the full backup would stop the server/);
       assert(!calls.some((r) => r.url.endsWith('/apps/appendbackuptask')), 'never the full backup on the primary');
-      assert(calls.some((r) => r.url === removeEndpoint));
+      assert(calls.some((r) => profileSlotCleared.match(r)), 'its own partial archive is cleared');
+      assert(!calls.some((r) => r.url === removeEndpoint), "the owner's local backup is never touched on the primary");
       assert(!calls.some((r) => r.url.startsWith(`${NODE}/backup/getlocalbackuplist/`)));
     }
+
+    assert(!calls.some((r) => r.url.endsWith('/apps/compressobject')), 'no room: nothing is written');
+    assert.match(result.error, /no room on the primary/);
 
     // With no profile there is nothing to take on the primary.
     calls.length = 0;
@@ -402,6 +431,18 @@ async function main() {
       false,
       'a file that could not be queued fails on the primary too',
     );
+    assert.strictEqual(
+      canRetryOnPrimary(primaryProfiles, { stage: 'create_backup', taskFailures: [{ component: COMPONENT, message: 'Backup file was not found on the Flux node after creation', nodeSide: true }] }),
+      true,
+      'a file the node never made is the node failing',
+    );
+    // Games whose saves a listing cannot see change on a running server.
+    ['zomboid-world', '7dtd-world', 'hytale-world', 'windrose-world', 'minecraft-java-world', 'minecraft-bedrock-world'].forEach((id) => {
+      const unsafe = allProfiles.find((candidate) => candidate.id === id);
+      assert(unsafe, id);
+      assert.strictEqual(canRetryOnPrimary({ c: unsafe }, { stage: 'create_backup', taskFailures: [] }), false, `${id} is not taken on the primary`);
+      assert.strictEqual(canRetryOnPrimary({ [COMPONENT]: profile, c: unsafe }, { stage: 'create_backup', taskFailures: [] }), false, `${id} beside a safe one`);
+    });
 
     // --- the marker on a standby that refuses writes (FluxOS 8.21+) -----------------
     const PRIMARY = 'http://10.0.0.1:16137';
@@ -661,7 +702,7 @@ async function main() {
         'appdata/bannedlist.txt',
         'appdata/permittedlist.txt',
       ],
-      destination: `backup/local/backup_${VCOMP}.tar.gz`,
+      destination: `backup/local/flux-profile_${VCOMP}.tar.gz`,
       overwrite: true,
     });
     const listedFolders = calls.filter((r) => r.url.includes('/apps/getfolderinfo/')).map((r) => decodeURIComponent(r.url.split('/').pop()));
@@ -753,7 +794,7 @@ async function main() {
       'bannedlist.txt': null,
       'permittedlist.txt': null,
     });
-    assert.deepStrictEqual(plan2, { fits: true, sources: ['appdata/.flux-backup', 'appdata/worlds_local/localhost'] });
+    assert.deepStrictEqual(plan2, { fits: true, sources: ['appdata/.flux-backup', 'appdata/worlds_local/localhost'], bytes: 1 });
 
     // --- Palworld -------------------------------------------------------------------
     const PAPP = 'palworld1790000000000';
@@ -1531,6 +1572,7 @@ async function main() {
     assert.deepStrictEqual(backupProfiles.planProfiledArchive(mcProfile('minecraft'), mcListing), {
       fits: true,
       sources: ['appdata/.flux-backup', 'appdata/world', 'appdata/mods', 'appdata/config', 'appdata/server.properties', 'appdata/ops.json'],
+      bytes: 1201001700,
     });
     assert(!Object.keys(mcListing['']).includes('leftOut'), 'what is left out is not compared by sameListings');
     assert(backupProfiles.sameListings(mcListing, { '': [...mcListing['']] }), 'nor does it count as a difference');
@@ -1581,6 +1623,54 @@ async function main() {
       profile: 'dragonwilds-world',
     });
     assert.strictEqual('profile' in backupHooks.checkpointComponent({ component: COMPONENT, hash: 'Qm2', filesize: 1 }), false);
+
+    // --- what a partial restore clears ------------------------------------------
+    const vrisingProfile = allProfiles.find((candidate) => candidate.id === 'vrising-world');
+    const [vrisingRule] = backupProfiles.restoreClearRules(vrisingProfile);
+    assert.deepStrictEqual({ folder: vrisingRule.folder, flags: vrisingRule.flags }, { folder: 'Saves/v4/*', flags: 'i' });
+    assert(new RegExp(vrisingRule.name, vrisingRule.flags).test('AutoSave_5400.save.gz'));
+    assert(!new RegExp(vrisingRule.name, vrisingRule.flags).test('SessionId.json'));
+    assert.deepStrictEqual(backupProfiles.restoreClearRules(profile), []);
+
+    const realVerifySession = idService.verifyUserSession;
+    const realVerifyOwner = fluxOS.verifyAppOwner;
+    idService.verifyUserSession = async (headers) => (headers.zelidauth ? 'owner' : false);
+    fluxOS.verifyAppOwner = async (owner, appname) => owner === 'owner' && appname !== 'notyours1790000000000';
+    backupHooks.setDatabaseForTests({
+      async execute(sql, params) {
+        if (sql.includes('FROM enterprise_app_discovery')) {
+          if (params[0] === 'vrising1790000000000') return [{ components: '["vrisingvrising"]', repotags: '["runonflux/vrising-server-flux:latest"]' }];
+          if (params[0] === APP) return [{ components: JSON.stringify([COMPONENT]), repotags: JSON.stringify([IMAGE]) }];
+          return [];
+        }
+        throw new Error(`Unexpected SQL in test: ${sql}`);
+      },
+    });
+    const askRules = async (appname, headers = { zelidauth: 'auth' }) => {
+      let body = null;
+      const res = { headersSent: false, set() {}, json(data) { body = data; } };
+      await backupService.getRestoreRules({ query: { appname }, body: {}, headers }, res);
+      return body;
+    };
+    try {
+      let rules = await askRules('vrising1790000000000');
+      assert.strictEqual(rules.status, 'success');
+      assert.strictEqual(rules.data.vrisingvrising.profile, 'vrising-world');
+      assert.strictEqual(rules.data.vrisingvrising.clear[0].folder, 'Saves/v4/*');
+      rules = await askRules(APP);
+      assert.deepStrictEqual(rules.data, { [COMPONENT]: { profile: 'dragonwilds-world', clear: [] } });
+      assert.strictEqual((await askRules(APP, {})).status, 'error', 'no session, no rules');
+      assert.strictEqual((await askRules('notyours1790000000000')).status, 'error', 'only the owner');
+      // An app whose components cannot be read is an error, never "nothing to clear".
+      routes = [{
+        match: (r) => r.url.startsWith('https://api.runonflux.io/apps/appspecifications/'),
+        reply: () => ({ status: 200, headers: {}, data: { status: 'error', data: { message: 'down' } } }),
+      }];
+      assert.strictEqual((await askRules('vrising1790000000001')).status, 'error');
+    } finally {
+      idService.verifyUserSession = realVerifySession;
+      fluxOS.verifyAppOwner = realVerifyOwner;
+    }
   } finally {
     global.setTimeout = realSetTimeout;
   }

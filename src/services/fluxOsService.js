@@ -1214,6 +1214,40 @@ const PROFILE_UNSETTLED_WAIT_MS = 90 * 1000;
 const PROFILE_ARCHIVE_ATTEMPTS = 2;
 
 /**
+ * Where appendbackuptask writes a component's full archive, which is also
+ * where the owner's own "Create Backup" lands.
+ */
+const fullArchiveName = (component) => `backup_${component.toLowerCase()}.tar.gz`;
+/**
+ * Where a profile's partial archive goes: its own name, so it never replaces
+ * the owner's local backup and is never picked up as a full archive.
+ */
+const profiledArchiveName = (component) => `flux-profile_${component.toLowerCase()}.tar.gz`;
+
+/**
+ * On the primary the game keeps writing to the volume the archive is staged
+ * on. It is written only when what it can take leaves this much free, and at
+ * most this share of what is free.
+ */
+const PRIMARY_MIN_FREE_AFTER_BYTES = 1024 ** 3;
+const PRIMARY_MAX_FREE_SHARE = 0.25;
+
+/** The bytes free on a component's volume, as the node reports them. */
+async function getVolumeAvailableBytes(node, zelidAuth, appname, component) {
+  const endpoint = `${node}/backup/getvolumedataofcomponent/${appname}/${component}/B/0/available`;
+  const response = await axios({
+    method: 'get', url: endpoint, headers: { zelidauth: zelidAuth }, timeout: 10000, httpsAgent,
+  });
+  const available = Number(response.data?.data?.available);
+  if (response.data?.status !== 'success' || !Number.isFinite(available)) {
+    const error = new Error(`could not read the free space of the volume: ${getSafeApiMessage(response.data) || 'no answer'}`);
+    error.endpoint = endpoint;
+    throw error;
+  }
+  return available;
+}
+
+/**
  * Write a profile's partial archive where appendbackuptask writes the full one,
  * backup/local/backup_<component>.tar.gz, so everything after this - the
  * readiness check, the download and the upload - is the same for both.
@@ -1226,15 +1260,20 @@ const PROFILE_ARCHIVE_ATTEMPTS = 2;
  * is listed again after PROFILE_UNSETTLED_WAIT_MS before giving up: the full
  * backup would only archive the same half-synced files, and fifty times more.
  *
- * @returns {Promise<{fits: boolean, archiveFailed?: boolean, changing?: boolean, reason?: string}>}
+ * On the primary (options.onPrimary) the server is running, so the archive is
+ * only written when the volume has room for it beside the game (noRoom
+ * otherwise).
+ *
+ * @returns {Promise<{fits: boolean, archiveFailed?: boolean, changing?: boolean, noRoom?: boolean, reason?: string}>}
  *   fits:false when the app does not have the profile's layout, when the node
- *   could not write the partial archive (archiveFailed), or when the volume
- *   changed under every attempt (changing); the caller then takes the full
- *   backup in every case
+ *   could not write the partial archive (archiveFailed), when the volume
+ *   changed under every attempt (changing), or when the primary has no room
+ *   for it (noRoom); the caller then takes the full backup, except on the
+ *   primary
  * @throws when the profile's paths cannot be listed, so a transient failure is
  *   retried on another node rather than read as a missing layout
  */
-async function createProfiledArchiveOnNode(node, zelidAuth, appname, component, profile, diagnostics, reachPrimary = null) {
+async function createProfiledArchiveOnNode(node, zelidAuth, appname, component, profile, diagnostics, reachPrimary = null, options = {}) {
   const listAll = () => backupProfiles.collectProfileListings(
     profile,
     (folder) => listVolumeFolder(node, zelidAuth, appname, component, folder ? `appdata/${folder}` : 'appdata'),
@@ -1253,6 +1292,18 @@ async function createProfiledArchiveOnNode(node, zelidAuth, appname, component, 
   };
   let { listed: listings, planned: plan } = await settle(await listAll());
   if (!plan.fits) return plan;
+
+  if (options.onPrimary) {
+    let available;
+    try {
+      available = await getVolumeAvailableBytes(node, zelidAuth, appname, component);
+    } catch (error) {
+      return { fits: false, archiveFailed: true, reason: error?.message || String(error) };
+    }
+    if (plan.bytes > available * PRIMARY_MAX_FREE_SHARE || available - plan.bytes < PRIMARY_MIN_FREE_AFTER_BYTES) {
+      return { fits: false, noRoom: true, reason: `${plan.bytes} bytes to archive with ${available} free on the running server's volume` };
+    }
+  }
 
   // From here on a failure is the node not writing the partial archive: a
   // FluxOS older than 8.18 without compressobject, a refused or failed job.
@@ -1273,7 +1324,7 @@ async function createProfiledArchiveOnNode(node, zelidAuth, appname, component, 
         appname,
         component,
         source: plan.sources,
-        destination: `backup/local/backup_${component.toLowerCase()}.tar.gz`,
+        destination: `backup/local/${profiledArchiveName(component)}`,
         overwrite: true,
       });
     } catch (error) {
@@ -1333,13 +1384,14 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList, c
       for (let i = 0; i < componentList.length && profiled; i += 1) {
         const component = componentList[i];
         const profile = componentProfiles[component];
-        const outcome = await createProfiledArchiveOnNode(node, zelidAuth, appname, component, profile, diagnostics, reachPrimary);
+        const outcome = await createProfiledArchiveOnNode(node, zelidAuth, appname, component, profile, diagnostics, reachPrimary, { onPrimary });
         if (outcome.fits) {
           usedProfiles[component] = profile.id;
         } else {
           let why = 'does not fit';
           if (outcome.archiveFailed) why = 'archive failed';
           else if (outcome.changing) why = 'kept changing';
+          else if (outcome.noRoom) why = 'no room on the primary';
           else if (outcome.unsettled) why = 'still syncing';
           log.info(`Backup profile ${profile.id} ${why} for ${appname}/${component} (${outcome.reason}); taking the full backup instead`);
           diagnostics.push({
@@ -1353,17 +1405,23 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList, c
       }
       if (!profiled) {
         Object.keys(usedProfiles).forEach((component) => { delete usedProfiles[component]; });
-        // A partial archive may already sit where the full one goes: written by
-        // this attempt before the volume changed under it, or by an earlier run
-        // on this node. appendbackuptask only replaces it once it has stopped
-        // the app, and it can refuse before that in its streamed answer, which
-        // reads as success here; what follows would then upload the partial
-        // archive as a full one, and a full one is restored over a wiped
-        // appdata. Cleared first, so a refusal leaves nothing to pick up. A
-        // node that cannot clear it fails this attempt, which moves on to
-        // another node.
+        // The partial archives this attempt wrote for the components that fit
+        // are not uploaded: the backup is taken whole, or not at all.
         for (let i = 0; i < componentList.length; i += 1) {
-          await removeVolumeObject(node, zelidAuth, appname, componentList[i], `backup/local/backup_${componentList[i].toLowerCase()}.tar.gz`);
+          await removeVolumeObject(node, zelidAuth, appname, componentList[i], `backup/local/${profiledArchiveName(componentList[i])}`);
+        }
+        // A partial archive written under the full one's name by a middleware
+        // older than profiledArchiveName may still sit there (the node reaps
+        // backup/local after 24 hours). appendbackuptask only replaces it once
+        // it has stopped the app, and it can refuse before that in its
+        // streamed answer, which reads as success here; what follows would then
+        // upload the partial archive as a full one, and a full one is restored
+        // over a wiped appdata. Cleared first, so a refusal leaves nothing to
+        // pick up. Never on the primary, which takes no full backup and where
+        // that file is the owner's own. A node that cannot clear it fails this
+        // attempt, which moves on to another node.
+        for (let i = 0; i < componentList.length && !onPrimary; i += 1) {
+          await removeVolumeObject(node, zelidAuth, appname, componentList[i], `backup/local/${fullArchiveName(componentList[i])}`);
         }
         if (onPrimary) {
           const skipped = diagnostics.filter((diagnostic) => diagnostic.outcome === 'skipped').pop();
@@ -1540,11 +1598,12 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList, c
               log.warn(`No files found in backup directory for component ${component}, attempt ${retryCount + 1}`);
             }
 
-            // Filter backup files for this specific component and get the latest one
-            const expectedPattern = `backup_${component}.tar.gz`;
-            const allBackups = responseData.filter((backup) => backup.name.toLowerCase().includes(expectedPattern.toLowerCase()));
+            // This component's archive, by its exact name: the partial one under
+            // its own name, the full one where appendbackuptask writes it.
+            const expectedName = usedProfiles[component] ? profiledArchiveName(component) : fullArchiveName(component);
+            const allBackups = responseData.filter((backup) => String(backup.name).toLowerCase() === expectedName);
 
-            log.info(`Filtering for pattern "${expectedPattern}": found ${allBackups.length} matching backup(s)`);
+            log.info(`Looking for "${expectedName}": found ${allBackups.length} matching backup(s)`);
 
             if (allBackups.length > 0) {
               // Sort by create timestamp (descending) and get the latest
@@ -1560,7 +1619,7 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList, c
 
               log.info(`Found ${allBackups.length} backup(s) for component ${component}, selected latest: ${latestBackup.name} (created: ${latestBackup.create})`);
             } else {
-              log.warn(`No backups matching pattern "${expectedPattern}" for component ${component}, attempt ${retryCount + 1}`);
+              log.warn(`No backup named "${expectedName}" for component ${component}, attempt ${retryCount + 1}`);
             }
           } else {
             lastComponentFailure = {
