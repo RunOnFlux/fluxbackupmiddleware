@@ -213,6 +213,70 @@ async function main() {
     await fluxOS.testHooks.createProfiledArchiveOnNode(NODE, 'auth', APP, COMPONENT, profile, []);
     assert(!calls.some((r) => r.url.includes('evil.example')));
 
+    // --- the node answering while the volume changes ----------------------------
+    const sequenceOf = (...replies) => { let served = 0; return () => { const reply = replies[Math.min(served, replies.length - 1)]; served += 1; return reply(); }; };
+    const entryGone = () => ({
+      status: 200,
+      headers: {},
+      data: { status: 'error', data: { code: 'ENOENT', message: "ENOENT: no such file or directory, lstat '/x/SaveGames/.syncthing.W.sav.tmp'" } },
+    });
+    // An entry that went between readdir and lstat: listed again, never "missing".
+    routes = [folderRoute('appdata/RSDragonwilds/Saved/SaveGames', sequenceOf(entryGone, () => success([{ name: 'W.sav', isFile: true, size: 10 }])))];
+    assert.deepStrictEqual(
+      await fluxOS.testHooks.listVolumeFolder(NODE, 'auth', APP, COMPONENT, 'appdata/RSDragonwilds/Saved/SaveGames'),
+      [{ name: 'W.sav', isFile: true, size: 10 }],
+    );
+    routes = [folderRoute('appdata/RSDragonwilds/Saved/SaveGames', entryGone)];
+    await assert.rejects(
+      fluxOS.testHooks.listVolumeFolder(NODE, 'auth', APP, COMPONENT, 'appdata/RSDragonwilds/Saved/SaveGames'),
+      /Could not list/,
+      'a folder that keeps failing on an entry is a failure, not a missing folder',
+    );
+    routes = [folderRoute('appdata/RSDragonwilds/Saved/SaveGames', missing)];
+    assert.strictEqual(await fluxOS.testHooks.listVolumeFolder(NODE, 'auth', APP, COMPONENT, 'appdata/RSDragonwilds/Saved/SaveGames'), null);
+
+    // createfolder waits out a busy volume like the other operations.
+    calls.length = 0;
+    const busyThenMade = sequenceOf(
+      () => ({ status: 503, headers: { 'retry-after': '1' }, data: { status: 'error', data: { message: 'busy' } } }),
+      () => success({}),
+    );
+    routes = [{ match: (r) => r.url.startsWith(`${NODE}/apps/createfolder/`), reply: busyThenMade }];
+    await fluxOS.testHooks.ensureVolumeFolder(NODE, 'auth', APP, COMPONENT, 'backup');
+    assert.strictEqual(calls.length, 2);
+
+    // A 202 with no job to follow is not a success.
+    routes = [...worldFolders(), anyCreateFolder, {
+      match: (r) => r.url === `${NODE}/apps/compressobject`,
+      reply: () => ({ status: 202, headers: {}, data: { status: 'success', data: {} } }),
+    }];
+    outcome = await fluxOS.testHooks.createProfiledArchiveOnNode(NODE, 'auth', APP, COMPONENT, profile, []);
+    assert.strictEqual(outcome.archiveFailed, true);
+    assert.match(outcome.reason, /accepted without a job/);
+
+    // A source gone before tar read it: listed and written again, not the full backup.
+    calls.length = 0;
+    let vanishedRuns = 0;
+    routes = [...worldFolders(), anyCreateFolder, {
+      match: (r) => r.method === 'post' && r.url === `${NODE}/apps/compressobject`,
+      reply: () => {
+        vanishedRuns += 1;
+        return vanishedRuns === 1
+          ? { status: 200, headers: {}, data: { status: 'error', data: { message: 'tar: RSDragonwilds/Saved/SaveGames/W.sav: Cannot stat: No such file or directory' } } }
+          : { status: 200, headers: {}, data: { status: 'success', data: {} } };
+      },
+    }];
+    outcome = await fluxOS.testHooks.createProfiledArchiveOnNode(NODE, 'auth', APP, COMPONENT, profile, []);
+    assert.deepStrictEqual(outcome, { fits: true });
+    assert.strictEqual(vanishedRuns, 2);
+
+    // The marker is never listed twice, even by a profile that forgets it.
+    const forgetful = { id: 't', include: [{ path: '', children: true, excludeChildren: /^logs$/ }] };
+    const forgetfulListing = await backupProfiles.collectProfileListings(forgetful, async () => [
+      { name: '.flux-backup', isDirectory: true, size: 0 }, { name: 'world.sav', isFile: true, size: 5 }, { name: 'logs', isDirectory: true, size: 9 },
+    ]);
+    assert.deepStrictEqual(backupProfiles.planProfiledArchive(forgetful, forgetfulListing).sources, ['appdata/.flux-backup', 'appdata/world.sav']);
+
     // --- the whole node step ----------------------------------------------------
     const mount = `/var/lib/fluxos/flux-apps/flux${COMPONENT}_${APP}`;
     const listingRoutes = [
@@ -436,6 +500,24 @@ async function main() {
       true,
       'a file the node never made is the node failing',
     );
+    assert.strictEqual(
+      canRetryOnPrimary(primaryProfiles, { stage: 'create_backup', taskFailures: [], diagnostics: [{ outcome: 'skipped', structural: true }] }),
+      false,
+      'a profile the files do not fit is refused on the primary too',
+    );
+    assert.strictEqual(
+      canRetryOnPrimary(primaryProfiles, { stage: 'create_backup', taskFailures: [], diagnostics: [{ outcome: 'skipped', structural: false }] }),
+      true,
+      'a node that could not write it, or a sync still arriving, is the node',
+    );
+    // The same fault on another node is the same failure for Discord.
+    const onNode = (node) => backupHooks.buildAutomaticFailureFingerprint({
+      stage: 'create_backup',
+      reason: `Failed to create backup tasks on http://${node}`,
+      failureAttempts: [{ stage: 'create_backup', reason: `could not log in on the primary https://${node.replace(/[.:]/g, '-')}.node.api.runonflux.io: refused` }],
+      taskFailures: [{ component: COMPONENT, message: `No matching backup file; node=http://${node}`, node }],
+    });
+    assert.strictEqual(onNode('10.0.0.2:16137'), onNode('203.0.113.9:16127'));
     // Games whose saves a listing cannot see change on a running server.
     ['zomboid-world', '7dtd-world', 'hytale-world', 'windrose-world', 'minecraft-java-world', 'minecraft-bedrock-world'].forEach((id) => {
       const unsafe = allProfiles.find((candidate) => candidate.id === id);

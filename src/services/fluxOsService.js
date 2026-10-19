@@ -316,12 +316,34 @@ async function getPrimaryNodeAddress(appname, diagnostics) {
   const primaryIp = await getPrimaryNodeIp(appname, diagnostics);
   if (!primaryIp) return null;
   const locationUrl = `https://api.runonflux.io/apps/location/${appname}`;
-  const response = await axios.get(locationUrl, { httpsAgent, timeout: 30000 });
-  const locations = response.data?.status === 'success' && Array.isArray(response.data.data)
-    ? response.data.data
-    : [];
+  let locations;
+  try {
+    const response = await axios.get(locationUrl, { httpsAgent, timeout: 30000 });
+    locations = response.data?.status === 'success' && Array.isArray(response.data.data)
+      ? response.data.data
+      : [];
+  } catch (error) {
+    diagnostics.push({
+      check: 'Flux location API (primary port)',
+      outcome: 'failed',
+      endpoint: locationUrl,
+      node: primaryIp,
+      ...getRequestFailure(error),
+    });
+    return null;
+  }
   const matching = locations.filter((location) => location?.ip && extractNodeIp(location.ip) === primaryIp);
-  return matching.length === 1 ? formatLocationNode(matching[0].ip) : null;
+  if (matching.length !== 1) {
+    diagnostics.push({
+      check: 'Flux location API (primary port)',
+      outcome: 'failed',
+      endpoint: locationUrl,
+      node: primaryIp,
+      detail: `${matching.length} location record(s) for the primary IP, so its API port is unknown`,
+    });
+    return null;
+  }
+  return formatLocationNode(matching[0].ip);
 }
 
 async function getSecondaryNodeFromLocationApi(
@@ -949,12 +971,26 @@ async function getAppsWithSyncthing() {
 const FILE_OPERATION_TERMINAL_STATES = ['Succeeded', 'Failed', 'Canceled', 'Evicted'];
 const FILE_OPERATION_TIMEOUT_MS = 10 * 60 * 1000;
 const FILE_OPERATION_MAX_BUSY_RETRIES = 12;
+/** Listings of a folder whose entries keep going while it is read. */
+const LISTING_ATTEMPTS = 3;
+const LISTING_RETRY_MS = 2000;
 
 function isMissingPathResponse(data) {
   const code = data?.data?.code || data?.code;
   if (code === 'ENOENT') return true;
   const message = getSafeApiMessage(data) || '';
   return /ENOENT|no such file|does not exist/i.test(message);
+}
+
+/**
+ * A listing that failed on one of the folder's entries rather than the folder:
+ * getfolderinfo reads the folder, then lstat()s each entry, and an entry that
+ * went in between (a save renamed into place, a Syncthing temporary file
+ * delivered) fails the whole listing with that entry's ENOENT. The folder is
+ * there; listing it again answers.
+ */
+function isVanishedEntryResponse(data) {
+  return /\blstat\b/i.test(getSafeApiMessage(data) || '');
 }
 
 function retryAfterMs(headers, fallbackSeconds = 5) {
@@ -1023,16 +1059,22 @@ async function requestFullBackupOnNode(node, zelidAuth, appname, componentList, 
  */
 async function listVolumeFolder(node, zelidAuth, appname, component, folder) {
   const endpoint = `${node}/apps/getfolderinfo/${appname}/${component}/${encodeURIComponent(folder)}`;
-  const response = await axios({
-    method: 'get',
-    url: endpoint,
-    headers: { zelidauth: zelidAuth },
-    timeout: 30000,
-    httpsAgent,
-  });
-  const { data } = response;
+  let data;
+  for (let attempt = 1; ; attempt += 1) {
+    const response = await axios({
+      method: 'get',
+      url: endpoint,
+      headers: { zelidauth: zelidAuth },
+      timeout: 30000,
+      httpsAgent,
+    });
+    ({ data } = response);
+    if (data?.status !== 'error' || !isVanishedEntryResponse(data) || attempt >= LISTING_ATTEMPTS) break;
+    await new Promise((resolve) => { setTimeout(resolve, LISTING_RETRY_MS); });
+  }
   if (data?.status === 'success' && Array.isArray(data.data)) return data.data;
-  if (data?.status === 'error' && isMissingPathResponse(data)) return null;
+  // Never read as a missing folder: the folder was there, an entry was not.
+  if (data?.status === 'error' && isMissingPathResponse(data) && !isVanishedEntryResponse(data)) return null;
   const error = new Error(`Could not list ${folder}: ${getSafeApiMessage(data) || 'unexpected response'}`);
   error.endpoint = endpoint;
   throw error;
@@ -1041,14 +1083,22 @@ async function listVolumeFolder(node, zelidAuth, appname, component, folder) {
 /** Create a directory on the volume; one that already exists is fine. */
 async function ensureVolumeFolder(node, zelidAuth, appname, component, folder) {
   const endpoint = `${node}/apps/createfolder/${appname}/${component}/${encodeURIComponent(folder)}`;
-  const response = await axios({
-    method: 'get',
-    url: endpoint,
-    headers: { zelidauth: zelidAuth },
-    timeout: 60000,
-    httpsAgent,
-    validateStatus: () => true,
-  });
+  let response;
+  // 503 with Retry-After while another operation holds the volume, or while
+  // the node is still fetching the image its file operations run in.
+  for (let attempt = 0; ; attempt += 1) {
+    response = await axios({
+      method: 'get',
+      url: endpoint,
+      headers: { zelidauth: zelidAuth },
+      timeout: 60000,
+      httpsAgent,
+      validateStatus: () => true,
+    });
+    if (response.status !== 503 || attempt >= FILE_OPERATION_MAX_BUSY_RETRIES) break;
+    const waitMs = retryAfterMs(response.headers);
+    await new Promise((resolve) => { setTimeout(resolve, waitMs); });
+  }
   const { data } = response;
   if (data?.status === 'success') return;
   const code = data?.data?.code || data?.code;
@@ -1091,7 +1141,11 @@ async function runVolumeOperation(node, zelidAuth, label, request, onAnswer = ()
 
   const body = response.data;
   onAnswer(response);
-  if (response.status === 202 && body?.data?.jobId) {
+  if (response.status === 202 && !body?.data?.jobId) {
+    // Accepted, with nothing to follow: whether it ever ran is unknown.
+    throw new Error(`${label} accepted without a job to follow`);
+  }
+  if (response.status === 202) {
     const offered = body.data.statusUrl;
     // Only a path on this node: an offered URL naming another host would carry the zelidauth there.
     const statusPath = typeof offered === 'string' && offered.startsWith('/') && !offered.startsWith('//')
@@ -1165,6 +1219,11 @@ const PROFILE_MARKER = `appdata/${backupProfiles.PROFILE_MARKER_DIR}`;
 /** How often, and how many times, to look for a marker made on the primary to reach the standby. */
 const PROFILE_MARKER_SYNC_WAIT_MS = 15 * 1000;
 const PROFILE_MARKER_SYNC_CHECKS = 8;
+
+/** compressobject failing on a source that is no longer there. */
+function isVanishedSourceError(error) {
+  return /ENOENT|no such file|cannot stat|does not exist/i.test(error?.message || '');
+}
 
 /** FluxOS 8.21+ refusing a write on a standby, whose copy follows the primary's. */
 function isReadOnlyCopyRefusal(error) {
@@ -1319,6 +1378,7 @@ async function createProfiledArchiveOnNode(node, zelidAuth, appname, component, 
   }
 
   for (let attempt = 1; ; attempt += 1) {
+    let vanished = false;
     try {
       await compressOnNode(node, zelidAuth, {
         appname,
@@ -1328,11 +1388,14 @@ async function createProfiledArchiveOnNode(node, zelidAuth, appname, component, 
         overwrite: true,
       });
     } catch (error) {
-      return { fits: false, archiveFailed: true, reason: error?.message || String(error) };
+      // A source the game or a sync removed after it was listed: the volume
+      // changed, which a new listing and plan answer.
+      vanished = isVanishedSourceError(error);
+      if (!vanished) return { fits: false, archiveFailed: true, reason: error?.message || String(error) };
     }
 
     const after = await listAll();
-    if (backupProfiles.sameListings(listings, after, profile.ignoreChanges)) break;
+    if (!vanished && backupProfiles.sameListings(listings, after, profile.ignoreChanges)) break;
     if (attempt >= PROFILE_ARCHIVE_ATTEMPTS) {
       return { fits: false, changing: true, reason: `the files changed while archiving, ${attempt} times` };
     }
@@ -1399,6 +1462,8 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList, c
             outcome: 'skipped',
             node,
             detail: `${profile.id} ${why}: ${outcome.reason}`,
+            // The app's files, not this node's state: the primary would refuse the profile too.
+            structural: why === 'does not fit',
           });
           profiled = false;
         }

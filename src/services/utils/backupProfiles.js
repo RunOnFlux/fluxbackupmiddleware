@@ -165,7 +165,11 @@ async function collectProfileListings(profile, list) {
     // eslint-disable-next-line no-await-in-loop
     let listing = await listOnce(entry.path);
     if (Array.isArray(listing) && entry.children) {
-      const excluded = (item) => Boolean(entry.excludeChildren && entry.excludeChildren.test(String(item.name)));
+      // The marker is archived first, on its own, whatever the profile says:
+      // listed again under appdata it would be a second source for the same
+      // folder, which compressobject refuses.
+      const excluded = (item) => (entry.path === '' && item.name === PROFILE_MARKER_DIR)
+        || Boolean(entry.excludeChildren && entry.excludeChildren.test(String(item.name)));
       const kept = listing.filter((item) => item && !excluded(item));
       const leftOut = listing.filter((item) => item && excluded(item));
       let folders = 0;

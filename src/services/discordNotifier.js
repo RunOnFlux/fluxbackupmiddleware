@@ -73,7 +73,7 @@ function formatDiagnostic(diagnostic) {
   return `- ${fields.join(' | ')}`;
 }
 
-function summarizeAttempt(attempt) {
+function summarizeAttemptChecks(attempt) {
   const diagnostics = attempt.diagnostics || [];
   const decisiveCheck = [...diagnostics].reverse().find((item) => item.outcome === 'failed')
     || diagnostics[diagnostics.length - 1];
@@ -88,6 +88,11 @@ function summarizeAttempt(attempt) {
     ].filter(Boolean).join(' | ');
   }
   return `${sanitizeDiagnosticText(attempt.stage || 'automatic_backup', 40)} | ${sanitizeDiagnosticText(attempt.reason, 220)}`;
+}
+
+function summarizeAttempt(attempt) {
+  const summary = summarizeAttemptChecks(attempt);
+  return attempt.onPrimary ? `on the primary | ${summary}` : summary;
 }
 
 function formatFailureAttempts(failureAttempts) {
