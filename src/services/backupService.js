@@ -513,20 +513,31 @@ function inferFailureStage(error) {
   return 'automatic_backup';
 }
 
+/**
+ * A failure's text without the nodes it names: the same fault on the next
+ * secondary, or after a failover, is the same failure.
+ */
+function withoutNodes(text) {
+  if (text === undefined || text === null) return text;
+  return String(text)
+    .replace(/https?:\/\/[^\s/'"]+/gi, '<node>')
+    .replace(/\b\d{1,3}(?:-\d{1,3}){3}-\d{2,5}\.node\.api\.runonflux\.io\b/gi, '<node>')
+    .replace(/\b\d{1,3}(?:\.\d{1,3}){3}(?::\d{2,5})?\b/g, '<node>');
+}
+
 function buildAutomaticFailureFingerprint(payload) {
   const stableFailure = {
     stage: payload.stage,
-    reason: payload.reason,
+    reason: withoutNodes(payload.reason),
     taskFailures: (payload.taskFailures || []).map((failure) => ({
       component: failure.component,
-      message: failure.message,
-      node: failure.node,
+      message: withoutNodes(failure.message),
       errorCode: failure.errorCode,
       httpStatus: failure.httpStatus,
     })),
     attempts: (payload.failureAttempts || []).map((attempt) => ({
       stage: attempt.stage,
-      reason: attempt.reason,
+      reason: withoutNodes(attempt.reason),
     })),
   };
   return crypto.createHash('sha256').update(JSON.stringify(stableFailure)).digest('hex');
@@ -2491,6 +2502,24 @@ async function getRestoreRules(req, res) {
   }
 }
 
+/**
+ * Push a claimed backup's lease out again before another attempt, so a run
+ * whose attempts each wait on a node is never claimed a second time while it
+ * still works. A lease that cannot be renewed is left as it is: the claim's
+ * own lease is hours longer than an attempt.
+ */
+async function renewAutomaticBackupLease(automaticBackup) {
+  const leaseUntil = Date.now() + config.automaticBackupSchedule.dispatcherLeaseMinutes * 60 * 1000;
+  try {
+    await dbCli.execute(
+      'UPDATE automatic_backups SET dispatch_lease_until = ? WHERE id = ? AND dispatch_token = ?',
+      [leaseUntil, automaticBackup.id, automaticBackup.dispatch_token],
+    );
+  } catch (error) {
+    log.warn(`Could not renew the dispatch lease of ${automaticBackup.appname}: ${getErrorMessage(error)}`);
+  }
+}
+
 /** Failures of the secondary node itself, which the primary may not share. */
 const PRIMARY_FALLBACK_STAGES = ['node_selection', 'node_auth', 'create_backup'];
 
@@ -2507,7 +2536,9 @@ function canRetryOnPrimary(componentProfiles, lastFailure) {
     && Object.values(componentProfiles).every((profile) => profile && profile.primarySafe === true)
     && Boolean(lastFailure)
     && PRIMARY_FALLBACK_STAGES.includes(lastFailure.stage)
-    && (lastFailure.taskFailures || []).every((failure) => failure.nodeSide === true);
+    && (lastFailure.taskFailures || []).every((failure) => failure.nodeSide === true)
+    // A profile the app's files do not fit is refused on the primary too.
+    && !(lastFailure.diagnostics || []).some((diagnostic) => diagnostic.structural === true);
 }
 
 async function processAutomaticBackupInternal() {
@@ -2593,6 +2624,7 @@ async function processAutomaticBackupInternal() {
       const attemptDiagnostics = [];
       const onPrimary = retryCount === maxRetries - 1
         && canRetryOnPrimary(componentProfiles, lastFailure);
+      if (retryCount > 0) await renewAutomaticBackupLease(automaticBackup);
       try {
         let nodeAddress;
         if (onPrimary) {
@@ -2864,6 +2896,7 @@ async function processAutomaticBackupInternal() {
         };
         failureAttempts.push({
           attempt: retryCount,
+          onPrimary,
           ...lastFailure,
         });
         if (lastFailure.stage === 'task_pipeline') {
