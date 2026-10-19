@@ -61,6 +61,8 @@
  *                `directory`), even though `path` itself is left out. With
  *                `path: ''` it is picked from the child folder itself, among
  *                the entries `excludeWithin` leaves out
+ *   checkOnly    listed for `validate` only, never archived: for a folder the
+ *                profile leaves out but whose contents decide whether it fits
  *   validate     (listing, now) => null when the listing is fit to archive, or the
  *                reason it is not: a string, or { reason, unsettled: true } when
  *                the files are still arriving (a sync caught half-way), which is
@@ -131,18 +133,22 @@ const SAVE_TOLERANCE_MS = 5000;
  * Sync-conflict copies (`_main.890.sync-conflict-....db2`) match none of the
  * names below and are moved out of the folder by the spec's start hook.
  */
-function valheimWorldsCommitted(listing) {
+function valheimWorldsCommitted(listing, now = Date.now()) {
   const unsettled = (reason) => ({ reason, unsettled: true });
   const time = (file) => Date.parse(file.modifiedAt);
   let worlds = 0;
   for (let i = 0; i < listing.length; i += 1) {
     const item = listing[i];
-    if (item.isFile && SYNCTHING_TEMP.test(String(item.name))) {
+    // A temporary file a sync gave up on stays up to a day; only a recent one
+    // is a save still arriving.
+    // eslint-disable-next-line no-use-before-define
+    if (item.isFile && syncArriving([item], now)) {
       return unsettled(`${item.name} is still being synced`);
     }
     if (item.isDirectory) {
       const files = (item.children || []).filter((file) => file && file.isFile);
-      const syncing = files.find((file) => SYNCTHING_TEMP.test(String(file.name)));
+      // eslint-disable-next-line no-use-before-define
+      const syncing = syncArriving(files, now);
       if (syncing) return unsettled(`${item.name}/${syncing.name} is still being synced`);
       const byName = new Map(files.map((file) => [String(file.name), file]));
       const generations = [...byName.keys()]
@@ -304,8 +310,21 @@ function minecraftWorldPresent(isWorld) {
 }
 const javaWorld = (item) => item.isDirectory && (item.children || [])
   .some((file) => file.isFile && file.name === 'level.dat' && Number(file.size) > 0);
-const bedrockWorlds = (item) => item.isDirectory && item.name === 'worlds' && (item.children || [])
-  .some((world) => world.isDirectory && Number(world.size) > 0);
+/**
+ * Whether worlds/ holds a Bedrock world, with no sync arriving in it or in its
+ * db/. A world is LevelDB: CURRENT names a MANIFEST that names the .ldb and
+ * .log files, so a db/ caught while a compaction is arriving (the new MANIFEST
+ * in, one of its tables still a Syncthing temporary file) does not open.
+ */
+function bedrockWorldsSettled(listing, now = Date.now()) {
+  const inside = listing.flatMap((item) => [...(item.children || []), ...(item.excludedChildren || [])]);
+  const dbs = inside.flatMap((item) => (item.isDirectory && item.name === 'db' && Array.isArray(item.children) ? item.children : []));
+  const arriving = syncArriving([...listing, ...inside, ...dbs], now);
+  if (arriving) return { reason: `${arriving.name} is still being synced`, unsettled: true };
+  const world = listing.some((item) => item.isDirectory && (item.children || [])
+    .some((entry) => entry.isDirectory && entry.name === 'db' && Number(entry.size) > 0));
+  return world ? null : 'no world';
+}
 
 /**
  * A file ARK: Survival Ascended writes on every save: a byte copy of the world
@@ -558,6 +577,8 @@ module.exports = [
       // Pak mods the owner uploaded. Lives inside the install tree, but nothing
       // downloads it again.
       { path: 'RSDragonwilds/Content/Paks/~mods' },
+      // The ones the owner switched off in the hub, parked outside the game.
+      { path: 'mods-off' },
     ],
   },
   {
@@ -809,13 +830,16 @@ module.exports = [
         excludeChildren: /\.sync-conflict-/,
         validate: hytaleWorldPresent,
       },
-      // config.json, permissions, bans, whitelist, mods/ and earlyplugins/,
-      // the server's own account (auth.enc, readable only with .machine-id)
+      // config.json, permissions, bans, whitelist, mods/ and earlyplugins/
       // and whatever else the owner keeps there.
       {
         path: '',
         children: true,
-        excludeChildren: /^(universe|Assets\.zip|Server|downloader|\.cache|backups|logs|telemetry|start\.(sh|bat)|\.server-version|game\.zip|hytale-downloader\.zip|\.flux-backup)$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+        // Not the server's account either (auth.enc, readable only with
+        // .machine-id): its refresh token is single-use, so the one in a backup
+        // is spent, and restored over the node's live one it would revoke the
+        // whole family. Left out, a restore keeps the node's.
+        excludeChildren: /^(universe|Assets\.zip|Server|downloader|\.cache|backups|logs|telemetry|start\.(sh|bat)|\.server-version|game\.zip|hytale-downloader\.zip|auth\.enc|\.machine-id|\.flux-backup)$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
       },
     ],
   },
@@ -834,6 +858,16 @@ module.exports = [
     // node would be loaded in its place, so the restore would change nothing.
     restoreClear: [{ folder: 'Saves/v4/*', name: VRISING_AUTOSAVE }],
     include: [
+      // A game update that moves the saves to another format folder would
+      // leave Saves/v4 behind, stale: then the full backup.
+      {
+        path: 'Saves',
+        checkOnly: true,
+        validate: (listing) => {
+          const other = listing.find((item) => item.isDirectory && /^v\d+$/i.test(String(item.name)) && item.name !== 'v4');
+          return other ? `Saves/${other.name} is not the v4 this profile archives` : null;
+        },
+      },
       // Each world folder: SessionId.json, StartDate.json and whatever else is
       // there, plus its newest settled autosave, which is what the server
       // loads when it is the only one.
@@ -977,14 +1011,25 @@ module.exports = [
     // upgrade (two kept; never the worlds). Everything else is kept: the
     // behavior and resource packs mix Mojang's with the owner's.
     id: 'minecraft-bedrock-world',
-    match: { name: 'bedrock', repotag: 'minecraft-bedrock', component: '^minecraftbedrock' },
+    // App names start `minecraftbedrock` (the hub's) or `MinecraftBedrockServer`
+    // (the marketplace's); a Java server merely named after Bedrock is not one.
+    match: { name: '^minecraftbedrock', repotag: 'minecraft-bedrock', component: '^minecraftbedrock' },
     include: [
+      // Each world, entry by entry: db/ (LevelDB) whole, level.dat and the
+      // rest. Listed down to db/, whose files must agree with each other.
       {
-        path: '',
+        path: 'worlds',
         required: true,
         children: true,
-        excludeChildren: /^(bedrock_server-[\d.]+|backup-pre-[\d.]+|\.flux-backup)$/,
-        validate: minecraftWorldPresent(bedrockWorlds),
+        excludeChildren: SYNC_CONFLICT,
+        excludeWithin: /\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+        validate: bedrockWorldsSettled,
+      },
+      // The packs, the server's settings and lists, and whatever else is there.
+      {
+        path: '',
+        children: true,
+        excludeChildren: /^(worlds|bedrock_server-[\d.]+|backup-pre-[\d.]+|\.flux-backup)$|\.sync-conflict-/,
       },
     ],
   },

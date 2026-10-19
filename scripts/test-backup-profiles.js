@@ -88,6 +88,7 @@ const worldFolders = (saveGames = [{ name: 'Vanhiem.sav', isFile: true, size: 12
   folderRoute('appdata/RSDragonwilds/Saved/SaveGames', () => success(saveGames)),
   folderRoute('appdata/RSDragonwilds/Saved/Config', () => success([{ name: 'LinuxServer', isDirectory: true, size: 9912 }])),
   folderRoute('appdata/RSDragonwilds/Content/Paks/~mods', missing),
+  folderRoute('appdata/mods-off', missing),
 ];
 
 function compressRoute(jobStatuses, statusUrl) {
@@ -1316,11 +1317,13 @@ async function main() {
       name, size, isFile: false, isDirectory: true, modifiedAt: at(30),
     });
     const hytaleTopKept = [
-      hDir('.machine-id', 200), hFile('auth.enc', 4000), hFile('bans.json', 2), hFile('bans.json.bak', 2),
+      hFile('bans.json', 2), hFile('bans.json.bak', 2),
       hFile('config.json', 1500), hFile('config.json.bak', 1500), hDir('earlyplugins', 0), hFile('hstats-server-uuid.txt', 36),
       hDir('mods', 15400000), hFile('permissions.json', 300),
     ];
     const hytaleTopLeftOut = [
+      // The server's account: its single-use token in a backup is spent.
+      hDir('.machine-id', 200), hFile('auth.enc', 4000),
       hFile('Assets.zip', 3942800000), hDir('Server', 231700000), hDir('backups', 859100000), hDir('.cache', 53400000),
       hDir('downloader', 17600000), hDir('logs', 3500000), hDir('telemetry', 200000), hFile('start.sh', 2000), hFile('start.bat', 2000),
       hFile('.server-version', 30), hFile('game.zip', 1200000000), hFile('config.sync-conflict-20261017-182622-ABCDEFG.json', 1500, 2000),
@@ -1615,10 +1618,12 @@ async function main() {
       '.flux-empty-files-1791590881511.zip', 'server.sync-conflict-20260907-080318-LR5NJ4S.properties', '.paper', 'forge-installer-1.15.1-30.0.51.jar',
     ];
     owners.forEach((name) => assert(!javaRoot.excludeChildren.test(name), `${name} is kept`));
-    const bedrockRoot = mcProfile('minecraftbedrock').include[0];
-    ['bedrock_server-1.21.111.1', 'backup-pre-1.21.111.1', '.flux-backup'].forEach((name) => assert(bedrockRoot.excludeChildren.test(name), name));
-    ['worlds', 'behavior_packs', 'resource_packs', 'server.properties', 'allowlist.json', 'permissions.json', 'bedrock_server_how_to.html']
+    const bedrockRoot = mcProfile('minecraftbedrock').include.find((entry) => entry.path === '');
+    ['bedrock_server-1.21.111.1', 'backup-pre-1.21.111.1', '.flux-backup', 'worlds'].forEach((name) => assert(bedrockRoot.excludeChildren.test(name), name));
+    ['behavior_packs', 'resource_packs', 'server.properties', 'allowlist.json', 'permissions.json', 'bedrock_server_how_to.html']
       .forEach((name) => assert(!bedrockRoot.excludeChildren.test(name), name));
+    // A Java server named after Bedrock is not one.
+    assert.strictEqual(mcProfile('minecraft', null, 'mybedrockjava1790000000000').id, 'minecraft-java-world');
 
     const mFile = (name, size, minutesAgo = 60) => ({
       name, size, isFile: true, isDirectory: false, modifiedAt: new Date(Date.now() - minutesAgo * 60000).toISOString(),
@@ -1634,8 +1639,9 @@ async function main() {
       reason: '.syncthing.level.dat.tmp is still being synced', unsettled: true,
     });
     assert.strictEqual(javaRoot.validate([mDir('world', 1, [levelDat, mFile('.syncthing.session.lock.tmp', 9, 600)])]), null, 'a sync given up on hours ago');
-    assert.strictEqual(bedrockRoot.validate([mDir('worlds', 9e6, [mDir('Bedrock level', 9e6)]), mDir('behavior_packs', 1, [])]), null);
-    assert.strictEqual(bedrockRoot.validate([mDir('worlds', 0, [])]), 'no world');
+    const bedrockWorlds = mcProfile('minecraftbedrock').include.find((entry) => entry.path === 'worlds');
+    assert.strictEqual(bedrockWorlds.validate([mDir('Bedrock level', 9e6, [mDir('db', 9e6, [])])]), null);
+    assert.strictEqual(bedrockWorlds.validate([mDir('Bedrock level', 0, [])]), 'no world');
 
     // The plan over appdata itself: the owner's entries, one by one.
     const mcListing = await backupProfiles.collectProfileListings(mcProfile('minecraft'), async (folder) => {
@@ -1668,6 +1674,69 @@ async function main() {
     assert.deepStrictEqual(backupProfiles.planProfiledArchive(mcProfile('minecraft'), bigWorld), {
       fits: false, reason: 'it would leave out only 1% of the volume',
     });
+
+    // A Bedrock world is LevelDB: one whose db/ is still arriving is not archived.
+    const bedrock = mcProfile('minecraftbedrock');
+    const bedrockVolume = (dbFiles) => async (folder) => {
+      switch (folder) {
+        case 'worlds': return [mDir('Bedrock level', 20e6)];
+        case 'worlds/Bedrock level': return [mDir('db', 20e6), mFile('level.dat', 3000), mFile('levelname.txt', 13)];
+        case 'worlds/Bedrock level/db': return dbFiles;
+        case '': return [mDir('worlds', 20e6), mDir('bedrock_server-1.21.111.1', 90e6), mFile('server.properties', 2000), mDir('behavior_packs', 9e6)];
+        default: return [];
+      }
+    };
+    const bedrockDb = [mFile('CURRENT', 16), mFile('MANIFEST-000123', 900), mFile('000456.ldb', 2e6)];
+    let bedrockPlan = backupProfiles.planProfiledArchive(bedrock, await backupProfiles.collectProfileListings(bedrock, bedrockVolume(bedrockDb)));
+    assert.deepStrictEqual(bedrockPlan.sources, [
+      'appdata/.flux-backup',
+      'appdata/worlds/Bedrock level/db', 'appdata/worlds/Bedrock level/level.dat', 'appdata/worlds/Bedrock level/levelname.txt',
+      'appdata/server.properties', 'appdata/behavior_packs',
+    ]);
+    const arrivingTable = {
+      name: '.syncthing.000457.ldb.tmp', isFile: true, size: 1e6, modifiedAt: new Date().toISOString(),
+    };
+    bedrockPlan = backupProfiles.planProfiledArchive(bedrock, await backupProfiles.collectProfileListings(bedrock, bedrockVolume([...bedrockDb, arrivingTable])));
+    assert.strictEqual(bedrockPlan.unsettled, true, 'a table still arriving in db/');
+    const abandoned = { ...arrivingTable, modifiedAt: new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString() };
+    bedrockPlan = backupProfiles.planProfiledArchive(bedrock, await backupProfiles.collectProfileListings(bedrock, bedrockVolume([...bedrockDb, abandoned])));
+    assert.strictEqual(bedrockPlan.fits, true, 'one a sync gave up on hours ago is not');
+
+    // V Rising: saves moved to another format folder leave v4 stale.
+    const vMoved = await backupProfiles.collectProfileListings(vrising, async (folder) => (
+      folder === 'Saves' ? [vDir('v4', 224300000), vDir('v5', 12000000)] : vrisingVolume()(folder)));
+    assert.match(backupProfiles.planProfiledArchive(vrising, vMoved).reason, /Saves\/v5 is not the v4/);
+    const vOnlyV4 = await backupProfiles.collectProfileListings(vrising, async (folder) => (
+      folder === 'Saves' ? [vDir('v4', 224300000)] : vrisingVolume()(folder)));
+    const vOnlyV4Plan = backupProfiles.planProfiledArchive(vrising, vOnlyV4);
+    assert.strictEqual(vOnlyV4Plan.fits, true);
+    assert(!vOnlyV4Plan.sources.some((source) => source === 'appdata/Saves'), 'checkOnly is never archived');
+
+    // Valheim: a temporary file a sync gave up on hours ago is no save arriving.
+    const valheimWorlds = valheim.include.find((entry) => entry.path === 'worlds_local');
+    const vhAt = (minutesAgo) => new Date(Date.now() - minutesAgo * 60000).toISOString();
+    const vhFile = (name, minutesAgo) => ({
+      name, size: 10, isFile: true, isDirectory: false, modifiedAt: vhAt(minutesAgo),
+    });
+    const vhWorld = (extra) => ({
+      name: 'Dedicated',
+      isDirectory: true,
+      size: 40,
+      children: [vhFile('_main.7.db2', 30), vhFile('_main.7.chunks', 30), vhFile('_main.7.fwl2', 30), vhFile('_main.7.ok', 30), ...extra],
+    });
+    assert.strictEqual(valheimWorlds.validate([vhWorld([vhFile('.syncthing._main.6.db2.tmp', 600)])], Date.now()), null);
+    assert.strictEqual(valheimWorlds.validate([vhFile('.syncthing.prefs.tmp', 600), vhWorld([])], Date.now()), null);
+    assert.strictEqual(valheimWorlds.validate([vhWorld([vhFile('.syncthing._main.8.db2.tmp', 1)])], Date.now()).unsettled, true);
+
+    // Dragonwilds: the mods the owner switched off in the hub go too.
+    routes = [
+      folderRoute('appdata/RSDragonwilds/Saved/SaveGames', () => success([{ name: 'W.sav', isFile: true, size: 10 }])),
+      folderRoute('appdata/RSDragonwilds/Saved/Config', () => success([])),
+      folderRoute('appdata/RSDragonwilds/Content/Paks/~mods', missing),
+      folderRoute('appdata/mods-off', () => success([{ name: 'Off.pak', isFile: true, size: 5 }])),
+    ];
+    const dwListings = await backupProfiles.collectProfileListings(profile, (folder) => fluxOS.testHooks.listVolumeFolder(NODE, 'auth', APP, COMPONENT, folder ? `appdata/${folder}` : 'appdata'));
+    assert(backupProfiles.planProfiledArchive(profile, dwListings).sources.includes('appdata/mods-off'));
 
     // --- backupService ----------------------------------------------------------
     backupHooks.setDatabaseForTests({
