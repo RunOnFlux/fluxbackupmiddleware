@@ -389,7 +389,7 @@ class DBClient {
         removedFromFluxdrive tinyint DEFAULT '0',
         reconciliationRecovered tinyint DEFAULT '0',
         fails tinyint DEFAULT '0',
-        host varchar(256),
+        host varchar(1024),
         hash varchar(256),
         startTime bigint unsigned DEFAULT '0',
         finishTime bigint unsigned DEFAULT '0',
@@ -575,6 +575,22 @@ class DBClient {
       log.info('backup_profile column added successfully');
     } else {
       log.info('backup_profile column already exists, moving on...');
+    }
+
+    // The download URL embeds the volume path, which repeats the component and app
+    // names; ARK's (`arksurvivalascendedarksurvivalascended`) pushes it past 256.
+    const hostColumn = await this.query(`
+      SELECT CHARACTER_MAXIMUM_LENGTH AS maxLength
+      FROM INFORMATION_SCHEMA.COLUMNS
+      WHERE TABLE_SCHEMA = '${this.InitDB}'
+      AND TABLE_NAME = 'tasks'
+      AND COLUMN_NAME = 'host'
+    `);
+
+    if (hostColumn.length && Number(hostColumn[0].maxLength) < 1024) {
+      log.info('Widening tasks.host to VARCHAR(1024)...');
+      await this.query('ALTER TABLE tasks MODIFY COLUMN host VARCHAR(1024)');
+      log.info('tasks.host widened successfully');
     }
 
     // Add index on backup_type for faster queries
