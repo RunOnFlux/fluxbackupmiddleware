@@ -83,6 +83,9 @@
  *
  * A profile assumes a g: app: backups are taken on the secondary, where the
  * container does not run, so nothing is written while the paths are archived.
+ * When the secondaries fail, the last attempt takes the profiled archive on the
+ * primary, with the server running: a file the game writes meanwhile changes
+ * the listing or fails the tar, and that attempt fails rather than keep it.
  */
 
 /** Syncthing writes a file under one of these names and renames it when it is whole. */
