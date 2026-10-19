@@ -338,6 +338,70 @@ async function main() {
       { [COMPONENT]: profile },
     );
     assert.strictEqual(seen[0][4][COMPONENT].id, 'dragonwilds-world');
+    assert.strictEqual(typeof seen[0][5], 'function', 'a standby can still reach the primary for its marker');
+
+    // --- the last attempt, on the primary ---------------------------------------
+    // The profiled archive is taken while the server runs.
+    calls.length = 0;
+    routes = [...worldFolders(), anyCreateFolder, ...compressRoute(['Succeeded']), ...listingRoutes];
+    result = await fluxOS.createBackupTaskOnNode(NODE, 'auth', APP, [COMPONENT], { [COMPONENT]: profile }, null, { onPrimary: true });
+    assert.strictEqual(result.status, 'completed');
+    assert.strictEqual(result.components[0].profile, 'dragonwilds-world');
+    assert(!calls.some((r) => r.url.endsWith('/apps/appendbackuptask')));
+
+    // A profile that cannot be used fails the attempt: the full backup would
+    // stop the server. The partial archive slot is still cleared.
+    const failingOnPrimary = [
+      [...worldFolders([]), removeRoute(), fullBackupRoute, ...listingRoutes],
+      [...worldFolders(), anyCreateFolder, ...compressRoute(['Failed']), removeRoute(), fullBackupRoute, ...listingRoutes],
+    ];
+    for (let i = 0; i < failingOnPrimary.length; i += 1) {
+      calls.length = 0;
+      routes = failingOnPrimary[i];
+      // eslint-disable-next-line no-await-in-loop
+      result = await fluxOS.createBackupTaskOnNode(NODE, 'auth', APP, [COMPONENT], { [COMPONENT]: profile }, null, { onPrimary: true });
+      assert.strictEqual(result.status, 'failed');
+      assert.match(result.error, /could not be used on the primary \(dragonwilds-world .*\); the full backup would stop the server/);
+      assert(!calls.some((r) => r.url.endsWith('/apps/appendbackuptask')), 'never the full backup on the primary');
+      assert(calls.some((r) => r.url === removeEndpoint));
+      assert(!calls.some((r) => r.url.startsWith(`${NODE}/backup/getlocalbackuplist/`)));
+    }
+
+    // With no profile there is nothing to take on the primary.
+    calls.length = 0;
+    routes = [fullBackupRoute, ...listingRoutes];
+    result = await fluxOS.createBackupTaskOnNode(NODE, 'auth', APP, [COMPONENT], null, null, { onPrimary: true });
+    assert.strictEqual(result.status, 'failed');
+    assert.strictEqual(calls.length, 0);
+
+    // The wrapper hands the option on, with no primary to reach: it is the primary.
+    seen.length = 0;
+    await fluxOS.createBackupTaskWithTeamCredentials(
+      NODE,
+      APP,
+      [COMPONENT],
+      async () => ({ zelidAuth: 'auth', diagnostics: [] }),
+      async (...args) => { seen.push(args); return { status: 'completed', components: [] }; },
+      { [COMPONENT]: profile },
+      { onPrimary: true },
+    );
+    assert.strictEqual(seen[0][5], null);
+    assert.deepStrictEqual(seen[0][6], { onPrimary: true });
+
+    // Which failures send the last attempt to the primary.
+    const primaryProfiles = { [COMPONENT]: profile };
+    const { canRetryOnPrimary } = backupHooks;
+    ['node_selection', 'node_auth', 'create_backup'].forEach((stage) => {
+      assert.strictEqual(canRetryOnPrimary(primaryProfiles, { stage, taskFailures: [] }), true, stage);
+    });
+    assert.strictEqual(canRetryOnPrimary(null, { stage: 'create_backup', taskFailures: [] }), false, 'no profile, no primary');
+    assert.strictEqual(canRetryOnPrimary(primaryProfiles, null), false);
+    assert.strictEqual(canRetryOnPrimary(primaryProfiles, { stage: 'app_owner', taskFailures: [] }), false);
+    assert.strictEqual(
+      canRetryOnPrimary(primaryProfiles, { stage: 'create_backup', taskFailures: [{ component: COMPONENT, message: "Data too long for column 'host'" }] }),
+      false,
+      'a file that could not be queued fails on the primary too',
+    );
 
     // --- the marker on a standby that refuses writes (FluxOS 8.21+) -----------------
     const PRIMARY = 'http://10.0.0.1:16137';

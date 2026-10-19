@@ -1309,14 +1309,23 @@ async function createProfiledArchiveOnNode(node, zelidAuth, appname, component, 
  * @param {string} zelidAuth - The authentication string
  * @param {string} appname - The application name
  * @param {Array} componentList - Array of component names
+ * @param {Object} [options]
+ * @param {boolean} [options.onPrimary] - the node is the primary, where the
+ *   app's container runs: only the profile's partial archive is taken, never
+ *   the full backup, which stops the app for the customer
  * @returns {Promise<Object|null>} - Combined backup data for all components, or null if failed
  */
-async function createBackupTaskOnNode(node, zelidAuth, appname, componentList, componentProfiles = null, reachPrimary = null) {
+async function createBackupTaskOnNode(node, zelidAuth, appname, componentList, componentProfiles = null, reachPrimary = null, options = {}) {
   const diagnostics = [];
   const createEndpoint = `${node}/apps/appendbackuptask`;
   const usedProfiles = {};
+  const onPrimary = options.onPrimary === true;
   try {
-    log.info(`Creating backup task for ${appname} with components: ${JSON.stringify(componentList)}`);
+    log.info(`Creating backup task for ${appname} with components: ${JSON.stringify(componentList)}${onPrimary ? ' on the primary' : ''}`);
+
+    if (onPrimary && !componentProfiles) {
+      throw new Error('A backup on the primary needs a backup profile; the full backup would stop the server');
+    }
 
     let profiled = false;
     if (componentProfiles) {
@@ -1355,6 +1364,10 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList, c
         // another node.
         for (let i = 0; i < componentList.length; i += 1) {
           await removeVolumeObject(node, zelidAuth, appname, componentList[i], `backup/local/backup_${componentList[i].toLowerCase()}.tar.gz`);
+        }
+        if (onPrimary) {
+          const skipped = diagnostics.filter((diagnostic) => diagnostic.outcome === 'skipped').pop();
+          throw new Error(`Backup profile could not be used on the primary (${skipped?.detail || 'no detail'}); the full backup would stop the server`);
         }
       }
     }
@@ -1636,6 +1649,7 @@ async function createBackupTaskWithTeamCredentials(
   verifier = verifyLoginDetailed,
   backupCreator = createBackupTaskOnNode,
   componentProfiles = null,
+  options = {},
 ) {
   const credentials = await getTeamCredentials();
   if (credentials.length === 0) {
@@ -1680,9 +1694,10 @@ async function createBackupTaskWithTeamCredentials(
 
     // A profiled backup may need the primary for its marker (see
     // ensureProfileMarker), reached with the credential the standby accepted.
-    // Asked for at most once, and only when needed.
+    // Asked for at most once, and only when needed. On the primary the marker
+    // is made in place.
     let primaryAccess = null;
-    const reachPrimary = componentProfiles ? () => {
+    const reachPrimary = componentProfiles && !options.onPrimary ? () => {
       primaryAccess = primaryAccess || (async () => {
         const address = await getPrimaryNodeAddress(appname, []);
         if (!address) throw new Error('the primary node could not be identified');
@@ -1705,6 +1720,7 @@ async function createBackupTaskWithTeamCredentials(
       componentList,
       componentProfiles,
       reachPrimary,
+      options,
     );
     lastResult = backupResult;
     failureStage = 'create_backup';
@@ -1756,6 +1772,7 @@ module.exports = {
   isAppExpiredInGlobalSpecs,
   getSecondaryNodeSelection,
   getSecondaryNodeFromHAProxy,
+  getPrimaryNodeAddress,
   createBackupTaskOnNode,
   createBackupTaskWithTeamCredentials,
   isExplicitAuthorizationFailure,

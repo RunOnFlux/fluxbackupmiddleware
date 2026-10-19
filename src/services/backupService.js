@@ -2430,6 +2430,22 @@ async function resolveBackupProfiles(appname, componentList) {
   }
 }
 
+/** Failures of the secondary node itself, which the primary may not share. */
+const PRIMARY_FALLBACK_STAGES = ['node_selection', 'node_auth', 'create_backup'];
+
+/**
+ * Whether the last attempt goes to the primary: only for an app with a backup
+ * profile, whose partial archive is taken without stopping the server, and
+ * only after a failure of the secondary node. A file that could not be queued
+ * would fail on the primary the same way.
+ */
+function canRetryOnPrimary(componentProfiles, lastFailure) {
+  return Boolean(componentProfiles)
+    && Boolean(lastFailure)
+    && PRIMARY_FALLBACK_STAGES.includes(lastFailure.stage)
+    && (lastFailure.taskFailures || []).length === 0;
+}
+
 async function processAutomaticBackupInternal() {
   const maxRetries = 3;
   let retryCount = 0;
@@ -2506,21 +2522,39 @@ async function processAutomaticBackupInternal() {
 
     log.info(`Processing automatic backup for app: ${appname} (marketplace=${Number(isMarketplace) === 1}, intervalHours=${scheduleHours})`);
 
+    const componentProfiles = await resolveBackupProfiles(appname, componentList);
+
     // Retry loop for node operations
     while (retryCount < maxRetries) {
       const attemptDiagnostics = [];
+      const onPrimary = retryCount === maxRetries - 1
+        && canRetryOnPrimary(componentProfiles, lastFailure);
       try {
-        // Get secondary node from HAProxy
-        const nodeSelection = await fluxOS.getSecondaryNodeSelection(appname, attemptedNodes);
-        attemptDiagnostics.push(...nodeSelection.diagnostics);
-        const nodeAddress = nodeSelection.node;
-        if (!nodeAddress) {
-          throw createBackupFailure(
-            nodeSelection.reason || `Failed to get secondary node for ${appname}`,
-            'node_selection',
-            [],
-            attemptDiagnostics,
-          );
+        let nodeAddress;
+        if (onPrimary) {
+          log.info(`Secondary nodes failed for ${appname}; last attempt on the primary with its backup profile`);
+          nodeAddress = await fluxOS.getPrimaryNodeAddress(appname, attemptDiagnostics);
+          if (!nodeAddress) {
+            throw createBackupFailure(
+              `Failed to identify the primary node of ${appname} for the profiled backup`,
+              'node_selection',
+              [],
+              attemptDiagnostics,
+            );
+          }
+        } else {
+          // Get secondary node from HAProxy
+          const nodeSelection = await fluxOS.getSecondaryNodeSelection(appname, attemptedNodes);
+          attemptDiagnostics.push(...nodeSelection.diagnostics);
+          nodeAddress = nodeSelection.node;
+          if (!nodeAddress) {
+            throw createBackupFailure(
+              nodeSelection.reason || `Failed to get secondary node for ${appname}`,
+              'node_selection',
+              [],
+              attemptDiagnostics,
+            );
+          }
         }
 
         const node = `http://${nodeAddress}`;
@@ -2541,7 +2575,6 @@ async function processAutomaticBackupInternal() {
         const { owner } = ownerResult;
 
         // Create backup task on node
-        const componentProfiles = await resolveBackupProfiles(appname, componentList);
         const backupResult = await fluxOS.createBackupTaskWithTeamCredentials(
           node,
           appname,
@@ -2549,6 +2582,7 @@ async function processAutomaticBackupInternal() {
           undefined,
           undefined,
           componentProfiles,
+          { onPrimary },
         );
         attemptDiagnostics.push(...(backupResult?.diagnostics || []));
         if (!backupResult || backupResult.status === 'failed' || !backupResult.components) {
@@ -2718,7 +2752,9 @@ async function processAutomaticBackupInternal() {
             fileCount: Number(completedStats?.file_count) || completedTaskIds.length,
             filesize: Number(completedStats?.total_size) || 0,
             stage: 'completed',
-            reason: 'All component tasks completed successfully',
+            reason: onPrimary
+              ? 'All component tasks completed successfully (profiled backup on the primary)'
+              : 'All component tasks completed successfully',
           });
 
           log.info(`Successfully processed automatic backup for ${appname}. Stored ${completedTaskIds.length} canonical tasks.`);
@@ -2975,6 +3011,7 @@ module.exports = {
   testHooks: {
     enforceAppBackupRetention,
     resolveBackupProfiles,
+    canRetryOnPrimary,
     checkpointComponent,
     claimNextAutomaticBackup,
     persistAutomaticBackupCompletion,
