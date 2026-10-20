@@ -57,6 +57,7 @@ const backupProfiles = require('../src/services/utils/backupProfiles');
 const allProfiles = require('../config/backupProfiles');
 const idService = require('../src/services/idService');
 const fluxOS = require('../src/services/fluxOsService');
+const enterpriseCrypto = require('../src/services/enterpriseCrypto');
 const backupService = require('../src/services/backupService');
 
 const { testHooks: backupHooks } = backupService;
@@ -1667,6 +1668,39 @@ async function main() {
         reply: () => ({ status: 200, headers: {}, data: { status: 'error', data: { message: 'down' } } }),
       }];
       assert.strictEqual((await askRules('vrising1790000000001')).status, 'error');
+
+      // An enterprise app registered since the last discovery sync is not in the
+      // cache and the chain's spec hides its compose: it is decrypted on demand
+      // (dragonwilds1792414545286, "Could not read the components").
+      const NEW_APP = 'dragonwilds1792414545286';
+      routes = [{
+        match: (r) => r.url.startsWith('https://api.runonflux.io/apps/appspecifications/'),
+        reply: () => success({
+          name: NEW_APP, version: 8, owner: 'owner', hash: 'h1', enterprise: 'payload', compose: [],
+        }),
+      }];
+      const realDecrypt = enterpriseCrypto.decryptEnterpriseSpecWithSas;
+      const decrypted = [];
+      enterpriseCrypto.decryptEnterpriseSpecWithSas = async (spec) => {
+        decrypted.push(spec.name);
+        return { compose: [{ name: COMPONENT, repotag: IMAGE }], contacts: [] };
+      };
+      try {
+        rules = await askRules(NEW_APP);
+        assert.strictEqual(rules.status, 'success');
+        assert.deepStrictEqual(rules.data, { [COMPONENT]: { profile: 'dragonwilds-world', clear: [] } });
+        assert.deepStrictEqual(decrypted, [NEW_APP]);
+        const decryptedProfiles = await backupHooks.resolveBackupProfiles(NEW_APP, [COMPONENT]);
+        assert.strictEqual(decryptedProfiles[COMPONENT].id, 'dragonwilds-world');
+
+        // SAS down: still an error, never "nothing to clear".
+        enterpriseCrypto.decryptEnterpriseSpecWithSas = async () => { throw new Error('SAS down'); };
+        rules = await askRules(NEW_APP);
+        assert.strictEqual(rules.status, 'error');
+        assert(/Could not read the components/.test(rules.data.message));
+      } finally {
+        enterpriseCrypto.decryptEnterpriseSpecWithSas = realDecrypt;
+      }
     } finally {
       idService.verifyUserSession = realVerifySession;
       fluxOS.verifyAppOwner = realVerifyOwner;

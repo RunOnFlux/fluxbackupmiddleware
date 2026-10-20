@@ -12,6 +12,7 @@ const messageHelper = require('./utils/messageHelper');
 const fileManager = require('./fileService');
 const fluxDrive = require('./fluxDrive');
 const fluxOS = require('./fluxOsService');
+const enterpriseCrypto = require('./enterpriseCrypto');
 const marketplaceService = require('./marketplaceService');
 const enterpriseDiscoveryCache = require('./utils/enterpriseDiscoveryCache');
 const backupProfiles = require('./utils/backupProfiles');
@@ -2392,7 +2393,9 @@ function parseJsonList(value) {
  */
 /**
  * An app's component names and their images: from the enterprise discovery
- * cache (an enterprise spec hides its compose), else from the spec.
+ * cache (an enterprise spec hides its compose), else from the spec, decrypted
+ * through SAS when it is enterprise. The cache is only filled by the daily
+ * Syncthing sync, so an app registered since the last run is not in it yet.
  *
  * @returns {Promise<{names: string[]|null, repotags: Object<string, string>}>}
  */
@@ -2408,7 +2411,15 @@ async function lookupAppComponents(appname) {
     specRepotags = parseJsonList(rows[0].repotags);
   }
   if (!specComponentNames || specComponentNames.length === 0) {
-    const spec = await fluxOS.getAppSpecs(appname);
+    let spec = await fluxOS.getAppSpecs(appname);
+    if (spec && enterpriseCrypto.isEnterpriseApp(spec) && !(Array.isArray(spec.compose) && spec.compose.length > 0)) {
+      try {
+        const decrypted = await enterpriseCrypto.decryptEnterpriseSpecWithSas(spec);
+        spec = { ...spec, compose: decrypted.compose || [] };
+      } catch (error) {
+        log.warn(`Could not decrypt the enterprise spec of ${appname}: ${getErrorMessage(error)}`);
+      }
+    }
     if (spec && Array.isArray(spec.compose) && spec.compose.length > 0) {
       specComponentNames = spec.compose.map((component) => component.name);
       specRepotags = spec.compose.map((component) => component.repotag);
