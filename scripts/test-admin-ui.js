@@ -2,8 +2,8 @@ const assert = require('assert');
 const http = require('http');
 const fs = require('fs');
 const crypto = require('crypto');
-const bitcoinMessage = require('bitcoinjs-message');
 const ethereumSigner = require('nano-ethereum-signer');
+const bitcoinMessage = require('../src/services/utils/bitcoinMessage');
 
 const secrets = require('../secrets');
 const backupService = require('../src/services/backupService');

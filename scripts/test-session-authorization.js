@@ -2,8 +2,7 @@
 const assert = require('assert');
 const crypto = require('crypto');
 const qs = require('qs');
-const bitcoinMessage = require('bitcoinjs-message');
-const zeltrezjs = require('zeltrezjs');
+const bitcoinMessage = require('../src/services/utils/bitcoinMessage');
 const idService = require('../src/services/idService');
 const backupService = require('../src/services/backupService');
 const fluxOS = require('../src/services/fluxOsService');
@@ -11,8 +10,9 @@ const log = require('../src/lib/log');
 
 function identity() {
   const privateKey = crypto.randomBytes(32);
-  const publicKey = zeltrezjs.address.privKeyToPubKey(privateKey.toString('hex'), true);
-  return { privateKey, address: zeltrezjs.address.pubKeyToAddr(publicKey, '00') };
+  const ecdh = crypto.createECDH('secp256k1');
+  ecdh.setPrivateKey(privateKey);
+  return { privateKey, address: bitcoinMessage.publicKeyToAddress(ecdh.getPublicKey(null, 'compressed')) };
 }
 
 function authenticate(message, signer) {

@@ -4,8 +4,7 @@ const axios = require('axios');
 const https = require('https');
 const appOwners = require('memory-cache');
 const qs = require('qs');
-const zeltrezjs = require('zeltrezjs');
-const bitcoinMessage = require('bitcoinjs-message');
+const bitcoinMessage = require('./utils/bitcoinMessage');
 const log = require('../lib/log');
 const Vault = require('./Vault');
 const enterpriseCrypto = require('./enterpriseCrypto');
@@ -592,15 +591,8 @@ async function getLoginPhraseDetailed(node) {
 
 function signMessage(message, pk, strMessageMagic) {
   try {
-    let privKey = pk;
-    if (privKey.length !== 64) {
-      privKey = zeltrezjs.address.WIFToPrivKey(privKey);
-    }
-    const privateKey = Buffer.from(privKey, 'hex');
-
-    // Use bitcoinMessage.sign instead of zeltrezjs.message.sign
+    const privateKey = bitcoinMessage.privateKeyFromString(pk);
     const signature = bitcoinMessage.sign(message, privateKey, true, strMessageMagic);
-    // bitcoinMessage.sign returns a Buffer, convert to base64 string
     return signature.toString('base64');
   } catch (e) {
     log.error(`Error signing message: ${e.message}`, { stack: e.stack });
@@ -1836,6 +1828,7 @@ module.exports = {
   createBackupTaskWithTeamCredentials,
   isExplicitAuthorizationFailure,
   testHooks: {
+    signMessage,
     listVolumeFolder,
     ensureVolumeFolder,
     removeVolumeObject,

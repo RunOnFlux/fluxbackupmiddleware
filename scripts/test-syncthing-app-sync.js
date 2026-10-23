@@ -35,6 +35,7 @@ async function testIdempotentUpsert() {
     },
   };
 
+  const startedAt = Date.now();
   const result = await testHooks.upsertAutomaticBackupApp(database, {
     appName: 'palworld1788433315709',
     componentNames: ['palworld'],
@@ -42,11 +43,14 @@ async function testIdempotentUpsert() {
 
   assert.strictEqual(result.affectedRows, 2);
   assert.match(capturedSql, /ON DUPLICATE KEY UPDATE/);
-  assert.deepStrictEqual(capturedParams, [
+  assert.strictEqual(capturedParams.length, 4);
+  assert.deepStrictEqual(capturedParams.slice(0, 3), [
     'palworld1788433315709',
     '["palworld"]',
     1,
   ]);
+  assert(Number.isSafeInteger(capturedParams[3]));
+  assert(capturedParams[3] >= startedAt && capturedParams[3] <= Date.now());
 }
 
 async function testPerRecordFailureIsolation() {
