@@ -1,0 +1,388 @@
+const defaultProfiles = require('../../../config/backupProfiles');
+
+/**
+ * Empty directory created at the root of appdata and archived with a profile's
+ * paths. Archiving it makes appdata the archive's common parent, so members keep
+ * their appdata-relative names (RSDragonwilds/Saved/...), exactly as in a full
+ * backup. Without it the root would move down to the deepest folder the listed
+ * paths share. Its presence also marks an archive as partial.
+ */
+const PROFILE_MARKER_DIR = '.flux-backup';
+
+const pattern = (source) => (source ? new RegExp(source, 'i') : null);
+
+/**
+ * Whether a profile's `match` names this component. The games hub's rule
+ * (catalog.js appMatchesEntry), applied to one component rather than to the
+ * whole app: any one criterion is enough, and the app's name counts only when
+ * the app has no other component it could mean.
+ *
+ * @param {object} match - { name, component, repotag }, regular expression sources
+ * @param {object} target
+ * @param {string} target.appname
+ * @param {string} target.component
+ * @param {string|null} target.repotag - null when it is not known
+ * @param {number} target.componentCount - how many components the app has
+ */
+function matchesComponent(match, {
+  appname, component, repotag, componentCount,
+}) {
+  const m = match || {};
+  const byComponent = pattern(m.component);
+  const byImage = pattern(m.repotag);
+  const byName = pattern(m.name);
+  if (byComponent && byComponent.test(String(component || ''))) return true;
+  if (byImage && repotag && byImage.test(String(repotag))) return true;
+  return Boolean(byName && componentCount === 1 && byName.test(String(appname || '')));
+}
+
+function profileForComponent(target, profiles = defaultProfiles) {
+  return profiles.find((profile) => matchesComponent(profile.match, target)) || null;
+}
+
+/**
+ * The profile for every component, or null when any component has none.
+ *
+ * All or nothing because a node backs up a whole app in one stop: mixing a
+ * profiled archive with appendbackuptask would stop the app for the full
+ * archive anyway and save nothing.
+ *
+ * @param {string} appname
+ * @param {string[]} componentNames - the components being backed up
+ * @param {object} [known]
+ * @param {Object<string, string>} [known.repotags] - component name -> repotag, where known
+ * @param {number} [known.componentCount] - how many components the app has, when
+ *   known; otherwise the components being backed up are taken to be all of them
+ * @returns {Object<string, object>|null} component name -> profile
+ */
+function resolveComponentProfiles(appname, componentNames, known = {}, profiles = defaultProfiles) {
+  if (!Array.isArray(componentNames) || componentNames.length === 0) return null;
+  const repotags = known.repotags || {};
+  const componentCount = known.componentCount || componentNames.length;
+  const result = {};
+  for (let i = 0; i < componentNames.length; i += 1) {
+    const profile = profileForComponent({
+      appname,
+      component: componentNames[i],
+      repotag: repotags[componentNames[i]] || null,
+      componentCount,
+    }, profiles);
+    if (!profile) return null;
+    result[componentNames[i]] = profile;
+  }
+  return result;
+}
+
+/**
+ * The most folders of one `children` entry that are listed one level deeper.
+ * A world folder is one per world, so a handful is normal; past this the
+ * entry is not checked and the full backup is taken instead.
+ */
+const MAX_CHILD_FOLDERS = 20;
+
+const parentOf = (entryPath) => {
+  const slash = entryPath.lastIndexOf('/');
+  return slash === -1 ? '' : entryPath.slice(0, slash);
+};
+const baseName = (entryPath) => entryPath.slice(entryPath.lastIndexOf('/') + 1);
+/** A path under a profile entry's; an entry's path is '' for appdata itself. */
+const joinPath = (folder, name) => (folder ? `${folder}/${name}` : String(name));
+/** `latestWithin`'s folder inside a child folder: the child itself when its path is ''. */
+const withinPath = (folder, latestPath) => (latestPath ? `${folder}/${latestPath}` : folder);
+
+/**
+ * The most entries FluxOS's compressobject takes in one list
+ * (fileSystemManager.js MAX_ARCHIVE_SOURCES). A plan naming more is refused
+ * here, so the backup goes straight to the full archive rather than through a
+ * request the node would turn down.
+ */
+const MAX_ARCHIVE_SOURCES = 1000;
+
+/**
+ * One folder of a `children` entry with `excludeWithin`: what it holds less
+ * what is left out, each kept folder listed in turn (undefined past
+ * MAX_CHILD_FOLDERS, which the plan refuses), and `latestWithin`'s folder.
+ */
+async function listWithin(entry, folder, item, inside, listOnce) {
+  const leftOut = (child) => entry.excludeWithin.test(String(child.name));
+  const children = [];
+  let folders = 0;
+  const kept = inside.filter((child) => child && !leftOut(child));
+  for (let k = 0; k < kept.length; k += 1) {
+    const child = kept[k];
+    if (child.isDirectory) {
+      folders += 1;
+      children.push({
+        ...child,
+        // eslint-disable-next-line no-await-in-loop
+        children: folders <= MAX_CHILD_FOLDERS ? ((await listOnce(`${folder}/${child.name}`)) || []) : undefined,
+      });
+    } else {
+      children.push(child);
+    }
+  }
+  const result = { ...item, children, excludedChildren: inside.filter((child) => child && leftOut(child)) };
+  if (entry.latestWithin) {
+    result.latestCandidates = (await listOnce(withinPath(folder, entry.latestWithin.path))) || [];
+  }
+  return result;
+}
+
+/**
+ * List what the node holds for each of a profile's entries.
+ *
+ * @param {object} profile
+ * @param {function(string): Promise<Array|null>} list - lists a folder relative
+ *   to appdata ('' for appdata itself): its getfolderinfo entries, or null when
+ *   it does not exist; throws when the node cannot answer
+ * @returns {Promise<Object<string, Array|object|null>>} entry path -> its listing
+ *   (an array), or for a `file` entry its own getfolderinfo entry; null when
+ *   missing. A `children` entry's folders carry their own listing as `children`
+ *   (undefined past MAX_CHILD_FOLDERS). With `excludeWithin`, what it leaves out
+ *   of a folder is under `excludedChildren` instead, the kept folders inside are
+ *   listed in turn, and with `latestWithin` the folder it names is under
+ *   `latestCandidates`
+ */
+async function collectProfileListings(profile, list) {
+  const listed = new Map();
+  const listOnce = (folder) => {
+    if (!listed.has(folder)) listed.set(folder, list(folder));
+    return listed.get(folder);
+  };
+  const listings = {};
+  for (let i = 0; i < profile.include.length; i += 1) {
+    const entry = profile.include[i];
+    // One at a time, on purpose: each is a request to a node that is serving
+    // its own app, and they are a handful.
+    if (entry.file) {
+      // eslint-disable-next-line no-await-in-loop
+      const siblings = await listOnce(parentOf(entry.path));
+      listings[entry.path] = (siblings || [])
+        .find((item) => item && item.isFile && item.name === baseName(entry.path)) || null;
+      // eslint-disable-next-line no-continue
+      continue;
+    }
+    // eslint-disable-next-line no-await-in-loop
+    let listing = await listOnce(entry.path);
+    if (Array.isArray(listing) && entry.children) {
+      const excluded = (item) => Boolean(entry.excludeChildren && entry.excludeChildren.test(String(item.name)));
+      const kept = listing.filter((item) => item && !excluded(item));
+      const leftOut = listing.filter((item) => item && excluded(item));
+      let folders = 0;
+      listing = [];
+      // What was left out, for `minSavedShare`; not enumerable, so sameListings
+      // never compares it (logs and caches change all the time).
+      Object.defineProperty(listing, 'leftOut', { value: leftOut, enumerable: false });
+      for (let j = 0; j < kept.length; j += 1) {
+        const item = kept[j];
+        if (item.isDirectory && folders < MAX_CHILD_FOLDERS) {
+          folders += 1;
+          const folder = joinPath(entry.path, item.name);
+          // eslint-disable-next-line no-await-in-loop
+          const inside = (await listOnce(folder)) || [];
+          if (entry.excludeWithin) {
+            // eslint-disable-next-line no-await-in-loop
+            listing.push(await listWithin(entry, folder, item, inside, listOnce));
+          } else {
+            listing.push({ ...item, children: inside });
+          }
+        } else {
+          listing.push(item);
+        }
+      }
+    }
+    listings[entry.path] = listing;
+  }
+  return listings;
+}
+
+/**
+ * The newest non-empty file of a listing whose name matches, leaving out one
+ * modified within `settledMs`: a file that is still being written. With
+ * `directory`, the newest folder instead.
+ */
+function newestSettledFile(listing, { name, settledMs = 0, directory = false }, now) {
+  const time = (item) => {
+    const parsed = Date.parse(item.modifiedAt);
+    return Number.isFinite(parsed) ? parsed : 0;
+  };
+  return listing
+    .filter((item) => item && (directory ? item.isDirectory : item.isFile) && Number(item.size) > 0 && name.test(String(item.name)))
+    .filter((item) => !settledMs || now - time(item) >= settledMs)
+    .sort((a, b) => (time(b) - time(a)) || String(b.name).localeCompare(String(a.name)))[0] || null;
+}
+
+/**
+ * Decide what to archive from the node's listings of the profile's paths.
+ *
+ * @param {object} profile
+ * @param {Object<string, Array|object|null>} listings - from collectProfileListings
+ * @param {number} [now] - the time `latest` measures settledMs from
+ * @returns {{fits: true, sources: string[], bytes: number} | {fits: false, reason: string, unsettled?: true}}
+ *   sources are relative to the VOLUME root, as compressobject takes them, and
+ *   bytes what they hold as listed;
+ *   unsettled when an entry's `validate` found its files still arriving
+ */
+function planProfiledArchive(profile, listings, now = Date.now()) {
+  const sources = [`appdata/${PROFILE_MARKER_DIR}`];
+  // What the sources hold, as listed: a folder's size counts all it holds.
+  let bytes = 0;
+  const add = (source, size) => {
+    sources.push(source);
+    bytes += Number(size) || 0;
+  };
+  for (let i = 0; i < profile.include.length; i += 1) {
+    const entry = profile.include[i];
+    const listing = listings[entry.path];
+    const exists = entry.file ? Boolean(listing) : Array.isArray(listing);
+    if (!exists) {
+      if (entry.required) {
+        return { fits: false, reason: `${entry.path} does not exist` };
+      }
+      // eslint-disable-next-line no-continue
+      continue;
+    }
+    if (entry.file) {
+      add(`appdata/${entry.path}`, listing.size);
+      // eslint-disable-next-line no-continue
+      continue;
+    }
+    if (entry.mustContain) {
+      const matched = listing.some((file) => file && file.isFile
+        && Number(file.size) > 0 && entry.mustContain.test(String(file.name)));
+      if (!matched) {
+        return { fits: false, reason: `${entry.path} holds no non-empty file matching ${entry.mustContain}` };
+      }
+    }
+    if (entry.children && listing.some((item) => item.isDirectory && (item.children === undefined
+      || (entry.excludeWithin && item.children.some((child) => child.isDirectory && child.children === undefined))))) {
+      return { fits: false, reason: `${entry.path} holds more than ${MAX_CHILD_FOLDERS} folders to check` };
+    }
+    if (entry.validate) {
+      const problem = entry.validate(listing, now);
+      if (problem) {
+        const { reason, unsettled } = typeof problem === 'string' ? { reason: problem } : problem;
+        return { fits: false, reason: `${entry.path}: ${reason}`, ...(unsettled ? { unsettled: true } : {}) };
+      }
+    }
+    if (entry.latest) {
+      const newest = newestSettledFile(listing, entry.latest, now);
+      if (newest) add(`appdata/${entry.path}/${newest.name}`, newest.size);
+      else if (entry.required) return { fits: false, reason: `${entry.path} holds no settled file matching ${entry.latest.name}` };
+    } else if (entry.children) {
+      if (!listing.length && entry.required) return { fits: false, reason: `${entry.path} holds nothing to archive` };
+      listing.forEach((item) => {
+        const itemPath = joinPath(entry.path, item.name);
+        if (!(item.isDirectory && entry.excludeWithin)) {
+          add(`appdata/${itemPath}`, item.size);
+          return;
+        }
+        // Only what is kept inside, each on its own, so a restore replaces
+        // those and leaves what was left out where it is. With `splitWithin`
+        // a kept folder goes in as what it holds too, so tar never reads a
+        // folder whose files the game renames while it is being archived.
+        item.children.forEach((child) => {
+          if (entry.splitWithin && child.isDirectory) {
+            child.children
+              .filter((inner) => inner && !entry.excludeWithin.test(String(inner.name)))
+              .forEach((inner) => add(`appdata/${itemPath}/${child.name}/${inner.name}`, inner.size));
+            return;
+          }
+          add(`appdata/${itemPath}/${child.name}`, child.size);
+        });
+        if (entry.latestWithin) {
+          const newest = newestSettledFile(item.latestCandidates || [], entry.latestWithin, now);
+          if (newest) add(`appdata/${withinPath(itemPath, entry.latestWithin.path)}/${newest.name}`, newest.size);
+        }
+      });
+    } else {
+      add(`appdata/${entry.path}`, listing.reduce((sum, item) => sum + (Number(item?.size) || 0), 0));
+    }
+  }
+  if (profile.minSavedShare) {
+    // Measured over the `children` entries, whose listings give the size of
+    // both what is kept and what is left out.
+    const sizeOf = (items) => items.reduce((sum, item) => sum + (Number(item.size) || 0), 0);
+    let saved = 0;
+    let total = 0;
+    profile.include.filter((entry) => entry.children && Array.isArray(listings[entry.path])).forEach((entry) => {
+      const listing = listings[entry.path];
+      const leftOut = sizeOf(listing.leftOut || []);
+      saved += leftOut;
+      total += leftOut + sizeOf(listing);
+    });
+    if (total > 0 && saved / total < profile.minSavedShare) {
+      return { fits: false, reason: `it would leave out only ${Math.round((100 * saved) / total)}% of the volume` };
+    }
+  }
+  if (sources.length > MAX_ARCHIVE_SOURCES) {
+    return { fits: false, reason: `it would archive ${sources.length} entries, more than compressobject takes (${MAX_ARCHIVE_SOURCES})` };
+  }
+  return { fits: true, sources, bytes };
+}
+
+/**
+ * Whether two collectProfileListings results describe the same files: every
+ * entry, and the listed folders inside it, by name, kind, size and modifiedAt.
+ * A folder's size counts all it holds, so a file written deeper still shows. A
+ * folder whose contents are listed is compared by them alone: its size and
+ * time also count what `excludeWithin` leaves out (the game's own rotating
+ * snapshots, rewritten every minute), which is not archived. `latestWithin`'s
+ * candidates are not compared either; the one archived is a settled one.
+ * Taken before and after the archive is written, a difference means the volume
+ * changed meanwhile (Syncthing delivering a save) and the archive may hold
+ * half of it.
+ *
+ * A file whose name matches `ignore` (a profile's `ignoreChanges`) is left out
+ * of the comparison: one the game replaces whole every few seconds whatever
+ * happens in the world, which would otherwise never let two listings agree.
+ */
+function sameListings(before, after, ignore = null) {
+  const describe = (listings) => {
+    const lines = [];
+    const add = (where, item) => {
+      if (!item) return;
+      if (ignore && !item.isDirectory && ignore.test(String(item.name))) return;
+      if (Array.isArray(item.children)) {
+        lines.push([where, item.name, 'd'].join('|'));
+        item.children.forEach((child) => add(`${where}/${item.name}`, child));
+        return;
+      }
+      lines.push([where, item.name, item.isDirectory ? 'd' : 'f', item.size, item.modifiedAt].join('|'));
+    };
+    Object.keys(listings).forEach((entryPath) => {
+      const listing = listings[entryPath];
+      if (Array.isArray(listing)) listing.forEach((item) => add(entryPath, item));
+      else if (listing) add(entryPath, listing);
+      else lines.push(`${entryPath}|missing`);
+    });
+    return lines.sort().join('\n');
+  };
+  return describe(before) === describe(after);
+}
+
+/**
+ * A profile's `restoreClear`, as the restore side takes it: plain strings.
+ *
+ * @returns {Array<{folder: string, name: string, flags: string}>}
+ */
+function restoreClearRules(profile) {
+  return (profile.restoreClear || []).map((rule) => ({
+    folder: rule.folder,
+    name: rule.name.source,
+    flags: rule.name.flags.replace(/[gy]/g, ''),
+  }));
+}
+
+module.exports = {
+  PROFILE_MARKER_DIR,
+  MAX_CHILD_FOLDERS,
+  MAX_ARCHIVE_SOURCES,
+  matchesComponent,
+  profileForComponent,
+  resolveComponentProfiles,
+  collectProfileListings,
+  planProfiledArchive,
+  sameListings,
+  restoreClearRules,
+};

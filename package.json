@@ -5,7 +5,10 @@
   "main": "index.js",
   "scripts": {
     "test": "node index.js",
+    "test:session-authorization": "node scripts/test-session-authorization.js",
+    "test:wallet-compatibility": "node scripts/test-wallet-compatibility.js",
     "test:automatic-backup-dispatch": "node scripts/test-automatic-backup-dispatch.js",
+    "test:backup-profiles": "node scripts/test-backup-profiles.js",
     "test:concurrent-downloads": "node scripts/test-concurrent-task-downloads.js",
     "test:db-client-resilience": "node scripts/test-db-client-resilience.js",
     "test:daily-backup-report": "node scripts/test-daily-backup-report.js",
@@ -34,19 +37,20 @@
   "author": "Ali Mahdavi",
   "license": "ISC",
   "dependencies": {
-    "axios": "^1.18.0",
-    "bitcoinjs-message": "^2.2.0",
-    "body-parser": "^1.20.6",
+    "@noble/curves": "^1.9.7",
+    "axios": "^1.20.0",
+    "bech32": "^2.0.0",
+    "body-parser": "^1.20.9",
+    "bs58check": "^3.0.1",
     "cors": "^2.8.5",
     "dotenv": "^16.4.1",
-    "express": "^4.19.2",
+    "express": "^4.22.3",
     "express-rate-limit": "^7.1.5",
     "form-data": "^4.0.6",
     "memory-cache": "^0.2.0",
-    "mysql2": "^3.9.8",
+    "mysql2": "^3.24.6",
     "nano-ethereum-signer": "^0.1.2",
-    "qs": "^6.11.2",
-    "zeltrezjs": "^2.12.0"
+    "qs": "^6.16.1"
   },
   "devDependencies": {
     "@babel/eslint-parser": "^7.22.15",

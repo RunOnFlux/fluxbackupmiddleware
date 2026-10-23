@@ -12,8 +12,10 @@ const messageHelper = require('./utils/messageHelper');
 const fileManager = require('./fileService');
 const fluxDrive = require('./fluxDrive');
 const fluxOS = require('./fluxOsService');
+const enterpriseCrypto = require('./enterpriseCrypto');
 const marketplaceService = require('./marketplaceService');
 const enterpriseDiscoveryCache = require('./utils/enterpriseDiscoveryCache');
+const backupProfiles = require('./utils/backupProfiles');
 const discordNotifier = require('./discordNotifier');
 const dailyBackupReport = require('./utils/dailyBackupReport');
 const {
@@ -1454,12 +1456,14 @@ async function registerBackupTask(req, res, taskObj = null) {
   let filesize;
   let owner;
   let backupType;
+  let backupProfile = null;
 
   // If taskObj is provided, use its values; otherwise extract from request
   if (taskObj) {
     ({
       appname, component, timestamp, host, filesize, owner, filename, backup_type: backupType,
     } = taskObj);
+    backupProfile = taskObj.backup_profile || null;
     // Default to 'manual' if not specified in taskObj
     backupType = backupType || 'manual';
   } else {
@@ -1559,6 +1563,7 @@ async function registerBackupTask(req, res, taskObj = null) {
       const newTask = {
         owner, timestamp, filename, appname, component, filesize, host, extra, appExpireHeight, backup_type: backupType,
       };
+      if (backupProfile) newTask.backup_profile = backupProfile;
       const result = await dbCli.addNewTask(newTask);
       taskId = result.insertId;
       if (!taskId) {
@@ -1592,6 +1597,21 @@ async function registerBackupTask(req, res, taskObj = null) {
  * @param {Object} res - The response object.
  * @throws Will throw an error if the user session is invalid, application name is invalid, or database operation fails.
  */
+/**
+ * One component of a checkpoint as getbackuplist returns it. `profile` names
+ * the backup profile a partial archive was taken with, and is absent on a full
+ * one: a client restoring a partial archive must not clear appdata first.
+ */
+function checkpointComponent(row) {
+  const entry = {
+    component: row.component,
+    file_url: `https://jetpack2_38080.app.runonflux.io/ipfs/${row.hash}`,
+    file_size: row.filesize,
+  };
+  if (row.backup_profile) entry.profile = row.backup_profile;
+  return entry;
+}
+
 async function getBackupList(req, res) {
   let { appname } = req.body || {};
   appname = appname || (req.query || {}).appname;
@@ -1643,12 +1663,12 @@ async function getBackupList(req, res) {
       let i = 0;
       for (; i < result.length; i += 1) {
         if (Object.prototype.hasOwnProperty.call(temp, result[i].timestamp)) {
-          temp[result[i].timestamp].components.push({ component: result[i].component, file_url: `https://jetpack2_38080.app.runonflux.io/ipfs/${result[i].hash}`, file_size: result[i].filesize });
+          temp[result[i].timestamp].components.push(checkpointComponent(result[i]));
         } else {
           if (i > 0) {
             checkpoints.push({ timestamp: result[i - 1].timestamp, components: temp[result[i - 1].timestamp].components });
           }
-          temp[result[i].timestamp] = { components: [{ component: result[i].component, file_url: `https://jetpack2_38080.app.runonflux.io/ipfs/${result[i].hash}`, file_size: result[i].filesize }] };
+          temp[result[i].timestamp] = { components: [checkpointComponent(result[i])] };
         }
       }
       checkpoints.push({ timestamp: result[i - 1].timestamp, components: temp[result[i - 1].timestamp].components });
@@ -1687,7 +1707,6 @@ async function getTaskStatus(req, res) {
     if (!taskId) {
       throw new Error('taskId not provided.');
     }
-    console.log(taskQueue.entries());
     let task = taskQueue.get(Number(taskId));
     if (!task) {
       task = await dbCli.getTask(taskId);
@@ -1695,6 +1714,9 @@ async function getTaskStatus(req, res) {
 
     if (!task) {
       throw new Error('task does not exist.');
+    }
+    if (task.owner !== owner && !await fluxOS.isTeamFluxId(owner)) {
+      throw new Error('Unauthorized. Access denied.');
     }
     res.json({ status: 'success', data: { taskId: task.taskId, status: task.status } });
   } catch (error) {
@@ -2347,6 +2369,160 @@ async function persistAutomaticBackupCompletion(
   }]);
 }
 
+function parseJsonList(value) {
+  if (Array.isArray(value)) return value;
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : null;
+    } catch (error) {
+      return null;
+    }
+  }
+  return null;
+}
+
+/**
+ * The backup profile of each component of an app, or null for a full backup.
+ *
+ * Matched by the app's and the components' names, which the middleware always
+ * has, and by the images where they are known: from the enterprise discovery
+ * cache, which holds the decrypted specs, or from the public spec otherwise.
+ * An enterprise spec read from the chain has an empty compose, so the images
+ * are a help and never a requirement. Never throws: a profile only ever
+ * narrows what is archived, so when it cannot be resolved the full backup is
+ * the safe answer.
+ */
+/**
+ * An app's component names and their images: from the enterprise discovery
+ * cache (an enterprise spec hides its compose), else from the spec, decrypted
+ * through SAS when it is enterprise. The cache is only filled by the daily
+ * Syncthing sync, so an app registered since the last run is not in it yet.
+ *
+ * @returns {Promise<{names: string[]|null, repotags: Object<string, string>}>}
+ */
+async function lookupAppComponents(appname) {
+  let specComponentNames = null;
+  let specRepotags = null;
+  const rows = await dbCli.execute(
+    'SELECT components, repotags FROM enterprise_app_discovery WHERE appname = ?',
+    [appname],
+  );
+  if (rows.length > 0) {
+    specComponentNames = parseJsonList(rows[0].components);
+    specRepotags = parseJsonList(rows[0].repotags);
+  }
+  if (!specComponentNames || specComponentNames.length === 0) {
+    let spec = await fluxOS.getAppSpecs(appname);
+    if (spec && enterpriseCrypto.isEnterpriseApp(spec) && !(Array.isArray(spec.compose) && spec.compose.length > 0)) {
+      try {
+        const decrypted = await enterpriseCrypto.decryptEnterpriseSpecWithSas(spec);
+        spec = { ...spec, compose: decrypted.compose || [] };
+      } catch (error) {
+        log.warn(`Could not decrypt the enterprise spec of ${appname}: ${getErrorMessage(error)}`);
+      }
+    }
+    if (spec && Array.isArray(spec.compose) && spec.compose.length > 0) {
+      specComponentNames = spec.compose.map((component) => component.name);
+      specRepotags = spec.compose.map((component) => component.repotag);
+    } else if (spec && spec.repotag) {
+      specComponentNames = [spec.name];
+      specRepotags = [spec.repotag];
+    }
+  }
+  const repotags = {};
+  (specComponentNames || []).forEach((name, index) => {
+    if (specRepotags && specRepotags[index]) repotags[name] = specRepotags[index];
+  });
+  return { names: specComponentNames, repotags };
+}
+
+async function resolveBackupProfiles(appname, componentList) {
+  try {
+    const { names: specComponentNames, repotags } = await lookupAppComponents(appname);
+    const profiles = backupProfiles.resolveComponentProfiles(appname, componentList, {
+      repotags,
+      componentCount: specComponentNames ? specComponentNames.length : null,
+    });
+    if (profiles) {
+      log.info(`Backup profiles for ${appname}: ${Object.entries(profiles).map(([component, profile]) => `${component}=${profile.id}`).join(', ')}`);
+    }
+    return profiles;
+  } catch (error) {
+    log.warn(`Could not resolve backup profiles for ${appname}, taking the full backup: ${getErrorMessage(error)}`);
+    return null;
+  }
+}
+
+/**
+ * What a restore of a partial ("World & settings") archive must clear besides
+ * the entries it replaces, per component of the app: the game state a profile
+ * leaves out of a folder it splits, which would otherwise stay beside the
+ * restored files and be loaded in their place (V Rising's newer autosaves).
+ * The hub and the cloud UI ask for it before every partial restore.
+ *
+ * Answers { status: 'success', data: { <component>: { profile, clear: [{ folder, name, flags }] } } },
+ * with only the components that have a profile; `folder` is relative to
+ * appdata, `*` standing for one path segment, and name/flags a RegExp.
+ */
+async function getRestoreRules(req, res) {
+  let { appname } = req.body || {};
+  appname = appname || (req.query || {}).appname;
+  try {
+    const owner = await idService.verifyUserSession(req.headers);
+    if (owner === false) {
+      throw new Error('Unauthorized access. Session expired.');
+    }
+    if (!appname) {
+      throw new Error('Invalid appname.');
+    }
+    if (!await fluxOS.verifyAppOwner(owner, appname)) {
+      throw new Error('Unauthorized. Access denied.');
+    }
+    // Not resolveBackupProfiles, which reads any failure as "no profile": an
+    // answer with no rules would let a restore leave the newer saves in place.
+    const { names, repotags } = await lookupAppComponents(appname);
+    if (!names || names.length === 0) {
+      throw new Error(`Could not read the components of ${appname}.`);
+    }
+    const profiles = backupProfiles.resolveComponentProfiles(appname, names, {
+      repotags,
+      componentCount: names.length,
+    }) || {};
+    const data = {};
+    Object.entries(profiles).forEach(([component, profile]) => {
+      data[component] = { profile: profile.id, clear: backupProfiles.restoreClearRules(profile) };
+    });
+    res.set('Cache-Control', 'no-store');
+    res.json({ status: 'success', data });
+  } catch (error) {
+    log.error(`getrestorerules failed: app=${appname || 'missing'}, message=${error.message}`);
+    const errMessage = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    if (!res.headersSent) {
+      res.json(errMessage);
+    }
+  }
+}
+
+/** Failures of the secondary node itself, which the primary may not share. */
+const PRIMARY_FALLBACK_STAGES = ['node_selection', 'node_auth', 'create_backup'];
+
+/**
+ * Whether the last attempt goes to the primary: only for an app whose every
+ * component has a backup profile marked `primarySafe`, whose partial archive
+ * is taken without stopping the server and cannot be caught half-way through
+ * a save there, and only after a failure of the secondary node. A file that
+ * the node made but that could not be queued would fail on the primary the
+ * same way; one the node never made is the node's failure.
+ */
+function canRetryOnPrimary(componentProfiles, lastFailure) {
+  return Boolean(componentProfiles)
+    && Object.values(componentProfiles).every((profile) => profile && profile.primarySafe === true)
+    && Boolean(lastFailure)
+    && PRIMARY_FALLBACK_STAGES.includes(lastFailure.stage)
+    && (lastFailure.taskFailures || []).every((failure) => failure.nodeSide === true);
+}
+
 async function processAutomaticBackupInternal() {
   const maxRetries = 3;
   let retryCount = 0;
@@ -2423,21 +2599,39 @@ async function processAutomaticBackupInternal() {
 
     log.info(`Processing automatic backup for app: ${appname} (marketplace=${Number(isMarketplace) === 1}, intervalHours=${scheduleHours})`);
 
+    const componentProfiles = await resolveBackupProfiles(appname, componentList);
+
     // Retry loop for node operations
     while (retryCount < maxRetries) {
       const attemptDiagnostics = [];
+      const onPrimary = retryCount === maxRetries - 1
+        && canRetryOnPrimary(componentProfiles, lastFailure);
       try {
-        // Get secondary node from HAProxy
-        const nodeSelection = await fluxOS.getSecondaryNodeSelection(appname, attemptedNodes);
-        attemptDiagnostics.push(...nodeSelection.diagnostics);
-        const nodeAddress = nodeSelection.node;
-        if (!nodeAddress) {
-          throw createBackupFailure(
-            nodeSelection.reason || `Failed to get secondary node for ${appname}`,
-            'node_selection',
-            [],
-            attemptDiagnostics,
-          );
+        let nodeAddress;
+        if (onPrimary) {
+          log.info(`Secondary nodes failed for ${appname}; last attempt on the primary with its backup profile`);
+          nodeAddress = await fluxOS.getPrimaryNodeAddress(appname, attemptDiagnostics);
+          if (!nodeAddress) {
+            throw createBackupFailure(
+              `Failed to identify the primary node of ${appname} for the profiled backup`,
+              'node_selection',
+              [],
+              attemptDiagnostics,
+            );
+          }
+        } else {
+          // Get secondary node from HAProxy
+          const nodeSelection = await fluxOS.getSecondaryNodeSelection(appname, attemptedNodes);
+          attemptDiagnostics.push(...nodeSelection.diagnostics);
+          nodeAddress = nodeSelection.node;
+          if (!nodeAddress) {
+            throw createBackupFailure(
+              nodeSelection.reason || `Failed to get secondary node for ${appname}`,
+              'node_selection',
+              [],
+              attemptDiagnostics,
+            );
+          }
         }
 
         const node = `http://${nodeAddress}`;
@@ -2462,6 +2656,10 @@ async function processAutomaticBackupInternal() {
           node,
           appname,
           componentList,
+          undefined,
+          undefined,
+          componentProfiles,
+          { onPrimary },
         );
         attemptDiagnostics.push(...(backupResult?.diagnostics || []));
         if (!backupResult || backupResult.status === 'failed' || !backupResult.components) {
@@ -2493,6 +2691,7 @@ async function processAutomaticBackupInternal() {
               owner,
               filename: componentData.backups.name,
               backup_type: 'automatic',
+              backup_profile: componentData.profile || null,
             };
 
             try {
@@ -2529,6 +2728,7 @@ async function processAutomaticBackupInternal() {
               component: componentData.component,
               message: componentData.error || 'Backup file was not found on the Flux node after creation',
               fails: 0,
+              nodeSide: true,
             });
           }
         }
@@ -2630,7 +2830,9 @@ async function processAutomaticBackupInternal() {
             fileCount: Number(completedStats?.file_count) || completedTaskIds.length,
             filesize: Number(completedStats?.total_size) || 0,
             stage: 'completed',
-            reason: 'All component tasks completed successfully',
+            reason: onPrimary
+              ? 'All component tasks completed successfully (profiled backup on the primary)'
+              : 'All component tasks completed successfully',
           });
 
           log.info(`Successfully processed automatic backup for ${appname}. Stored ${completedTaskIds.length} canonical tasks.`);
@@ -2873,6 +3075,7 @@ module.exports = {
   getDatabase: () => dbCli,
   registerBackupTask,
   getBackupList,
+  getRestoreRules,
   getTaskStatus,
   removeCheckpoint,
   syncSyncthingApps,
@@ -2886,6 +3089,9 @@ module.exports = {
   forceSyncSyncthingApps,
   testHooks: {
     enforceAppBackupRetention,
+    resolveBackupProfiles,
+    canRetryOnPrimary,
+    checkpointComponent,
     claimNextAutomaticBackup,
     persistAutomaticBackupCompletion,
     runAutomaticBackupDispatcher,

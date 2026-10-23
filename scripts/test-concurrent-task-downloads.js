@@ -40,6 +40,7 @@ async function close(server) {
 
 async function main() {
   config.storagePath = storageRoot;
+  config.storageMinimumFreeGb = 0;
   fluxOS.verifyTeamLogin = async () => 'test-auth';
   Vault.getKey = async () => 'test-secret';
   log.info = () => {};

@@ -44,6 +44,7 @@ function registerRoutes(app) {
   app.post('/verifylogin', asyncRoute(idService.verifyLogin));
   app.post('/registerbackupfile', asyncRoute(backupService.registerBackupTask));
   app.get('/getbackuplist', asyncRoute(backupService.getBackupList));
+  app.get('/getrestorerules', asyncRoute(backupService.getRestoreRules));
   app.get('/getTaskStatus', asyncRoute(backupService.getTaskStatus));
   app.post('/removeCheckpoint', asyncRoute(backupService.removeCheckpoint));
   app.get('/getfile', asyncRoute(fluxDrive.getFile));

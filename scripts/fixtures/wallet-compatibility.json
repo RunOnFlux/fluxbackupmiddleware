@@ -1,0 +1,119 @@
+{
+  "privateKey": "0000000000000000000000000000000000000000000000000000000000000001",
+  "wifCompressed": "KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU73sVHnoWn",
+  "wifUncompressed": "5HpHagT65TZzG1PH3CSu63k8DbpvD8s5ip4nEB3kEsreAnchuDf",
+  "vectors": [
+    {
+      "message": "Flux Backup wallet compatibility test",
+      "compressed": true,
+      "publicKey": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "address": "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
+      "prefix": null,
+      "signature": "H5K1/u/Enlxu+RPo1mz1mnMBEADliBZJuN+/weXyAAlzI/85eEZFAw8ENjkcJFnCkNDg1gO2YtwjYNZSyHO96Uw="
+    },
+    {
+      "message": "Flux Backup wallet compatibility test",
+      "compressed": true,
+      "publicKey": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "address": "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
+      "prefix": "\u0018Flux Signed Message:\n",
+      "signature": "HwzLd2dzcf9qG7XBQ2j5qd7wxsWPtOvunBgEoR6PelMQYgGeOgdkDCFLXRNCAzEuO7uOna6Qmaiqfk4SoE78nbE="
+    },
+    {
+      "message": "Flux backup Grüß dich 🌍",
+      "compressed": true,
+      "publicKey": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "address": "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
+      "prefix": null,
+      "signature": "ICwCfCevwS5RliKCn296YJXowPkbGMd9BSiYTnbRNq/3BZIFWzL8L57ZWAQIUMITsWzn+SqdU/dm+0JBe6zzP5A="
+    },
+    {
+      "message": "Flux backup Grüß dich 🌍",
+      "compressed": true,
+      "publicKey": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "address": "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
+      "prefix": "\u0018Flux Signed Message:\n",
+      "signature": "IP1x3tcoPZZDsC1UjocBP2x7OYkqMEauUlMnbzJlq79LL+nfiSp2NS0OdvUUgIXGHh/+8uvwH8gPcZ7AIiBR1l0="
+    },
+    {
+      "message": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "compressed": true,
+      "publicKey": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "address": "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
+      "prefix": null,
+      "signature": "IBLBkr8WtWpmpgY+qwfNyTxB102lcO26sUVgxtPS53SKIt8hRC/lGzLkj3i9SmtX2jeuQ8YURTSMK9Qil6KJgO4="
+    },
+    {
+      "message": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "compressed": true,
+      "publicKey": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "address": "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
+      "prefix": "\u0018Flux Signed Message:\n",
+      "signature": "H9Afg29YGMa97GKifDNAiRbF5BO5M3eoK9BXUtpkNyByWLtC90bimzg09qTbJ6kb0SY1o6FKl6ps0QB7Lb7ykFU="
+    },
+    {
+      "message": "Flux Backup wallet compatibility test",
+      "compressed": false,
+      "publicKey": "0479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8",
+      "address": "1EHNa6Q4Jz2uvNExL497mE43ikXhwF6kZm",
+      "prefix": null,
+      "signature": "G5K1/u/Enlxu+RPo1mz1mnMBEADliBZJuN+/weXyAAlzI/85eEZFAw8ENjkcJFnCkNDg1gO2YtwjYNZSyHO96Uw="
+    },
+    {
+      "message": "Flux Backup wallet compatibility test",
+      "compressed": false,
+      "publicKey": "0479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8",
+      "address": "1EHNa6Q4Jz2uvNExL497mE43ikXhwF6kZm",
+      "prefix": "\u0018Flux Signed Message:\n",
+      "signature": "GwzLd2dzcf9qG7XBQ2j5qd7wxsWPtOvunBgEoR6PelMQYgGeOgdkDCFLXRNCAzEuO7uOna6Qmaiqfk4SoE78nbE="
+    },
+    {
+      "message": "Flux backup Grüß dich 🌍",
+      "compressed": false,
+      "publicKey": "0479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8",
+      "address": "1EHNa6Q4Jz2uvNExL497mE43ikXhwF6kZm",
+      "prefix": null,
+      "signature": "HCwCfCevwS5RliKCn296YJXowPkbGMd9BSiYTnbRNq/3BZIFWzL8L57ZWAQIUMITsWzn+SqdU/dm+0JBe6zzP5A="
+    },
+    {
+      "message": "Flux backup Grüß dich 🌍",
+      "compressed": false,
+      "publicKey": "0479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8",
+      "address": "1EHNa6Q4Jz2uvNExL497mE43ikXhwF6kZm",
+      "prefix": "\u0018Flux Signed Message:\n",
+      "signature": "HP1x3tcoPZZDsC1UjocBP2x7OYkqMEauUlMnbzJlq79LL+nfiSp2NS0OdvUUgIXGHh/+8uvwH8gPcZ7AIiBR1l0="
+    },
+    {
+      "message": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "compressed": false,
+      "publicKey": "0479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8",
+      "address": "1EHNa6Q4Jz2uvNExL497mE43ikXhwF6kZm",
+      "prefix": null,
+      "signature": "HBLBkr8WtWpmpgY+qwfNyTxB102lcO26sUVgxtPS53SKIt8hRC/lGzLkj3i9SmtX2jeuQ8YURTSMK9Qil6KJgO4="
+    },
+    {
+      "message": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "compressed": false,
+      "publicKey": "0479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8",
+      "address": "1EHNa6Q4Jz2uvNExL497mE43ikXhwF6kZm",
+      "prefix": "\u0018Flux Signed Message:\n",
+      "signature": "G9Afg29YGMa97GKifDNAiRbF5BO5M3eoK9BXUtpkNyByWLtC90bimzg09qTbJ6kb0SY1o6FKl6ps0QB7Lb7ykFU="
+    },
+    {
+      "message": "Flux Backup SegWit compatibility test",
+      "compressed": true,
+      "publicKey": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "address": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+      "prefix": null,
+      "signature": "Jz06vQtmFDM29xWBOJDT8McHHhNsHYjyBt5pmpWjYf7dSJZZ3ThPoTaNYiA8KEh15ta8YcY7ml/x5T4jep5W4X8="
+    },
+    {
+      "message": "Flux Backup SegWit compatibility test",
+      "compressed": true,
+      "publicKey": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "address": "3JvL6Ymt8MVWiCNHC7oWU6nLeHNJKLZGLN",
+      "prefix": null,
+      "signature": "Iz06vQtmFDM29xWBOJDT8McHHhNsHYjyBt5pmpWjYf7dSJZZ3ThPoTaNYiA8KEh15ta8YcY7ml/x5T4jep5W4X8="
+    }
+  ]
+}

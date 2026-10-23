@@ -4,12 +4,12 @@ const axios = require('axios');
 const https = require('https');
 const appOwners = require('memory-cache');
 const qs = require('qs');
-const zeltrezjs = require('zeltrezjs');
-const bitcoinMessage = require('bitcoinjs-message');
+const bitcoinMessage = require('./utils/bitcoinMessage');
 const log = require('../lib/log');
 const Vault = require('./Vault');
 const enterpriseCrypto = require('./enterpriseCrypto');
 const enterpriseDiscoveryCache = require('./utils/enterpriseDiscoveryCache');
+const backupProfiles = require('./utils/backupProfiles');
 
 // Create HTTPS agent that accepts insecure connections
 const httpsAgent = new https.Agent({
@@ -306,6 +306,23 @@ async function getPrimaryNodeIp(appname, diagnostics) {
   }
 }
 
+/**
+ * The primary's API address (ip:port): its IP from FDM appips, its port from
+ * the location API. Null when either cannot say, or when several locations
+ * share that IP and the port cannot be told apart.
+ */
+async function getPrimaryNodeAddress(appname, diagnostics) {
+  const primaryIp = await getPrimaryNodeIp(appname, diagnostics);
+  if (!primaryIp) return null;
+  const locationUrl = `https://api.runonflux.io/apps/location/${appname}`;
+  const response = await axios.get(locationUrl, { httpsAgent, timeout: 30000 });
+  const locations = response.data?.status === 'success' && Array.isArray(response.data.data)
+    ? response.data.data
+    : [];
+  const matching = locations.filter((location) => location?.ip && extractNodeIp(location.ip) === primaryIp);
+  return matching.length === 1 ? formatLocationNode(matching[0].ip) : null;
+}
+
 async function getSecondaryNodeFromLocationApi(
   appname,
   primaryIp,
@@ -574,15 +591,8 @@ async function getLoginPhraseDetailed(node) {
 
 function signMessage(message, pk, strMessageMagic) {
   try {
-    let privKey = pk;
-    if (privKey.length !== 64) {
-      privKey = zeltrezjs.address.WIFToPrivKey(privKey);
-    }
-    const privateKey = Buffer.from(privKey, 'hex');
-
-    // Use bitcoinMessage.sign instead of zeltrezjs.message.sign
+    const privateKey = bitcoinMessage.privateKeyFromString(pk);
     const signature = bitcoinMessage.sign(message, privateKey, true, strMessageMagic);
-    // bitcoinMessage.sign returns a Buffer, convert to base64 string
     return signature.toString('base64');
   } catch (e) {
     log.error(`Error signing message: ${e.message}`, { stack: e.stack });
@@ -928,6 +938,412 @@ async function getAppsWithSyncthing() {
   return discovery ? discovery.apps : false;
 }
 
+const FILE_OPERATION_TERMINAL_STATES = ['Succeeded', 'Failed', 'Canceled', 'Evicted'];
+const FILE_OPERATION_TIMEOUT_MS = 10 * 60 * 1000;
+const FILE_OPERATION_MAX_BUSY_RETRIES = 12;
+
+function isMissingPathResponse(data) {
+  const code = data?.data?.code || data?.code;
+  if (code === 'ENOENT') return true;
+  const message = getSafeApiMessage(data) || '';
+  return /ENOENT|no such file|does not exist/i.test(message);
+}
+
+function retryAfterMs(headers, fallbackSeconds = 5) {
+  const seconds = Number(headers?.['retry-after']);
+  return (Number.isFinite(seconds) && seconds > 0 ? Math.min(seconds, 60) : fallbackSeconds) * 1000;
+}
+
+/**
+ * Ask the node for the full appdata archive of each component
+ * (appendbackuptask), and give it time to write it.
+ */
+async function requestFullBackupOnNode(node, zelidAuth, appname, componentList, diagnostics) {
+  const createEndpoint = `${node}/apps/appendbackuptask`;
+  const backupPayload = {
+    appname,
+    backup: componentList.map((component) => ({
+      component,
+      backup: true,
+    })),
+  };
+
+  // Make the backup request
+  const backupResponse = await axios({
+    method: 'post',
+    url: createEndpoint,
+    headers: {
+      'Content-Type': 'application/json',
+      zelidauth: zelidAuth,
+    },
+    data: backupPayload,
+    timeout: 300000, // 5 minutes timeout for backup process
+    httpsAgent,
+  });
+
+  if (!backupResponse.data) {
+    throw new Error('No response data from backup task creation');
+  }
+  if (backupResponse.data.status === 'error') {
+    throw new Error(
+      getSafeApiMessage(backupResponse.data) || 'Flux node rejected the backup task',
+    );
+  }
+
+  diagnostics.push({
+    check: 'Flux node backup creation',
+    outcome: 'success',
+    endpoint: createEndpoint,
+    node,
+    httpStatus: backupResponse.status,
+    detail: 'Node accepted the backup task',
+  });
+
+  log.info(`Backup task created successfully for ${appname}`);
+
+  // Wait longer for backup creation to ensure files are generated
+  log.info(`Waiting for backup files to be created for ${appname}...`);
+  await new Promise((resolve) => { setTimeout(resolve, 5 * 60 * 1000); }); // Wait 5 minutes
+}
+
+/**
+ * List a directory of a component's volume.
+ *
+ * @param {string} folder - path relative to the volume root (appdata/...)
+ * @returns {Promise<Array|null>} the entries, or null when the directory does not exist
+ * @throws when the node cannot answer, so a transient failure is never read as "missing"
+ */
+async function listVolumeFolder(node, zelidAuth, appname, component, folder) {
+  const endpoint = `${node}/apps/getfolderinfo/${appname}/${component}/${encodeURIComponent(folder)}`;
+  const response = await axios({
+    method: 'get',
+    url: endpoint,
+    headers: { zelidauth: zelidAuth },
+    timeout: 30000,
+    httpsAgent,
+  });
+  const { data } = response;
+  if (data?.status === 'success' && Array.isArray(data.data)) return data.data;
+  if (data?.status === 'error' && isMissingPathResponse(data)) return null;
+  const error = new Error(`Could not list ${folder}: ${getSafeApiMessage(data) || 'unexpected response'}`);
+  error.endpoint = endpoint;
+  throw error;
+}
+
+/** Create a directory on the volume; one that already exists is fine. */
+async function ensureVolumeFolder(node, zelidAuth, appname, component, folder) {
+  const endpoint = `${node}/apps/createfolder/${appname}/${component}/${encodeURIComponent(folder)}`;
+  const response = await axios({
+    method: 'get',
+    url: endpoint,
+    headers: { zelidauth: zelidAuth },
+    timeout: 60000,
+    httpsAgent,
+    validateStatus: () => true,
+  });
+  const { data } = response;
+  if (data?.status === 'success') return;
+  const code = data?.data?.code || data?.code;
+  const message = getSafeApiMessage(data) || `HTTP ${response.status}`;
+  if (code === 'EEXIST' || /already exists|file exists/i.test(message)) return;
+  const error = new Error(`Could not create ${folder}: ${message}`);
+  error.endpoint = endpoint;
+  throw error;
+}
+
+/**
+ * Run one of FluxOS's volume file operations and wait for it to finish.
+ *
+ * The node answers 200 when the operation finished inline, 202 with a job to
+ * poll when it continues in the background, and 503 with Retry-After when
+ * another operation holds this app's volume. A job's outcome is its status
+ * field, never the HTTP code: a failed job is a 200 that says Failed.
+ *
+ * @param {string} label - the operation's name, which starts every error message
+ * @param {object} request - the axios request, without headers or agent
+ * @param {function(object): void} [onAnswer] - sees the final non-503 answer
+ *   first, to throw for a status this operation gives its own meaning
+ * @throws when the node refuses, the job does not succeed, or it outlives
+ *   FILE_OPERATION_TIMEOUT_MS
+ */
+async function runVolumeOperation(node, zelidAuth, label, request, onAnswer = () => {}) {
+  let response;
+  for (let attempt = 0; ; attempt += 1) {
+    response = await axios({
+      ...request,
+      headers: { ...(request.data ? { 'Content-Type': 'application/json' } : {}), zelidauth: zelidAuth },
+      timeout: 60000,
+      httpsAgent,
+      validateStatus: () => true,
+    });
+    if (response.status !== 503 || attempt >= FILE_OPERATION_MAX_BUSY_RETRIES) break;
+    const waitMs = retryAfterMs(response.headers);
+    await new Promise((resolve) => { setTimeout(resolve, waitMs); });
+  }
+
+  const body = response.data;
+  onAnswer(response);
+  if (response.status === 202 && body?.data?.jobId) {
+    const offered = body.data.statusUrl;
+    // Only a path on this node: an offered URL naming another host would carry the zelidauth there.
+    const statusPath = typeof offered === 'string' && offered.startsWith('/') && !offered.startsWith('//')
+      ? offered
+      : `/apps/operations/${body.data.jobId}`;
+    const giveUpAt = Date.now() + FILE_OPERATION_TIMEOUT_MS;
+    let failures = 0;
+    while (Date.now() < giveUpAt) {
+      await new Promise((resolve) => { setTimeout(resolve, 2000); });
+      try {
+        const poll = await axios({
+          method: 'get',
+          url: `${node}${statusPath}`,
+          headers: { zelidauth: zelidAuth },
+          timeout: 30000,
+          httpsAgent,
+        });
+        const view = poll.data?.data || {};
+        if (FILE_OPERATION_TERMINAL_STATES.includes(view.status)) {
+          if (view.status === 'Succeeded') return;
+          const failed = new Error(`${label} ${view.status}: ${view.error?.detail || view.error?.title || 'no detail'}`);
+          failed.terminal = true;
+          throw failed;
+        }
+        failures = 0;
+      } catch (error) {
+        if (error.terminal) throw error;
+        failures += 1;
+        if (failures >= 3) throw error;
+      }
+    }
+    throw new Error(`${label} did not finish within ${FILE_OPERATION_TIMEOUT_MS / 60000} minutes`);
+  }
+  if (response.status < 200 || response.status >= 300 || body?.status === 'error') {
+    throw new Error(`${label} refused: ${getSafeApiMessage(body) || `HTTP ${response.status}`}`);
+  }
+}
+
+/** Run compressobject and wait for it to finish. */
+async function compressOnNode(node, zelidAuth, payload) {
+  await runVolumeOperation(node, zelidAuth, 'compressobject', {
+    method: 'post',
+    url: `${node}/apps/compressobject`,
+    data: payload,
+  }, (response) => {
+    if (response.status === 404) {
+      throw new Error('Node does not support compressobject (FluxOS older than 8.18.0)');
+    }
+  });
+}
+
+/**
+ * Delete a file or folder of a component's volume. One already gone is fine:
+ * the node removes with rm -rf, which succeeds on a missing path.
+ *
+ * @param {string} object - path relative to the volume root
+ * @throws when the node does not confirm the removal
+ */
+async function removeVolumeObject(node, zelidAuth, appname, component, object) {
+  const endpoint = `${node}/apps/removeobject/${appname}/${component}/${encodeURIComponent(object)}`;
+  try {
+    await runVolumeOperation(node, zelidAuth, 'removeobject', { method: 'get', url: endpoint });
+  } catch (error) {
+    error.endpoint = endpoint;
+    throw error;
+  }
+}
+
+/** The empty folder every partial archive starts with; see backupProfiles.PROFILE_MARKER_DIR. */
+const PROFILE_MARKER = `appdata/${backupProfiles.PROFILE_MARKER_DIR}`;
+/** How often, and how many times, to look for a marker made on the primary to reach the standby. */
+const PROFILE_MARKER_SYNC_WAIT_MS = 15 * 1000;
+const PROFILE_MARKER_SYNC_CHECKS = 8;
+
+/** FluxOS 8.21+ refusing a write on a standby, whose copy follows the primary's. */
+function isReadOnlyCopyRefusal(error) {
+  return /read-only copy/i.test(error?.message || '');
+}
+
+/**
+ * Make sure the marker is on the node the archive is written on.
+ *
+ * Since FluxOS 8.21 a standby refuses writes into appdata, which is the
+ * replicated part of its volume: syncthing would never send them and the
+ * standby reverts them. The marker is then made on the primary, which owns
+ * the copy, and arrives on the standby like any other file. Being an empty
+ * folder, it is harmless to the game, and once there it stays: later backups
+ * find it and ask the primary for nothing. A full backup carries it too, and
+ * is still told apart by its first entry, `./`.
+ *
+ * @param {function(): Promise<{node: string, zelidAuth: string}>} [reachPrimary]
+ * @throws when the marker cannot be put on this node
+ */
+async function ensureProfileMarker(node, zelidAuth, appname, component, reachPrimary) {
+  const present = () => listVolumeFolder(node, zelidAuth, appname, component, PROFILE_MARKER);
+  if (await present()) return;
+  try {
+    // Accepted by a primary, a standby on FluxOS older than 8.21, and an app with no synced copy.
+    await ensureVolumeFolder(node, zelidAuth, appname, component, PROFILE_MARKER);
+    return;
+  } catch (error) {
+    if (!isReadOnlyCopyRefusal(error) || !reachPrimary) throw error;
+  }
+  const primary = await reachPrimary();
+  await ensureVolumeFolder(primary.node, primary.zelidAuth, appname, component, PROFILE_MARKER);
+  for (let check = 0; check < PROFILE_MARKER_SYNC_CHECKS; check += 1) {
+    await new Promise((resolve) => { setTimeout(resolve, PROFILE_MARKER_SYNC_WAIT_MS); });
+    if (await present()) return;
+  }
+  throw new Error(`${PROFILE_MARKER} was made on the primary ${primary.node} but had not reached this node after ${(PROFILE_MARKER_SYNC_WAIT_MS * PROFILE_MARKER_SYNC_CHECKS) / 1000}s`);
+}
+
+/**
+ * How long to wait before listing again a volume whose files were still
+ * arriving. Syncthing delivers a save in seconds; this leaves it a wide margin
+ * without holding the backup worker long.
+ */
+const PROFILE_UNSETTLED_WAIT_MS = 90 * 1000;
+/** Archives written before giving up on a volume that keeps changing under them. */
+const PROFILE_ARCHIVE_ATTEMPTS = 2;
+
+/**
+ * Where appendbackuptask writes a component's full archive, which is also
+ * where the owner's own "Create Backup" lands.
+ */
+const fullArchiveName = (component) => `backup_${component.toLowerCase()}.tar.gz`;
+/**
+ * Where a profile's partial archive goes: its own name, so it never replaces
+ * the owner's local backup and is never picked up as a full archive.
+ */
+const profiledArchiveName = (component) => `flux-profile_${component.toLowerCase()}.tar.gz`;
+
+/**
+ * On the primary the game keeps writing to the volume the archive is staged
+ * on. It is written only when what it can take leaves this much free, and at
+ * most this share of what is free.
+ */
+const PRIMARY_MIN_FREE_AFTER_BYTES = 1024 ** 3;
+const PRIMARY_MAX_FREE_SHARE = 0.25;
+
+/** The bytes free on a component's volume, as the node reports them. */
+async function getVolumeAvailableBytes(node, zelidAuth, appname, component) {
+  const endpoint = `${node}/backup/getvolumedataofcomponent/${appname}/${component}/B/0/available`;
+  const response = await axios({
+    method: 'get', url: endpoint, headers: { zelidauth: zelidAuth }, timeout: 10000, httpsAgent,
+  });
+  const available = Number(response.data?.data?.available);
+  if (response.data?.status !== 'success' || !Number.isFinite(available)) {
+    const error = new Error(`could not read the free space of the volume: ${getSafeApiMessage(response.data) || 'no answer'}`);
+    error.endpoint = endpoint;
+    throw error;
+  }
+  return available;
+}
+
+/**
+ * Write a profile's partial archive where appendbackuptask writes the full one,
+ * backup/local/backup_<component>.tar.gz, so everything after this - the
+ * readiness check, the download and the upload - is the same for both.
+ *
+ * No stop is needed: backups are taken on the secondary, where a g: app's
+ * container does not run. Syncthing still writes there, though, so the paths
+ * are listed again once the archive is written: when anything changed, the
+ * archive may hold half of a save, and it is written again from the new
+ * listing. A listing whose `validate` finds a save still arriving (unsettled)
+ * is listed again after PROFILE_UNSETTLED_WAIT_MS before giving up: the full
+ * backup would only archive the same half-synced files, and fifty times more.
+ *
+ * On the primary (options.onPrimary) the server is running, so the archive is
+ * only written when the volume has room for it beside the game (noRoom
+ * otherwise).
+ *
+ * @returns {Promise<{fits: boolean, archiveFailed?: boolean, changing?: boolean, noRoom?: boolean, reason?: string}>}
+ *   fits:false when the app does not have the profile's layout, when the node
+ *   could not write the partial archive (archiveFailed), when the volume
+ *   changed under every attempt (changing), or when the primary has no room
+ *   for it (noRoom); the caller then takes the full backup, except on the
+ *   primary
+ * @throws when the profile's paths cannot be listed, so a transient failure is
+ *   retried on another node rather than read as a missing layout
+ */
+async function createProfiledArchiveOnNode(node, zelidAuth, appname, component, profile, diagnostics, reachPrimary = null, options = {}) {
+  const listAll = () => backupProfiles.collectProfileListings(
+    profile,
+    (folder) => listVolumeFolder(node, zelidAuth, appname, component, folder ? `appdata/${folder}` : 'appdata'),
+  );
+  // The plan for a listing, listed once more after a wait when its files were still arriving.
+  const settle = async (first) => {
+    let listed = first;
+    let planned = backupProfiles.planProfiledArchive(profile, listed);
+    if (!planned.fits && planned.unsettled) {
+      log.info(`Backup profile ${profile.id} found ${appname}/${component} still syncing (${planned.reason}); listing again in ${PROFILE_UNSETTLED_WAIT_MS / 1000}s`);
+      await new Promise((resolve) => { setTimeout(resolve, PROFILE_UNSETTLED_WAIT_MS); });
+      listed = await listAll();
+      planned = backupProfiles.planProfiledArchive(profile, listed);
+    }
+    return { listed, planned };
+  };
+  let { listed: listings, planned: plan } = await settle(await listAll());
+  if (!plan.fits) return plan;
+
+  if (options.onPrimary) {
+    let available;
+    try {
+      available = await getVolumeAvailableBytes(node, zelidAuth, appname, component);
+    } catch (error) {
+      return { fits: false, archiveFailed: true, reason: error?.message || String(error) };
+    }
+    if (plan.bytes > available * PRIMARY_MAX_FREE_SHARE || available - plan.bytes < PRIMARY_MIN_FREE_AFTER_BYTES) {
+      return { fits: false, noRoom: true, reason: `${plan.bytes} bytes to archive with ${available} free on the running server's volume` };
+    }
+  }
+
+  // From here on a failure is the node not writing the partial archive: a
+  // FluxOS older than 8.18 without compressobject, a refused or failed job.
+  // appendbackuptask can still take the full one, as it did before
+  // profiles existed. Never a reason to leave the app with no backup at all.
+  try {
+    await ensureProfileMarker(node, zelidAuth, appname, component, reachPrimary);
+    // appendbackuptask makes backup/local itself; on a node that never ran one it is not there yet.
+    await ensureVolumeFolder(node, zelidAuth, appname, component, 'backup');
+    await ensureVolumeFolder(node, zelidAuth, appname, component, 'backup/local');
+  } catch (error) {
+    return { fits: false, archiveFailed: true, reason: error?.message || String(error) };
+  }
+
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      await compressOnNode(node, zelidAuth, {
+        appname,
+        component,
+        source: plan.sources,
+        destination: `backup/local/${profiledArchiveName(component)}`,
+        overwrite: true,
+      });
+    } catch (error) {
+      return { fits: false, archiveFailed: true, reason: error?.message || String(error) };
+    }
+
+    const after = await listAll();
+    if (backupProfiles.sameListings(listings, after, profile.ignoreChanges)) break;
+    if (attempt >= PROFILE_ARCHIVE_ATTEMPTS) {
+      return { fits: false, changing: true, reason: `the files changed while archiving, ${attempt} times` };
+    }
+    log.info(`Backup profile ${profile.id}: ${appname}/${component} changed while archiving; writing the archive again`);
+    ({ listed: listings, planned: plan } = await settle(after));
+    if (!plan.fits) return plan;
+  }
+
+  diagnostics.push({
+    check: `Flux node profiled archive (${component})`,
+    outcome: 'success',
+    endpoint: `${node}/apps/compressobject`,
+    node,
+    detail: `${profile.id}: ${plan.sources.join(', ')}`,
+  });
+  log.info(`Profiled archive ${profile.id} written for ${appname}/${component}: ${plan.sources.join(', ')}`);
+  return { fits: true };
+}
+
 /**
  * Creates a backup task for an application and retrieves backup lists for each component.
  *
@@ -936,59 +1352,79 @@ async function getAppsWithSyncthing() {
  * @param {string} zelidAuth - The authentication string
  * @param {string} appname - The application name
  * @param {Array} componentList - Array of component names
+ * @param {Object} [options]
+ * @param {boolean} [options.onPrimary] - the node is the primary, where the
+ *   app's container runs: only the profile's partial archive is taken, never
+ *   the full backup, which stops the app for the customer
  * @returns {Promise<Object|null>} - Combined backup data for all components, or null if failed
  */
-async function createBackupTaskOnNode(node, zelidAuth, appname, componentList) {
+async function createBackupTaskOnNode(node, zelidAuth, appname, componentList, componentProfiles = null, reachPrimary = null, options = {}) {
   const diagnostics = [];
   const createEndpoint = `${node}/apps/appendbackuptask`;
+  const usedProfiles = {};
+  const onPrimary = options.onPrimary === true;
   try {
-    log.info(`Creating backup task for ${appname} with components: ${JSON.stringify(componentList)}`);
+    log.info(`Creating backup task for ${appname} with components: ${JSON.stringify(componentList)}${onPrimary ? ' on the primary' : ''}`);
 
-    // Prepare backup payload
-    const backupPayload = {
-      appname,
-      backup: componentList.map((component) => ({
-        component,
-        backup: true,
-      })),
-    };
-
-    // Make the backup request
-    const backupResponse = await axios({
-      method: 'post',
-      url: createEndpoint,
-      headers: {
-        'Content-Type': 'application/json',
-        zelidauth: zelidAuth,
-      },
-      data: backupPayload,
-      timeout: 300000, // 5 minutes timeout for backup process
-      httpsAgent,
-    });
-
-    if (!backupResponse.data) {
-      throw new Error('No response data from backup task creation');
-    }
-    if (backupResponse.data.status === 'error') {
-      throw new Error(
-        getSafeApiMessage(backupResponse.data) || 'Flux node rejected the backup task',
-      );
+    if (onPrimary && !componentProfiles) {
+      throw new Error('A backup on the primary needs a backup profile; the full backup would stop the server');
     }
 
-    diagnostics.push({
-      check: 'Flux node backup creation',
-      outcome: 'success',
-      endpoint: createEndpoint,
-      node,
-      httpStatus: backupResponse.status,
-      detail: 'Node accepted the backup task',
-    });
+    let profiled = false;
+    if (componentProfiles) {
+      profiled = true;
+      for (let i = 0; i < componentList.length && profiled; i += 1) {
+        const component = componentList[i];
+        const profile = componentProfiles[component];
+        const outcome = await createProfiledArchiveOnNode(node, zelidAuth, appname, component, profile, diagnostics, reachPrimary, { onPrimary });
+        if (outcome.fits) {
+          usedProfiles[component] = profile.id;
+        } else {
+          let why = 'does not fit';
+          if (outcome.archiveFailed) why = 'archive failed';
+          else if (outcome.changing) why = 'kept changing';
+          else if (outcome.noRoom) why = 'no room on the primary';
+          else if (outcome.unsettled) why = 'still syncing';
+          log.info(`Backup profile ${profile.id} ${why} for ${appname}/${component} (${outcome.reason}); taking the full backup instead`);
+          diagnostics.push({
+            check: `Backup profile (${component})`,
+            outcome: 'skipped',
+            node,
+            detail: `${profile.id} ${why}: ${outcome.reason}`,
+          });
+          profiled = false;
+        }
+      }
+      if (!profiled) {
+        Object.keys(usedProfiles).forEach((component) => { delete usedProfiles[component]; });
+        // The partial archives this attempt wrote for the components that fit
+        // are not uploaded: the backup is taken whole, or not at all.
+        for (let i = 0; i < componentList.length; i += 1) {
+          await removeVolumeObject(node, zelidAuth, appname, componentList[i], `backup/local/${profiledArchiveName(componentList[i])}`);
+        }
+        // A partial archive written under the full one's name by a middleware
+        // older than profiledArchiveName may still sit there (the node reaps
+        // backup/local after 24 hours). appendbackuptask only replaces it once
+        // it has stopped the app, and it can refuse before that in its
+        // streamed answer, which reads as success here; what follows would then
+        // upload the partial archive as a full one, and a full one is restored
+        // over a wiped appdata. Cleared first, so a refusal leaves nothing to
+        // pick up. Never on the primary, which takes no full backup and where
+        // that file is the owner's own. A node that cannot clear it fails this
+        // attempt, which moves on to another node.
+        for (let i = 0; i < componentList.length && !onPrimary; i += 1) {
+          await removeVolumeObject(node, zelidAuth, appname, componentList[i], `backup/local/${fullArchiveName(componentList[i])}`);
+        }
+        if (onPrimary) {
+          const skipped = diagnostics.filter((diagnostic) => diagnostic.outcome === 'skipped').pop();
+          throw new Error(`Backup profile could not be used on the primary (${skipped?.detail || 'no detail'}); the full backup would stop the server`);
+        }
+      }
+    }
 
-    log.info(`Backup task created successfully for ${appname}`);
-
-    // Wait longer for backup creation to ensure files are generated
-    log.info(`Waiting for backup files to be created for ${appname}...`);
-    await new Promise((resolve) => { setTimeout(resolve, 5 * 60 * 1000); }); // Wait 5 minutes
+    if (!profiled) {
+      await requestFullBackupOnNode(node, zelidAuth, appname, componentList, diagnostics);
+    }
 
     // Get volume mount paths for all components upfront
     const componentMounts = {};
@@ -1154,11 +1590,12 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList) {
               log.warn(`No files found in backup directory for component ${component}, attempt ${retryCount + 1}`);
             }
 
-            // Filter backup files for this specific component and get the latest one
-            const expectedPattern = `backup_${component}.tar.gz`;
-            const allBackups = responseData.filter((backup) => backup.name.toLowerCase().includes(expectedPattern.toLowerCase()));
+            // This component's archive, by its exact name: the partial one under
+            // its own name, the full one where appendbackuptask writes it.
+            const expectedName = usedProfiles[component] ? profiledArchiveName(component) : fullArchiveName(component);
+            const allBackups = responseData.filter((backup) => String(backup.name).toLowerCase() === expectedName);
 
-            log.info(`Filtering for pattern "${expectedPattern}": found ${allBackups.length} matching backup(s)`);
+            log.info(`Looking for "${expectedName}": found ${allBackups.length} matching backup(s)`);
 
             if (allBackups.length > 0) {
               // Sort by create timestamp (descending) and get the latest
@@ -1167,13 +1604,14 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList) {
               const encodedFileName = encodeURIComponent(latestBackup.name);
               componentBackupData = {
                 component,
+                profile: usedProfiles[component] || null,
                 backups: latestBackup,
                 host: `${node}/backup/downloadlocalfile/${backupPath}%2F${encodedFileName}/${appname}`,
               };
 
               log.info(`Found ${allBackups.length} backup(s) for component ${component}, selected latest: ${latestBackup.name} (created: ${latestBackup.create})`);
             } else {
-              log.warn(`No backups matching pattern "${expectedPattern}" for component ${component}, attempt ${retryCount + 1}`);
+              log.warn(`No backup named "${expectedName}" for component ${component}, attempt ${retryCount + 1}`);
             }
           } else {
             lastComponentFailure = {
@@ -1239,7 +1677,8 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList) {
     diagnostics.push({
       check: 'Flux node backup creation',
       outcome: 'failed',
-      endpoint: createEndpoint,
+      // A profile's listing or the clearing of the archive slot names its own.
+      endpoint: error?.endpoint || createEndpoint,
       node,
       ...getRequestFailure(error),
     });
@@ -1260,6 +1699,8 @@ async function createBackupTaskWithTeamCredentials(
   componentList,
   verifier = verifyLoginDetailed,
   backupCreator = createBackupTaskOnNode,
+  componentProfiles = null,
+  options = {},
 ) {
   const credentials = await getTeamCredentials();
   if (credentials.length === 0) {
@@ -1302,12 +1743,35 @@ async function createBackupTaskWithTeamCredentials(
       continue;
     }
 
+    // A profiled backup may need the primary for its marker (see
+    // ensureProfileMarker), reached with the credential the standby accepted.
+    // Asked for at most once, and only when needed. On the primary the marker
+    // is made in place.
+    let primaryAccess = null;
+    const reachPrimary = componentProfiles && !options.onPrimary ? () => {
+      primaryAccess = primaryAccess || (async () => {
+        const address = await getPrimaryNodeAddress(appname, []);
+        if (!address) throw new Error('the primary node could not be identified');
+        const primaryNode = `http://${address}`;
+        if (primaryNode === node) throw new Error(`${node} is the primary itself`);
+        const primaryLogin = await verifier(credential.zelid, credential.privateKey, primaryNode);
+        if (!primaryLogin.zelidAuth) {
+          throw new Error(`could not log in on the primary ${primaryNode}: ${primaryLogin.reason || 'refused'}`);
+        }
+        return { node: primaryNode, zelidAuth: primaryLogin.zelidAuth };
+      })();
+      return primaryAccess;
+    } : null;
+
     // eslint-disable-next-line no-await-in-loop
     const backupResult = await backupCreator(
       node,
       loginResult.zelidAuth,
       appname,
       componentList,
+      componentProfiles,
+      reachPrimary,
+      options,
     );
     lastResult = backupResult;
     failureStage = 'create_backup';
@@ -1359,7 +1823,18 @@ module.exports = {
   isAppExpiredInGlobalSpecs,
   getSecondaryNodeSelection,
   getSecondaryNodeFromHAProxy,
+  getPrimaryNodeAddress,
   createBackupTaskOnNode,
   createBackupTaskWithTeamCredentials,
   isExplicitAuthorizationFailure,
+  testHooks: {
+    signMessage,
+    listVolumeFolder,
+    ensureVolumeFolder,
+    removeVolumeObject,
+    compressOnNode,
+    createProfiledArchiveOnNode,
+    ensureProfileMarker,
+    getPrimaryNodeAddress,
+  },
 };
