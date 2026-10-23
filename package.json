@@ -5,6 +5,7 @@
   "main": "index.js",
   "scripts": {
     "test": "node index.js",
+    "test:session-authorization": "node scripts/test-session-authorization.js",
     "test:automatic-backup-dispatch": "node scripts/test-automatic-backup-dispatch.js",
     "test:backup-profiles": "node scripts/test-backup-profiles.js",
     "test:concurrent-downloads": "node scripts/test-concurrent-task-downloads.js",

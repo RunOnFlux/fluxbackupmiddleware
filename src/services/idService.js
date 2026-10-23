@@ -10,6 +10,17 @@ const ethRegex = /^0x[a-fA-F0-9]{40}$/;
 const sessionExpireTime = 1.5 * 60 * 60 * 1000;
 const signatureValidationTime = 1.5 * 60 * 60 * 1000;
 
+function isValidLoginPhrase(message) {
+  return typeof message === 'string' && message.length >= 40 && message.length <= 70
+    && /^\d{13}/.test(message);
+}
+
+function isFreshLoginPhrase(message) {
+  const timestamp = Number(message.substring(0, 13));
+  const now = Date.now();
+  return Number.isFinite(timestamp) && timestamp >= now - signatureValidationTime && timestamp <= now;
+}
+
 /**
  * To check if a parameter is an object and if not, return an empty object.
  * @param {*} parameter Parameter of any type.
@@ -95,7 +106,6 @@ async function verifyLogin(req, res) {
     const address = processedBody.zelid || processedBody.address;
     const { signature } = processedBody;
     const message = processedBody.loginPhrase || processedBody.message;
-    const timestamp = new Date().getTime();
 
     if (address === undefined || address === '') {
       throw new Error('No ZelID is specified');
@@ -110,11 +120,10 @@ async function verifyLogin(req, res) {
     } else if (!ethRegex.test(address)) {
       throw new Error('ZelID is not valid');
     }
-    if (message === undefined || message === '' || message.length < 40) {
+    if (!isValidLoginPhrase(message)) {
       throw new Error(message ? 'Signed message is not valid' : 'No message is specified');
     }
-    if (+message.substring(0, 13) < (timestamp - signatureValidationTime)
-      || +message.substring(0, 13) > timestamp) {
+    if (!isFreshLoginPhrase(message)) {
       throw new Error('Signed message is not valid');
     }
     if (signature === undefined || signature === '') {
@@ -162,7 +171,8 @@ async function verifyLogin(req, res) {
 async function verifyUserSession(headers) {
   if (!headers || !headers.zelidauth) return false;
   const auth = ensureObject(headers.zelidauth);
-  if (!auth.zelid || !auth.signature || !auth.loginPhrase) return false;
+  if (!auth || typeof auth.zelid !== 'string' || !auth.zelid
+    || typeof auth.signature !== 'string' || !auth.signature || !isValidLoginPhrase(auth.loginPhrase)) return false;
 
   const sessionParams = {
     zelid: auth.zelid,
@@ -179,10 +189,7 @@ async function verifyUserSession(headers) {
       return false;
     }
   } else if (signatureVerifier.verifySignature(auth.loginPhrase, auth.zelid, auth.signature) === true) {
-    const timestamp = new Date().getTime();
-    if (+auth.loginPhrase.substring(0, 13) < (timestamp - signatureValidationTime) || +auth.loginPhrase.substring(0, 13) > timestamp) {
-      return false;
-    }
+    if (!isFreshLoginPhrase(auth.loginPhrase)) return false;
     return auth.zelid;
   }
   return false;

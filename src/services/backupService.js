@@ -1707,7 +1707,6 @@ async function getTaskStatus(req, res) {
     if (!taskId) {
       throw new Error('taskId not provided.');
     }
-    console.log(taskQueue.entries());
     let task = taskQueue.get(Number(taskId));
     if (!task) {
       task = await dbCli.getTask(taskId);
@@ -1715,6 +1714,9 @@ async function getTaskStatus(req, res) {
 
     if (!task) {
       throw new Error('task does not exist.');
+    }
+    if (task.owner !== owner && !await fluxOS.isTeamFluxId(owner)) {
+      throw new Error('Unauthorized. Access denied.');
     }
     res.json({ status: 'success', data: { taskId: task.taskId, status: task.status } });
   } catch (error) {
