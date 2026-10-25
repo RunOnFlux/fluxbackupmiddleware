@@ -1574,6 +1574,63 @@ async function main() {
     );
     assert.match(soulLegacy.reason, /Saved\/Worlds\/Dedicated does not exist/, 'sknnr layout');
 
+    // --- Conan Exiles ---------------------------------------------------------------
+    const conan = backupProfiles.profileForComponent({
+      appname: 'conanexiles1790000000000', component: 'conanexilesconanexiles', repotag: null, componentCount: 1,
+    });
+    assert.strictEqual(conan.id, 'conan-exiles-world', 'marketplace component');
+    assert.strictEqual(byComponent('server', { repotag: 'runonflux/conanexiles-server-flux:1.0.2' }).id, 'conan-exiles-world', 'by image');
+    assert.strictEqual(byComponent('server', { repotag: 'alinmear/docker-conanexiles:latest' }).id, 'conan-exiles-world', 'the earlier image is matched too');
+    assert.deepStrictEqual(backupProfiles.restoreClearRules(conan).map((rule) => rule.folder), ['Saved']);
+    assert(new RegExp(backupProfiles.restoreClearRules(conan)[0].name).test('game_0.db-wal'));
+    assert(!new RegExp(backupProfiles.restoreClearRules(conan)[0].name).test('game_0.db'), 'never the database');
+    assert.deepStrictEqual(backupProfiles.restoreClearRules(soulmask).map((rule) => rule.folder), ['Saved/Worlds/Dedicated/*']);
+
+    const cFile = (name, size, minutesAgo = 30) => ({
+      name, size, isFile: true, isDirectory: false, modifiedAt: at(minutesAgo),
+    });
+    const cDir = (name, size) => ({
+      name, size, isFile: false, isDirectory: true, modifiedAt: at(30),
+    });
+    const conanSaved = [
+      cFile('game_0.db', 180000000), cFile('game_0.db-wal', 4000000, 1), cFile('game_0.db-shm', 32768, 1),
+      cDir('Config', 21000), cFile('blacklist.txt', 40),
+    ];
+    const conanCopies = [cFile('game_0_backup_1.db', 179000000, 700), cFile('game_0_backup_2.db', 178000000, 1400)];
+    const conanVolume = ({ saved = [...conanSaved, ...conanCopies] } = {}) => async (folder) => {
+      switch (folder) {
+        case '': return [cDir('Saved', 540000000), cDir('flux', 190000000), cFile('.flux-backup', 1)];
+        case 'Saved': return [...saved, cDir('Logs', 0), cDir('Crashes', 0), cDir('ExtractedMods', 0)];
+        case 'flux': return [
+          cDir('backups', 180000000), cDir('import', 9000000), cDir('sync-conflicts', 10), cFile('state.json', 700), cFile('worlds.json', 90),
+          cFile('mods.json', 300), cFile('rcon-password', 20), cFile('bans-pending.json', 20), cFile('settings-pending.json', 80),
+          cFile('restore-pending.json', 80), cFile('update-target.json', 80), cFile('mods-update-target.json', 80),
+        ];
+        default: return [];
+      }
+    };
+    const conanPlanOf = async (options) => backupProfiles.planProfiledArchive(
+      conan,
+      await backupProfiles.collectProfileListings(conan, conanVolume(options)),
+    );
+    assert.deepStrictEqual((await conanPlanOf()).sources, [
+      'appdata/.flux-backup',
+      ...conanSaved.map((kept) => `appdata/Saved/${kept.name}`),
+      'appdata/flux/state.json', 'appdata/flux/worlds.json', 'appdata/flux/mods.json', 'appdata/flux/rcon-password',
+      'appdata/flux/bans-pending.json', 'appdata/flux/settings-pending.json',
+    ]);
+    assert.match((await conanPlanOf({ saved: conanCopies })).reason, /no world/, 'only the game\'s rotating copies');
+    assert.match((await conanPlanOf({ saved: [cFile('game_0.db', 0)] })).reason, /no world/, 'an empty world');
+    assert.strictEqual((await conanPlanOf({ saved: [cFile('game.db', 90000000)] })).reason, undefined, 'an imported pre-Enhanced world');
+    const conanSyncing = await conanPlanOf({ saved: [...conanSaved, cFile('.syncthing.game_0.db.tmp', 9, 1)] });
+    assert(conanSyncing.unsettled && /still being synced/.test(conanSyncing.reason), 'a sync arriving');
+    // The Wine server of docker-conanexiles keeps its saves inside the install.
+    const conanLegacy = backupProfiles.planProfiledArchive(
+      conan,
+      await backupProfiles.collectProfileListings(conan, async (folder) => (folder === '' ? [cDir('ConanSandbox', 9000000000), cDir('Engine', 1000)] : null)),
+    );
+    assert.match(conanLegacy.reason, /Saved does not exist/, 'the earlier image\'s layout');
+
     // --- Satisfactory ---------------------------------------------------------------
     const satisfactory = backupProfiles.profileForComponent({
       appname: 'satisfactory1790000000000', component: 'satisfactory', repotag: null, componentCount: 1,

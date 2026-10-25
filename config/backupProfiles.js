@@ -532,6 +532,24 @@ function soulmaskWorldPresent(listing, now = Date.now()) {
 }
 
 /**
+ * Whether the Saved folder of a Conan Exiles server holds its world, and no
+ * sync arriving in it.
+ *
+ * The world is `game_0.db`, a SQLite file in WAL mode that the server commits
+ * to in place every few seconds (`game_0.db-wal` and `-shm` beside it, archived
+ * with it); the image checkpoints it every five minutes and on stop. A world
+ * uploaded from the pre-Enhanced server is `game.db` until the next start
+ * converts it. The game's own rotating copies `game_0_backup_N.db` are not
+ * worlds.
+ */
+function conanWorldPresent(listing, now = Date.now()) {
+  const arriving = syncArriving([...listing, ...(listing.leftOut || [])], now);
+  if (arriving) return { reason: `${arriving.name} is still being synced`, unsettled: true };
+  const world = listing.some((item) => item.isFile && /^game(_0)?\.db$/i.test(String(item.name)) && Number(item.size) > 0);
+  return world ? null : 'no world';
+}
+
+/**
  * What the itzg Java image puts at the top of /data by itself, from TYPE,
  * VERSION and the loader variables, and fetches again on a node that lacks it:
  * the server jar and its launcher, the libraries and game versions it runs on,
@@ -782,6 +800,10 @@ module.exports = [
     id: 'soulmask-world',
     // As in the hub's catalogue.
     match: { name: '^soulmask', repotag: '(^|/)soulmask-server-flux', component: '^soulmask' },
+    // The world's WAL and shared-memory files are archived with it, and a
+    // restore puts back a database as of that archive: one the node still has
+    // from after it would be replayed over it.
+    restoreClear: [{ folder: 'Saved/Worlds/Dedicated/*', name: /^world\.db-(wal|shm|journal)$/ }],
     include: [
       // Each map's folder: world.db and whatever sits with it, but not the
       // game's hourly copies, plus the newest of those that has settled as a
@@ -813,6 +835,52 @@ module.exports = [
         path: 'flux',
         children: true,
         excludeChildren: /^(backups|uploads|sync-conflicts|tmp|restore-pending\.json|update-.*\.json)$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+      },
+      {
+        path: '',
+        children: true,
+        excludeChildren: /^(Saved|flux|\.flux-backup)$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+      },
+    ],
+  },
+  {
+    // Conan Exiles (Enhanced, Linux) on runonflux/conanexiles-server-flux.
+    // appdata is /mnt/conan/data: Saved (the game's Saved folder, which the
+    // install links to) and flux, the image's state. The 4.2 GB install, the
+    // Workshop mods and the logs are on local (ml:) mounts. What makes the full
+    // backup large is the world again: the game's own rotating copies
+    // game_0_backup_N.db, each as large as game_0.db, and the tar.gz of the
+    // world the image makes on every start and every few hours (flux/backups).
+    id: 'conan-exiles-world',
+    // As in the hub's catalogue. It also matches the earlier alinmear/
+    // docker-conanexiles, whose volume has no Saved at its top: that one gets
+    // the full backup.
+    match: { name: '^conanexiles', repotag: '(^|/)(conanexiles-server-flux|docker-conanexiles)', component: '^conanexiles' },
+    // The world's WAL and shared-memory files are archived with it, and a
+    // restore puts back a database as of that archive: one the node still has
+    // from after it would be replayed over it.
+    restoreClear: [{ folder: 'Saved', name: /^game(_0)?\.db-(wal|shm|journal)$/ }],
+    include: [
+      // game_0.db with its sidecars, Config/LinuxServer (the .ini files) and
+      // blacklist.txt, but not the game's rotating copies, nor Logs, Crashes
+      // and ExtractedMods, which are links to the local mount.
+      {
+        path: 'Saved',
+        required: true,
+        children: true,
+        excludeChildren: /^(Logs|Crashes|ExtractedMods)$|^game(_\d+)?_backup_\d+\.db$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+        validate: conanWorldPresent,
+      },
+      // The image's state: worlds.json (which the world guard goes by),
+      // mods.json, the RCON password, the bans and settings it has queued.
+      // Not its backups (the same world again), imports, conflict copies, nor
+      // a restore, new-world or update it was asked for: restore-pending.json
+      // is read at the next start and could wipe the world or restore from
+      // flux/backups, which a node restored from this archive does not have.
+      {
+        path: 'flux',
+        children: true,
+        excludeChildren: /^(backups|import|sync-conflicts|tmp|restore-pending\.json|update-.*\.json|mods-update-.*\.json)$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
       },
       {
         path: '',
