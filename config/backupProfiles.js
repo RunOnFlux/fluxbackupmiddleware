@@ -43,6 +43,13 @@
  *                folders are listed one level deeper for `validate`. On restore
  *                each archived child is replaced as a whole and the rest of the
  *                directory is left alone
+ *   shallow      with `children`: the folders of the directory are not listed
+ *                one level deeper, so there is no limit to how many it holds.
+ *                For a directory whose `validate` reads only its own entries
+ *                and whose folders are the owner's (Garry's Mod's game folder)
+ *                and are compared by their own size and time. Not with
+ *                excludeWithin or latestWithin, which need those listings: the
+ *                plan refuses it
  *   excludeWithin  with `children`: a child FOLDER is archived as what it
  *                holds, each entry on its own, leaving out those matching; the
  *                folders kept inside it are listed in turn for `validate`, and
@@ -513,6 +520,63 @@ function windroseWorldPresent(listing, now = Date.now()) {
 }
 
 /**
+ * Whether Saved/Worlds/Dedicated holds a Soulmask world, and no sync arriving
+ * in it.
+ *
+ * A world is a map folder (Level01_Main, DLC_Level01_Main) holding a non-empty
+ * `world.db`, a SQLite file the server writes in place (with `-wal` and `-shm`
+ * beside it while it runs, archived with it), and the game's own hourly copies
+ * `YYYYmmddHH.db`, which are not worlds. A server that has not made its world
+ * yet, or whose world has not arrived on the standby, has no world.db.
+ */
+function soulmaskWorldPresent(listing, now = Date.now()) {
+  const inside = listing.flatMap((item) => [...(item.children || []), ...(item.excludedChildren || [])]);
+  const arriving = syncArriving([...listing, ...inside], now);
+  if (arriving) return { reason: `${arriving.name} is still being synced`, unsettled: true };
+  const world = listing.some((item) => item.isDirectory && (item.children || [])
+    .some((file) => file.isFile && file.name === 'world.db' && Number(file.size) > 0));
+  return world ? null : 'no world';
+}
+
+/**
+ * Whether the Saved folder of a Conan Exiles server holds its world, and no
+ * sync arriving in it.
+ *
+ * The world is `game_0.db`, a SQLite file in WAL mode that the server commits
+ * to in place every few seconds (`game_0.db-wal` and `-shm` beside it, archived
+ * with it); the image checkpoints it every five minutes and on stop. A world
+ * uploaded from the pre-Enhanced server is `game.db` until the next start
+ * converts it. The game's own rotating copies `game_0_backup_N.db` are not
+ * worlds.
+ */
+function conanWorldPresent(listing, now = Date.now()) {
+  const inside = listing.flatMap((item) => (Array.isArray(item.children) ? item.children : []));
+  const arriving = syncArriving([...listing, ...(listing.leftOut || []), ...inside], now);
+  if (arriving) return { reason: `${arriving.name} is still being synced`, unsettled: true };
+  const world = listing.some((item) => item.isFile && /^game(_0)?\.db$/i.test(String(item.name)) && Number(item.size) > 0);
+  return world ? null : 'no world';
+}
+
+/**
+ * Whether the top of a Garry's Mod game folder is a server's, and no sync
+ * arriving in it.
+ *
+ * Garry's Mod has no world: what the owner made is cfg/, data/ (sv.db and what
+ * addons write), addons/, gamemodes/ and maps/. There is no save to check them
+ * against, so this refuses a sync still arriving, and a folder that does not
+ * hold the game's stock garrysmod_dir.vpk (left out of the archive, so it is
+ * looked for beside what the listing leaves out): a volume that is a whole
+ * install has it a level down.
+ */
+function gmodFolderSettled(listing, now = Date.now()) {
+  const leftOut = listing.leftOut || [];
+  const arriving = syncArriving([...listing, ...leftOut], now);
+  if (arriving) return { reason: `${arriving.name} is still being synced`, unsettled: true };
+  const stock = leftOut.some((file) => file.isFile && /^garrysmod_dir\.vpk$/i.test(String(file.name)) && Number(file.size) > 0);
+  return stock ? null : 'no stock garrysmod_dir.vpk at the top';
+}
+
+/**
  * What the itzg Java image puts at the top of /data by itself, from TYPE,
  * VERSION and the loader variables, and fetches again on a node that lacks it:
  * the server jar and its launcher, the libraries and game versions it runs on,
@@ -696,6 +760,218 @@ module.exports = [
         path: '',
         children: true,
         excludeChildren: /^(SavedArks|Logs|Crashes|webcache.*|\.flux-backup)$/i,
+      },
+    ],
+  },
+  {
+    // ARK: Survival Evolved on runonflux/ase-server-flux. appdata is /mnt/ase/data:
+    // Saved (the game's Saved folder, which the install links to) and flux, the
+    // image's state. The 23 GB install, the mods it unpacks and the logs are on
+    // local (ml:) mounts, and so is flux.log; the game's own logs are in Saved/Logs
+    // on the data volume. What makes the full backup large is the world over
+    // and over: ARK writes a dated `<MAP>_DD.MM.YYYY_HH.MM.SS.ark` copy of the
+    // whole world every few saves and never deletes it (the image keeps the
+    // newest 4), a `.bak` beside each world, and the image makes its own
+    // tar.gz of Saved on every start and every few hours (flux/backups).
+    id: 'ark-evolved-world',
+    // As in the hub's catalogue. Not the Ascended profile's: that match is
+    // `arksurvivalascended`, and this layout has Saved/ under the data volume.
+    match: { name: '^arksurvivalevolved', repotag: '(^|/)ase-server-flux', component: '^arksurvivalevolved' },
+    include: [
+      // Each map folder: the world, every player's .arkprofile and tribe's
+      // .arktribe and whatever else is there, but not the dated copies, the
+      // game's .bak, .profilebak and .tribebak copies (a server with many
+      // players would pass the 1000 sources compressobject takes) or the
+      // image's one-off .flux-premigration, plus the newest
+      // dated copy that has settled, whole, as a restore point. The `.ark`
+      // the game loads is the one that is restored; the copies already on the
+      // node are left alone and are not loaded in its place.
+      {
+        path: 'Saved/SavedArks',
+        required: true,
+        children: true,
+        excludeChildren: /\.sync-conflict-|^\.flux-premigration$/,
+        excludeWithin: /_\d{2}\.\d{2}\.\d{4}_\d{2}\.\d{2}\.\d{2}\.ark$|\.(bak|profilebak|tribebak)$|\.tmp$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+        latestWithin: { path: '', name: ARK_DATED_COPY, settledMs: 5 * 60 * 1000 },
+        validate: arkWorldPresent,
+      },
+      // Saved/Config/LinuxServer (GameUserSettings.ini, Game.ini: the mod list
+      // is ActiveMods in it) and whatever else the owner keeps in Saved. Left
+      // out is what the game and the image write again by themselves.
+      {
+        path: 'Saved',
+        children: true,
+        excludeChildren: /^(SavedArks|Logs|Crashes|webcache.*)$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+      },
+      // The image's state: mods.json (the panel's mod list), state, the admin
+      // secret. Not its backups (the same world again), nor the last restore's
+      // result, nor its staging or temp files, nor an old image's flux.log,
+      // and not a restore or an update it was asked for: restore-pending
+      // would restore from flux/backups, which a node restored from this
+      // archive does not have.
+      {
+        path: 'flux',
+        children: true,
+        excludeChildren: /^(backups|tmp|restore-pending|restore-result\.json|update-.*\.json|flux\.log(\.1)?)$|^\.flux-|\.tmp$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+      },
+      {
+        path: '',
+        children: true,
+        excludeChildren: /^(Saved|flux)$|^\.flux-|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+      },
+    ],
+  },
+  {
+    // Soulmask on runonflux/soulmask-server-flux. appdata is /mnt/soulmask/data:
+    // Saved (the game's Saved folder, which the install links to) and flux, the
+    // image's state. The 2.2 GB install, the Workshop mods and the logs are on
+    // local (ml:) mounts. What makes the full backup large is the world again:
+    // the game's own hourly copy of each world.db (YYYYmmddHH.db, never
+    // deleted by the image), and the tar.gz of the worlds the image makes on
+    // every start and every few hours (flux/backups, 8.6 MB on a fresh world).
+    id: 'soulmask-world',
+    // As in the hub's catalogue.
+    match: { name: '^soulmask', repotag: '(^|/)soulmask-server-flux', component: '^soulmask' },
+    // The world's WAL and shared-memory files are archived with it, and a
+    // restore puts back a database as of that archive: one the node still has
+    // from after it would be replayed over it.
+    restoreClear: [{ folder: 'Saved/Worlds/Dedicated/*', name: /^world\.db-(wal|shm|journal)$/ }],
+    include: [
+      // Each map's folder: world.db and whatever sits with it, but not the
+      // game's hourly copies, plus the newest of those that has settled as a
+      // restore point. On restore only these are replaced; the copies already
+      // on the node stay and are not loaded in place of the world.
+      {
+        path: 'Saved/Worlds/Dedicated',
+        required: true,
+        children: true,
+        excludeChildren: /\.sync-conflict-/,
+        excludeWithin: /^\d{10}\.db$|\.flux-(unusable-.*|new)$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+        latestWithin: { path: '', name: /^\d{10}\.db$/, settledMs: 5 * 60 * 1000 },
+        validate: soulmaskWorldPresent,
+      },
+      // Any other folder of Saved/Worlds, as the image's own backup walks it.
+      {
+        path: 'Saved/Worlds',
+        children: true,
+        excludeChildren: /^Dedicated$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+      },
+      // GameplaySettings (GameXishu.json), the permission lists and the rest of
+      // Saved. Logs is a link to the local mount; Crashes, if the game writes
+      // any, is on the data volume and is not wanted.
+      {
+        path: 'Saved',
+        children: true,
+        excludeChildren: /^(Worlds|Logs|Crashes)$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+      },
+      // The image's state: worlds.json (which maps had a world, what its world
+      // guard goes by), gameplay.json, the whitelist and the admin password.
+      // Not its backups (the same worlds again), uploads, conflict copies, nor
+      // a restore or an update it was asked for: restore-pending.json would
+      // restore from flux/backups, which a node restored from this archive
+      // does not have.
+      {
+        path: 'flux',
+        children: true,
+        excludeChildren: /^(backups|uploads|sync-conflicts|tmp|restore-pending\.json|update-.*\.json|flux\.log(\.1)?)$|^\.flux-|\.tmp$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+      },
+      // The newest tar.gz the image made of the world, with SQLite's online
+      // backup: one whole database, where the live pair may be two moments
+      // apart (the server commits every few seconds, and the standby's
+      // database and WAL arrive on their own). The image's restore and world
+      // guard find a backup by this name.
+      { path: 'flux/backups', latest: { name: /^\d{8}-\d{6}-soulmask\.tar\.gz$/, settledMs: 5 * 60 * 1000 } },
+      {
+        path: '',
+        children: true,
+        excludeChildren: /^(Saved|flux)$|^\.flux-|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+      },
+    ],
+  },
+  {
+    // Conan Exiles (Enhanced, Linux) on runonflux/conanexiles-server-flux.
+    // appdata is /mnt/conan/data: Saved (the game's Saved folder, which the
+    // install links to) and flux, the image's state. The 4.2 GB install, the
+    // Workshop mods and the logs are on local (ml:) mounts. What makes the full
+    // backup large is the world again: the game's own rotating copies
+    // game_0_backup_N.db, each as large as game_0.db, and the tar.gz of the
+    // world the image makes on every start and every few hours (flux/backups).
+    id: 'conan-exiles-world',
+    // As in the hub's catalogue. It also matches the earlier alinmear/
+    // docker-conanexiles, whose volume has no Saved at its top: that one gets
+    // the full backup.
+    match: { name: '^conanexiles', repotag: '(^|/)(conanexiles-server-flux|docker-conanexiles)', component: '^conanexiles' },
+    // The world's WAL and shared-memory files are archived with it, and a
+    // restore puts back a database as of that archive: one the node still has
+    // from after it would be replayed over it. The names are the image's
+    // put_world: a legacy game.db that is restored beside a game_0.db the node
+    // has would never be loaded, and validate guarantees the archive holds one.
+    restoreClear: [{ folder: 'Saved', name: /^game(_0)?\.db(-wal|-shm|-journal)?$/ }],
+    include: [
+      // game_0.db with its sidecars, Config/LinuxServer (the .ini files) and
+      // blacklist.txt, but not the game's rotating copies, nor Logs, Crashes
+      // and ExtractedMods, which are links to the local mount.
+      {
+        path: 'Saved',
+        required: true,
+        children: true,
+        excludeChildren: /^(Logs|Crashes|ExtractedMods)$|^game(_\d+)?_backup_\d+\.db$|\.flux-(unusable-.*|new)$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+        validate: conanWorldPresent,
+      },
+      // The image's state: worlds.json (which the world guard goes by),
+      // mods.json, the RCON password, the bans and settings it has queued.
+      // Not its backups but the newest, below, nor imports, conflict copies,
+      // a restore, new-world or update it was asked for: restore-pending.json
+      // is read at the next start and could wipe the world or restore from
+      // flux/backups, which a node restored from this archive does not have.
+      {
+        path: 'flux',
+        children: true,
+        excludeChildren: /^(backups|import|sync-conflicts|tmp|restore-pending\.json|update-.*\.json|mods-update-.*\.json|flux\.log(\.1)?)$|^\.flux-|\.tmp$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+      },
+      // The newest tar.gz the image made of the world, with SQLite's online
+      // backup: one whole database, where the live pair may be two moments
+      // apart (the server commits every few seconds, and the standby's
+      // database and WAL arrive on their own). A restore point the owner can
+      // pick from the panel; the image uses one by itself only when game_0.db
+      // is missing or is not SQLite. It finds a backup by this name.
+      { path: 'flux/backups', latest: { name: /^\d{8}-\d{6}-conan\.tar\.gz$/, settledMs: 5 * 60 * 1000 } },
+      {
+        path: '',
+        children: true,
+        excludeChildren: /^(Saved|flux)$|^\.flux-|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+      },
+    ],
+  },
+  {
+    // Garry's Mod on runonflux/garrysmod-server-flux. appdata is the game's own
+    // folder, /mnt/gmod/server/garrysmod, a g: mount inside the install, which
+    // is local (ml:) like the Workshop cache beside it. It is synced whole
+    // because Flux's mount string cannot name the owner's files one by one, so
+    // it holds ~1.1 GB of the game's stock .vpk files too, beside the owner's
+    // cfg, data, addons, gamemodes and maps and the console logs in flux/.
+    // SteamCMD downloads the stock files again, anonymously (app 4020). The
+    // folder, from the depot manifests of 2026.09.17: garrysmod_dir.vpk and
+    // 4 more .vpk (1.1 GB), steam.inf and garrysmod.ver, and the stock bin
+    // (the server's own modules), maps, resource, gamemodes, scenes, lua,
+    // settings, particles and cfg, in which the owner's files sit too.
+    id: 'garrysmod-data',
+    // As in the hub's catalogue. It also matches ich777/steamcmd:garrysmod,
+    // whose volume is the whole install: that one gets the full backup.
+    match: { name: 'garrysmod', repotag: 'steamcmd:garrysmod', component: '^garrysmod' },
+    include: [
+      // Everything the owner keeps, but not the stock .vpk files at the top
+      // (a vpk is only ever loaded from there when the game's own gameinfo names
+      // it), nor the game's own bin (its server modules) and build files, which
+      // a restore would put back older than the install after a game update, the
+      // console logs, nor the Workshop cache. The owner's binary modules are in
+      // lua/bin, not here. validate keeps this to the layout the profile was written for.
+      {
+        path: '',
+        children: true,
+        shallow: true,
+        excludeChildren: /\.vpk$|^(bin|steam\.inf|garrysmod\.ver|cache|flux)$|^\.flux-|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+        validate: gmodFolderSettled,
       },
     ],
   },

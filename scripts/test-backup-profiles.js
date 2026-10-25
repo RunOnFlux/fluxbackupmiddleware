@@ -976,7 +976,7 @@ async function main() {
     assert.strictEqual(byComponent('server', { repotag: 'acekorneya/asa_server:2_1_latest' }).id, 'ark-ascended-world', 'by image');
     assert.strictEqual(backupProfiles.profileForComponent({
       appname: 'arksurvivalevolved1790000000000', component: 'arksurvivalevolved', repotag: 'runonflux/ase-server-flux:latest', componentCount: 1,
-    }), null, 'ARK: Survival Evolved has another layout');
+    }).id, 'ark-evolved-world', 'ARK: Survival Evolved has a profile of its own, not this one');
 
     // A save on the local ASA 94.15 run (2026-10-05): the world, a player and a
     // tribe, the game's copies of the last saves and the anti-corruption copy.
@@ -1447,6 +1447,325 @@ async function main() {
     const wArriving = await wPlanOf({ profileFolder: [wDir('RocksDB_v2', 22683654), wFile('.syncthing.x.tmp', 9, 1)] });
     assert(wArriving.unsettled && /still being synced/.test(wArriving.reason), 'a sync arriving');
     assert(!(await wPlanOf({ profileFolder: [wDir('RocksDB_v2', 22683654), wFile('.syncthing.x.tmp', 9, 600)] })).reason, 'a sync given up on hours ago');
+
+    // --- ARK: Survival Evolved ------------------------------------------------------
+    const ase = backupProfiles.profileForComponent({
+      appname: 'arksurvivalevolved1790000000000', component: 'arksurvivalevolvedarksurvivalevolved', repotag: null, componentCount: 1,
+    });
+    assert.strictEqual(ase.id, 'ark-evolved-world', 'marketplace component');
+    assert.strictEqual(byComponent('server', { repotag: 'runonflux/ase-server-flux:1.0.4' }).id, 'ark-evolved-world', 'by image');
+    assert.strictEqual(byComponent('arksurvivalascended').id, 'ark-ascended-world', 'Ascended keeps its own profile');
+    assert.strictEqual(byComponent('server', { repotag: 'acekorneya/asa_server:2_1_latest' }).id, 'ark-ascended-world');
+
+    const eFile = (name, size, minutesAgo = 30) => ({
+      name, size, isFile: true, isDirectory: false, modifiedAt: at(minutesAgo),
+    });
+    const eDir = (name, size) => ({
+      name, size, isFile: false, isDirectory: true, modifiedAt: at(30),
+    });
+    const EMAP = 'Ragnarok';
+    const aseWorld = [
+      eFile(`${EMAP}.ark`, 61000000), eFile('1415497718.arkprofile', 9000), eFile('2.arktribe', 4096),
+    ];
+    const aseCopies = [
+      eFile(`${EMAP}.ark.bak`, 61000000, 900), eFile('1415497718.profilebak', 9000), eFile('2.tribebak', 4096),
+      eFile(`${EMAP}_17.10.2026_21.19.11.ark`, 60000000, 1100),
+      eFile(`${EMAP}_18.10.2026_13.35.12.ark`, 60500000, 138),
+      eFile(`${EMAP}_18.10.2026_15.50.12.ark`, 60900000, 2),
+    ];
+    const aseVolume = ({
+      maps = [eDir(EMAP, 244000000), eDir('clusters', 100), eDir('.flux-premigration', 300000000)], mapFiles = [...aseWorld, ...aseCopies],
+    } = {}) => async (folder) => {
+      switch (folder) {
+        case '': return [eDir('Saved', 900000000), eDir('flux', 400000000), eFile('.flux-backup', 1)];
+        case 'Saved': return [eDir('SavedArks', 700000000), eDir('Config', 21000), eDir('Logs', 9000000), eDir('Crashes', 3000)];
+        case 'Saved/SavedArks': return maps;
+        case `Saved/SavedArks/${EMAP}`: return mapFiles;
+        case 'Saved/SavedArks/clusters': return [];
+        case 'flux': return [
+          eDir('backups', 300000000), eDir('tmp', 10), eFile('state.json', 900), eFile('mods.json', 300), eFile('admin.secret', 20),
+          eFile('restore-pending', 1), eFile('update-check.json', 200), eFile('restore-result.json', 90), eFile('flux.log', 5000000),
+          eDir('.flux-before-restore-1', 700000000), eFile('.flux-x.tmp', 3),
+        ];
+        default: return [];
+      }
+    };
+    const asePlanOf = async (options) => backupProfiles.planProfiledArchive(
+      ase,
+      await backupProfiles.collectProfileListings(ase, aseVolume(options)),
+    );
+    assert.deepStrictEqual((await asePlanOf()).sources, [
+      'appdata/.flux-backup',
+      ...aseWorld.map((kept) => `appdata/Saved/SavedArks/${EMAP}/${kept.name}`),
+      // The newest dated copy that has settled, not the one written 2 minutes ago.
+      `appdata/Saved/SavedArks/${EMAP}/${EMAP}_18.10.2026_13.35.12.ark`,
+      'appdata/Saved/Config',
+      'appdata/flux/state.json', 'appdata/flux/mods.json', 'appdata/flux/admin.secret',
+    ]);
+    assert.match((await asePlanOf({ mapFiles: [eFile(`${EMAP}_18.10.2026_13.35.12.ark`, 60500000)] })).reason, /no world/, 'only a dated copy');
+    assert.match((await asePlanOf({ mapFiles: [eFile(`${EMAP}.ark`, 0)] })).reason, /no world/, 'an empty world');
+    const aseSyncing = await asePlanOf({ mapFiles: [...aseWorld, eFile(`.syncthing.${EMAP}.ark.tmp`, 9, 1)] });
+    assert(aseSyncing.unsettled && /still being synced/.test(aseSyncing.reason), 'a sync arriving');
+    // The 1.0.0/1.0.1 layout, worlds loose in SavedArks, and an older image's
+    // volume (no Saved/SavedArks at the top) both take the full backup.
+    assert.match((await asePlanOf({ maps: [eFile(`${EMAP}.ark`, 61000000)] })).reason, /no world/, 'worlds not yet in a folder per map');
+    const aseLegacy = backupProfiles.planProfiledArchive(
+      ase,
+      await backupProfiles.collectProfileListings(ase, async (folder) => (folder === '' ? [eDir('ShooterGame', 23000000000), eDir('steamapps', 1000)] : null)),
+    );
+    assert.match(aseLegacy.reason, /Saved\/SavedArks does not exist/, 'a volume that is the whole install');
+
+    // --- Soulmask -------------------------------------------------------------------
+    const soulmask = backupProfiles.profileForComponent({
+      appname: 'soulmask1790000000000', component: 'soulmasksoulmask', repotag: null, componentCount: 1,
+    });
+    assert.strictEqual(soulmask.id, 'soulmask-world', 'marketplace component');
+    assert.strictEqual(byComponent('server', { repotag: 'runonflux/soulmask-server-flux:1.0.2' }).id, 'soulmask-world', 'by image');
+
+    // Cloud Mist Forest on image 1.0.2 (2026-10-23): the world, SQLite's
+    // sidecars while it runs, the game's hourly copies.
+    const smFile = (name, size, minutesAgo = 30) => ({
+      name, size, isFile: true, isDirectory: false, modifiedAt: at(minutesAgo),
+    });
+    const smDir = (name, size) => ({
+      name, size, isFile: false, isDirectory: true, modifiedAt: at(30),
+    });
+    const SMAP = 'Level01_Main';
+    const soulWorld = [smFile('world.db', 40000000), smFile('world.db-wal', 4000000), smFile('world.db-shm', 32768)];
+    const soulCopies = [
+      smFile('2026102310.db', 39000000, 1500), smFile('2026102312.db', 39500000, 800), smFile('2026102314.db', 39900000, 2),
+      smFile('world.db.flux-unusable-20261024', 39000000, 3000),
+    ];
+    const soulVolume = ({ mapFiles = [...soulWorld, ...soulCopies], dedicated = [smDir(SMAP, 120000000)], saved = null } = {}) => async (folder) => {
+      switch (folder) {
+        case '': return [smDir('Saved', 130000000), smDir('flux', 9000000), smFile('.flux-backup', 1)];
+        case 'Saved': return saved || [
+          smDir('Worlds', 120000000), smDir('GameplaySettings', 4000), smDir('Logs', 0), smDir('Crashes', 0), smFile('WhiteAccountList.txt', 40),
+        ];
+        case 'Saved/Worlds': return [smDir('Dedicated', 120000000), smDir('Creative', 5000)];
+        case 'Saved/Worlds/Dedicated': return dedicated;
+        case `Saved/Worlds/Dedicated/${SMAP}`: return mapFiles;
+        case 'flux/backups': return [
+          smFile('20261024-090000-soulmask.tar.gz', 8600000, 900), smFile('20261025-030000-soulmask.tar.gz', 8700000, 200),
+          smFile('20261025-090000-soulmask.tar.gz', 8700000, 2), smFile('index.json', 900, 2),
+        ];
+        case 'flux': return [
+          smDir('backups', 8600000), smDir('.flux-backup-ab12', 40000000), smFile('flux.log', 5000000), smDir('uploads', 40000000), smDir('sync-conflicts', 10), smFile('state.json', 700), smFile('worlds.json', 90),
+          smFile('gameplay.json', 300), smFile('whitelist.json', 20), smFile('restore-pending.json', 80), smFile('update-state.json', 80),
+        ];
+        default: return [];
+      }
+    };
+    const soulPlanOf = async (options) => backupProfiles.planProfiledArchive(
+      soulmask,
+      await backupProfiles.collectProfileListings(soulmask, soulVolume(options)),
+    );
+    assert.deepStrictEqual((await soulPlanOf()).sources, [
+      'appdata/.flux-backup',
+      ...soulWorld.map((kept) => `appdata/Saved/Worlds/Dedicated/${SMAP}/${kept.name}`),
+      // The newest hourly copy at least five minutes old, not the one from 2 minutes ago.
+      `appdata/Saved/Worlds/Dedicated/${SMAP}/2026102312.db`,
+      'appdata/Saved/Worlds/Creative',
+      'appdata/Saved/GameplaySettings', 'appdata/Saved/WhiteAccountList.txt',
+      'appdata/flux/state.json', 'appdata/flux/worlds.json', 'appdata/flux/gameplay.json', 'appdata/flux/whitelist.json',
+      // The image's own consistent copy of the world: the newest settled one.
+      'appdata/flux/backups/20261025-030000-soulmask.tar.gz',
+    ]);
+    assert.match((await soulPlanOf({ mapFiles: soulCopies })).reason, /no world/, 'only the game\'s hourly copies');
+    assert.match((await soulPlanOf({ mapFiles: [smFile('world.db', 0)] })).reason, /no world/, 'an empty world');
+    assert.match((await soulPlanOf({ dedicated: [] })).reason, /no world/, 'a server that has not made its world');
+    const soulSyncing = await soulPlanOf({ mapFiles: [...soulWorld, smFile('.syncthing.world.db.tmp', 9, 1)] });
+    assert(soulSyncing.unsettled && /still being synced/.test(soulSyncing.reason), 'a sync arriving');
+    assert(!(await soulPlanOf({ mapFiles: [...soulWorld, smFile('.syncthing.world.db.tmp', 9, 600)] })).reason, 'a sync given up on hours ago');
+    // An earlier community image kept the world elsewhere: the full backup.
+    const soulLegacy = backupProfiles.planProfiledArchive(
+      soulmask,
+      await backupProfiles.collectProfileListings(soulmask, async (folder) => (folder === '' ? [smDir('WS', 9000000000), smDir('steamcmd', 1000)] : null)),
+    );
+    assert.match(soulLegacy.reason, /Saved\/Worlds\/Dedicated does not exist/, 'sknnr layout');
+
+    // --- Conan Exiles ---------------------------------------------------------------
+    const conan = backupProfiles.profileForComponent({
+      appname: 'conanexiles1790000000000', component: 'conanexilesconanexiles', repotag: null, componentCount: 1,
+    });
+    assert.strictEqual(conan.id, 'conan-exiles-world', 'marketplace component');
+    assert.strictEqual(byComponent('server', { repotag: 'runonflux/conanexiles-server-flux:1.0.2' }).id, 'conan-exiles-world', 'by image');
+    assert.strictEqual(byComponent('server', { repotag: 'alinmear/docker-conanexiles:latest' }).id, 'conan-exiles-world', 'the earlier image is matched too');
+    assert.deepStrictEqual(backupProfiles.restoreClearRules(conan).map((rule) => rule.folder), ['Saved']);
+    assert(new RegExp(backupProfiles.restoreClearRules(conan)[0].name).test('game_0.db-wal'));
+    const conanClear = new RegExp(backupProfiles.restoreClearRules(conan)[0].name);
+    assert(conanClear.test('game.db-journal') && conanClear.test('game.db') && conanClear.test('game_0.db'), 'what put_world replaces');
+    assert(!conanClear.test('game_0_backup_1.db') && !conanClear.test('game_0.db.flux-unusable-1'), 'not the copies');
+    assert.deepStrictEqual(backupProfiles.restoreClearRules(soulmask).map((rule) => rule.folder), ['Saved/Worlds/Dedicated/*']);
+
+    const cFile = (name, size, minutesAgo = 30) => ({
+      name, size, isFile: true, isDirectory: false, modifiedAt: at(minutesAgo),
+    });
+    const cDir = (name, size) => ({
+      name, size, isFile: false, isDirectory: true, modifiedAt: at(30),
+    });
+    const conanSaved = [
+      cFile('game_0.db', 180000000), cFile('game_0.db-wal', 4000000, 1), cFile('game_0.db-shm', 32768, 1),
+      cDir('Config', 21000), cFile('blacklist.txt', 40),
+    ];
+    const conanCopies = [
+      cFile('game_0_backup_1.db', 179000000, 700), cFile('game_0_backup_2.db', 178000000, 1400), cFile('game_0.db.flux-unusable-20261024', 180000000, 2000),
+      cFile('game_0.db.flux-new', 180000000, 1),
+    ];
+    const conanVolume = ({ saved = [...conanSaved, ...conanCopies] } = {}) => async (folder) => {
+      switch (folder) {
+        case '': return [cDir('Saved', 540000000), cDir('flux', 190000000), cFile('.flux-backup', 1)];
+        case 'Saved': return [...saved, cDir('Logs', 0), cDir('Crashes', 0), cDir('ExtractedMods', 0)];
+        case 'flux/backups': return [
+          cFile('20261025-030000-conan.tar.gz', 40000000, 200), cFile('20261025-090000-conan.tar.gz', 40000000, 2), cFile('index.json', 900, 2),
+        ];
+        case 'flux': return [
+          cDir('backups', 180000000), cFile('flux.log', 5000000), cDir('.flux-restore-x', 9), cDir('import', 9000000), cDir('sync-conflicts', 10), cFile('state.json', 700), cFile('worlds.json', 90),
+          cFile('mods.json', 300), cFile('rcon-password', 20), cFile('bans-pending.json', 20), cFile('settings-pending.json', 80),
+          cFile('restore-pending.json', 80), cFile('update-target.json', 80), cFile('mods-update-target.json', 80),
+        ];
+        default: return [];
+      }
+    };
+    const conanPlanOf = async (options) => backupProfiles.planProfiledArchive(
+      conan,
+      await backupProfiles.collectProfileListings(conan, conanVolume(options)),
+    );
+    assert.deepStrictEqual((await conanPlanOf()).sources, [
+      'appdata/.flux-backup',
+      ...conanSaved.map((kept) => `appdata/Saved/${kept.name}`),
+      'appdata/flux/state.json', 'appdata/flux/worlds.json', 'appdata/flux/mods.json', 'appdata/flux/rcon-password',
+      'appdata/flux/bans-pending.json', 'appdata/flux/settings-pending.json',
+      'appdata/flux/backups/20261025-030000-conan.tar.gz',
+    ]);
+    assert.match((await conanPlanOf({ saved: conanCopies })).reason, /no world/, 'only the game\'s rotating copies');
+    assert.match((await conanPlanOf({ saved: [cFile('game_0.db', 0)] })).reason, /no world/, 'an empty world');
+    assert.strictEqual((await conanPlanOf({ saved: [cFile('game.db', 90000000)] })).reason, undefined, 'an imported pre-Enhanced world');
+    const conanSyncing = await conanPlanOf({ saved: [...conanSaved, cFile('.syncthing.game_0.db.tmp', 9, 1)] });
+    assert(conanSyncing.unsettled && /still being synced/.test(conanSyncing.reason), 'a sync arriving');
+    // The Wine server of docker-conanexiles keeps its saves inside the install.
+    const conanLegacy = backupProfiles.planProfiledArchive(
+      conan,
+      await backupProfiles.collectProfileListings(conan, async (folder) => (folder === '' ? [cDir('ConanSandbox', 9000000000), cDir('Engine', 1000)] : null)),
+    );
+    assert.match(conanLegacy.reason, /Saved does not exist/, 'the earlier image\'s layout');
+
+    // --- Garry's Mod ----------------------------------------------------------------
+    const gmod = backupProfiles.profileForComponent({
+      appname: 'garrysmod1790000000000', component: 'garrysmodgarrysmod', repotag: null, componentCount: 1,
+    });
+    assert.strictEqual(gmod.id, 'garrysmod-data', 'marketplace component');
+    assert.strictEqual(byComponent('garrysmod').id, 'garrysmod-data', 'hub plan component');
+    assert.strictEqual(byComponent('server', { repotag: 'ich777/steamcmd:garrysmod' }).id, 'garrysmod-data', 'the earlier image is matched too');
+
+    // The folder as the image lists it (2026-10-08): the stock .vpk files, the
+    // owner's folders, sv.db with the addons' data, the console logs.
+    const gFile = (name, size, minutesAgo = 30) => ({
+      name, size, isFile: true, isDirectory: false, modifiedAt: at(minutesAgo),
+    });
+    const gDir = (name, size) => ({
+      name, size, isFile: false, isDirectory: true, modifiedAt: at(30),
+    });
+    // The stock folders are the depot manifests' of 2026.09.17 (app 4020).
+    const gmodKept = [
+      gDir('cfg', 9000), gDir('data', 120000), gDir('addons', 4000000), gDir('gamemodes', 3000000), gDir('maps', 92100000),
+      gDir('lua', 1300000), gFile('sv.db', 24576), gDir('settings', 800000), gDir('resource', 37700000), gDir('scenes', 2700000),
+      gDir('particles', 700000), gFile('gameinfo.txt', 800),
+    ];
+    const gmodLeftOut = [
+      gFile('garrysmod_dir.vpk', 330000), gFile('garrysmod_000.vpk', 1000000000), gFile('fallbacks_dir.vpk', 900), gFile('fallbacks_000.vpk', 90000000),
+      gFile('garrysmod.ver', 40), gFile('steam.inf', 80), gDir('bin', 28600000), gDir('flux', 200000000), gDir('cache', 0), gFile('.flux-backup', 1),
+    ];
+    const gmodPlanOf = async (listing) => backupProfiles.planProfiledArchive(
+      gmod,
+      await backupProfiles.collectProfileListings(gmod, async (folder) => (folder === '' ? listing : [])),
+    );
+    const gmodPlan = await gmodPlanOf([...gmodKept, ...gmodLeftOut]);
+    assert.strictEqual(gmodPlan.reason, undefined, 'the stock folder fits');
+    assert.deepStrictEqual(gmodPlan.sources, [
+      'appdata/.flux-backup', ...gmodKept.map((kept) => `appdata/${kept.name}`),
+    ]);
+    // The stock folder count is the game's, and the owner adds more: past the 20 an entry lists one level deeper, a `shallow` entry has no limit.
+    const manyFolders = Array.from({ length: 40 }, (_, i) => gDir(`folder${i}`, 1000));
+    assert.strictEqual((await gmodPlanOf([...manyFolders, ...gmodLeftOut])).reason, undefined, '40 folders');
+    // The same through the node: 40 folders reach compressobject with the right sources.
+    const GAPP = 'garrysmod1790000000000';
+    const GCOMP = 'garrysmodgarrysmod';
+    const gRoute = (folder, entries) => ({
+      match: (r) => r.method === 'get' && r.url === `${NODE}/apps/getfolderinfo/${GAPP}/${GCOMP}/${encodeURIComponent(folder)}`,
+      reply: () => success(entries),
+    });
+    calls.length = 0;
+    routes = [
+      gRoute('appdata', [...manyFolders, ...gmodKept.slice(-1), ...gmodLeftOut]),
+      {
+        match: (r) => r.url.startsWith(`${NODE}/apps/createfolder/`),
+        reply: () => ({ status: 200, headers: {}, data: { status: 'success', data: {} } }),
+      },
+      {
+        match: (r) => r.method === 'post' && r.url === `${NODE}/apps/compressobject`,
+        reply: () => ({ status: 202, headers: {}, data: { status: 'success', data: { jobId: 'job-g' } } }),
+      },
+      {
+        match: (r) => r.url === `${NODE}/apps/operations/job-g`,
+        reply: () => success({ status: 'Succeeded' }),
+      },
+    ];
+    outcome = await fluxOS.testHooks.createProfiledArchiveOnNode(NODE, 'auth', GAPP, GCOMP, gmod, []);
+    assert.deepStrictEqual(outcome, { fits: true });
+    assert.deepStrictEqual(calls.find((r) => r.url.endsWith('/apps/compressobject')).data.source, [
+      'appdata/.flux-backup', ...manyFolders.map((folder) => `appdata/${folder.name}`), 'appdata/gameinfo.txt',
+    ]);
+    assert(!calls.some((r) => r.url.includes('/apps/getfolderinfo/') && /folder\d/.test(decodeURIComponent(r.url))), 'a shallow entry never lists its folders');
+    // A shallow entry is compared by its folders' own size and time.
+    const gmodBefore = await backupProfiles.collectProfileListings(gmod, async (folder) => (folder === '' ? [...gmodKept, ...gmodLeftOut] : []));
+    assert(backupProfiles.sameListings(gmodBefore, JSON.parse(JSON.stringify(gmodBefore))));
+    const gmodAfter = JSON.parse(JSON.stringify(gmodBefore));
+    gmodAfter[''].find((item) => item.name === 'data').size += 1;
+    assert(!backupProfiles.sameListings(gmodBefore, gmodAfter), 'a folder that grew');
+    // `shallow` does not widen the limit of the other entries: 21 folders in Soulmask's Saved are still refused.
+    const soulManyFolders = Array.from({ length: 21 }, (_, i) => smDir(`f${i}`, 10));
+    assert.match((await soulPlanOf({ saved: soulManyFolders })).reason, /holds more than 20 folders to check/);
+    // And it is not allowed with the options that need those listings.
+    assert.match(backupProfiles.planProfiledArchive(
+      {
+        include: [{
+          path: '', children: true, shallow: true, excludeWithin: /x/,
+        }],
+      },
+      {
+        '': [gDir('a', 1)],
+      },
+    ).reason, /shallow cannot be combined/);
+    const gmodSyncing = await gmodPlanOf([...gmodKept, ...gmodLeftOut, gFile('.syncthing.sv.db.tmp', 9, 1)]);
+    assert(gmodSyncing.unsettled && /still being synced/.test(gmodSyncing.reason), 'a sync arriving');
+    // ich777/steamcmd:garrysmod: the volume is serverfiles, with the game folder one level down.
+    const gmodLegacy = await gmodPlanOf([gDir('garrysmod', 6000000000), gDir('bin', 300000000), gFile('srcds_run', 20000), gFile('srcds_linux', 90000)]);
+    assert.match(gmodLegacy.reason, /no stock garrysmod_dir\.vpk/, 'the earlier image\'s layout');
+    assert.match((await gmodPlanOf([...gmodKept, gFile('garrysmod_dir.vpk', 0)])).reason, /no stock garrysmod_dir\.vpk/, 'a game folder with no stock files yet');
+
+    // --- The games of the hub with no profile (2026-10-25) --------------------------
+    // Their data volumes are saves and settings already (the install is on a
+    // local mount, or in the image), so none of them may fall under a profile
+    // written for another game: each marketplace component and image is checked.
+    const withoutProfile = [
+      ['factorio', 'factoriotools/factorio:stable'], ['unturnedunturned', 'runonflux/unturned-server-flux:1.2.2'],
+      ['dontstarvetogetherdontstarvetogether', 'runonflux/dst-server-flux:1.0.1'], ['corekeepercorekeeper', 'runonflux/corekeeper-server-flux:1.0.4'],
+      ['tmodloadertmodloader', 'runonflux/tmodloader-server-flux:1.0.4'], ['theisletheisle', 'runonflux/theisle-server-flux:1.1.2'],
+      ['eurotrucksimulator2eurotrucksimulator2', 'runonflux/truckersim-server-flux:1.0.5'], ['americantrucksimulatoramericantrucksimulator', 'runonflux/truckersim-server-flux:1.0.5'],
+      ['teamfortress2teamfortress2', 'runonflux/tf2-server-flux:1.0.2'], ['vintagestoryvintagestory', 'runonflux/vintagestory-server-flux:1.0.3'],
+      ['beammpbeammp', 'runonflux/beammp-server-flux:1.0.3'], ['armareforgerarmareforger', 'runonflux/arma-reforger:latest'],
+    ];
+    withoutProfile.forEach(([component, repotag]) => {
+      assert.strictEqual(byComponent(component, { appname: `${component}1790000000000` }), null, `${component} by component`);
+      assert.strictEqual(byComponent('server', { repotag, appname: 'x1' }), null, `${repotag} by image`);
+    });
+    // And the four that have one do not resolve to each other, nor to a neighbour.
+    [
+      ['arksurvivalevolvedarksurvivalevolved', 'ark-evolved-world'], ['arksurvivalascendedarksurvivalascended', 'ark-ascended-world'],
+      ['soulmasksoulmask', 'soulmask-world'], ['conanexilesconanexiles', 'conan-exiles-world'], ['garrysmodgarrysmod', 'garrysmod-data'],
+      ['terrariaterraria', 'terraria-world'], ['rustrust', 'rust-world'],
+    ].forEach(([component, id]) => assert.strictEqual(byComponent(component, { appname: `${component}1790000000000` }).id, id, component));
 
     // --- Satisfactory ---------------------------------------------------------------
     const satisfactory = backupProfiles.profileForComponent({
