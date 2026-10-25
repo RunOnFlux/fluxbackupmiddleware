@@ -1536,10 +1536,10 @@ async function main() {
       smFile('2026102310.db', 39000000, 1500), smFile('2026102312.db', 39500000, 800), smFile('2026102314.db', 39900000, 2),
       smFile('world.db.flux-unusable-20261024', 39000000, 3000),
     ];
-    const soulVolume = ({ mapFiles = [...soulWorld, ...soulCopies], dedicated = [smDir(SMAP, 120000000)] } = {}) => async (folder) => {
+    const soulVolume = ({ mapFiles = [...soulWorld, ...soulCopies], dedicated = [smDir(SMAP, 120000000)], saved = null } = {}) => async (folder) => {
       switch (folder) {
         case '': return [smDir('Saved', 130000000), smDir('flux', 9000000), smFile('.flux-backup', 1)];
-        case 'Saved': return [
+        case 'Saved': return saved || [
           smDir('Worlds', 120000000), smDir('GameplaySettings', 4000), smDir('Logs', 0), smDir('Crashes', 0), smFile('WhiteAccountList.txt', 40),
         ];
         case 'Saved/Worlds': return [smDir('Dedicated', 120000000), smDir('Creative', 5000)];
@@ -1666,13 +1666,15 @@ async function main() {
     const gDir = (name, size) => ({
       name, size, isFile: false, isDirectory: true, modifiedAt: at(30),
     });
+    // The stock folders are the depot manifests' of 2026.09.17 (app 4020).
     const gmodKept = [
-      gDir('cfg', 9000), gDir('data', 120000), gDir('addons', 4000000), gDir('gamemodes', 30000000), gDir('maps', 700000000),
-      gDir('lua', 40000000), gFile('sv.db', 24576), gDir('settings', 100),
+      gDir('cfg', 9000), gDir('data', 120000), gDir('addons', 4000000), gDir('gamemodes', 3000000), gDir('maps', 92100000),
+      gDir('lua', 1300000), gFile('sv.db', 24576), gDir('settings', 800000), gDir('resource', 37700000), gDir('scenes', 2700000),
+      gDir('particles', 700000), gFile('gameinfo.txt', 800),
     ];
     const gmodLeftOut = [
       gFile('garrysmod_dir.vpk', 330000), gFile('garrysmod_000.vpk', 1000000000), gFile('fallbacks_dir.vpk', 900), gFile('fallbacks_000.vpk', 90000000),
-      gFile('garrysmod.ver', 40), gDir('flux', 200000000), gDir('cache', 0), gFile('.flux-backup', 1),
+      gFile('garrysmod.ver', 40), gFile('steam.inf', 80), gDir('bin', 28600000), gDir('flux', 200000000), gDir('cache', 0), gFile('.flux-backup', 1),
     ];
     const gmodPlanOf = async (listing) => backupProfiles.planProfiledArchive(
       gmod,
@@ -1686,6 +1688,46 @@ async function main() {
     // The stock folder count is the game's, and the owner adds more: past the 20 an entry lists one level deeper, a `shallow` entry has no limit.
     const manyFolders = Array.from({ length: 40 }, (_, i) => gDir(`folder${i}`, 1000));
     assert.strictEqual((await gmodPlanOf([...manyFolders, ...gmodLeftOut])).reason, undefined, '40 folders');
+    // The same through the node: 40 folders reach compressobject with the right sources.
+    const GAPP = 'garrysmod1790000000000';
+    const GCOMP = 'garrysmodgarrysmod';
+    const gRoute = (folder, entries) => ({
+      match: (r) => r.method === 'get' && r.url === `${NODE}/apps/getfolderinfo/${GAPP}/${GCOMP}/${encodeURIComponent(folder)}`,
+      reply: () => success(entries),
+    });
+    calls.length = 0;
+    routes = [
+      gRoute('appdata', [...manyFolders, ...gmodKept.slice(-1), ...gmodLeftOut]),
+      {
+        match: (r) => r.url.startsWith(`${NODE}/apps/createfolder/`),
+        reply: () => ({ status: 200, headers: {}, data: { status: 'success', data: {} } }),
+      },
+      {
+        match: (r) => r.method === 'post' && r.url === `${NODE}/apps/compressobject`,
+        reply: () => ({ status: 202, headers: {}, data: { status: 'success', data: { jobId: 'job-g' } } }),
+      },
+      { match: (r) => r.url === `${NODE}/apps/operations/job-g`, reply: () => success({ status: 'Succeeded' }) },
+    ];
+    outcome = await fluxOS.testHooks.createProfiledArchiveOnNode(NODE, 'auth', GAPP, GCOMP, gmod, []);
+    assert.deepStrictEqual(outcome, { fits: true });
+    assert.deepStrictEqual(calls.find((r) => r.url.endsWith('/apps/compressobject')).data.source, [
+      'appdata/.flux-backup', ...manyFolders.map((folder) => `appdata/${folder.name}`), 'appdata/gameinfo.txt',
+    ]);
+    assert(!calls.some((r) => r.url.includes('/apps/getfolderinfo/') && /folder\d/.test(decodeURIComponent(r.url))), 'a shallow entry never lists its folders');
+    // A shallow entry is compared by its folders' own size and time.
+    const gmodBefore = await backupProfiles.collectProfileListings(gmod, async (folder) => (folder === '' ? [...gmodKept, ...gmodLeftOut] : []));
+    assert(backupProfiles.sameListings(gmodBefore, JSON.parse(JSON.stringify(gmodBefore))));
+    const gmodAfter = JSON.parse(JSON.stringify(gmodBefore));
+    gmodAfter[''].find((item) => item.name === 'data').size += 1;
+    assert(!backupProfiles.sameListings(gmodBefore, gmodAfter), 'a folder that grew');
+    // `shallow` does not widen the limit of the other entries: 21 folders in Soulmask's Saved are still refused.
+    const soulManyFolders = Array.from({ length: 21 }, (_, i) => smDir(`f${i}`, 10));
+    assert.match((await soulPlanOf({ saved: soulManyFolders })).reason, /holds more than 20 folders to check/);
+    // And it is not allowed with the options that need those listings.
+    assert.match(backupProfiles.planProfiledArchive(
+      { include: [{ path: '', children: true, shallow: true, excludeWithin: /x/ }] },
+      { '': [gDir('a', 1)] },
+    ).reason, /shallow cannot be combined/);
     const gmodSyncing = await gmodPlanOf([...gmodKept, ...gmodLeftOut, gFile('.syncthing.sv.db.tmp', 9, 1)]);
     assert(gmodSyncing.unsettled && /still being synced/.test(gmodSyncing.reason), 'a sync arriving');
     // ich777/steamcmd:garrysmod: the volume is serverfiles, with the game folder one level down.

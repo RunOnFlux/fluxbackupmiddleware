@@ -47,7 +47,9 @@
  *                one level deeper, so there is no limit to how many it holds.
  *                For a directory whose `validate` reads only its own entries
  *                and whose folders are the owner's (Garry's Mod's game folder)
- *                and are compared by their own size and time
+ *                and are compared by their own size and time. Not with
+ *                excludeWithin or latestWithin, which need those listings: the
+ *                plan refuses it
  *   excludeWithin  with `children`: a child FOLDER is archived as what it
  *                holds, each entry on its own, leaving out those matching; the
  *                folders kept inside it are listed in turn for `validate`, and
@@ -548,7 +550,8 @@ function soulmaskWorldPresent(listing, now = Date.now()) {
  * worlds.
  */
 function conanWorldPresent(listing, now = Date.now()) {
-  const arriving = syncArriving([...listing, ...(listing.leftOut || [])], now);
+  const inside = listing.flatMap((item) => (Array.isArray(item.children) ? item.children : []));
+  const arriving = syncArriving([...listing, ...(listing.leftOut || []), ...inside], now);
   if (arriving) return { reason: `${arriving.name} is still being synced`, unsettled: true };
   const world = listing.some((item) => item.isFile && /^game(_0)?\.db$/i.test(String(item.name)) && Number(item.size) > 0);
   return world ? null : 'no world';
@@ -947,7 +950,11 @@ module.exports = [
     // because Flux's mount string cannot name the owner's files one by one, so
     // it holds ~1.1 GB of the game's stock .vpk files too, beside the owner's
     // cfg, data, addons, gamemodes and maps and the console logs in flux/.
-    // SteamCMD downloads the stock files again, anonymously (app 4020).
+    // SteamCMD downloads the stock files again, anonymously (app 4020). The
+    // folder, from the depot manifests of 2026.09.17: garrysmod_dir.vpk and
+    // 4 more .vpk (1.1 GB), steam.inf and garrysmod.ver, and the stock bin
+    // (the server's own modules), maps, resource, gamemodes, scenes, lua,
+    // settings, particles and cfg, in which the owner's files sit too.
     id: 'garrysmod-data',
     // As in the hub's catalogue. It also matches ich777/steamcmd:garrysmod,
     // whose volume is the whole install: that one gets the full backup.
@@ -955,13 +962,15 @@ module.exports = [
     include: [
       // Everything the owner keeps, but not the stock .vpk files at the top
       // (a vpk is only ever loaded from there when the game's own gameinfo names
-      // it), the build file the image reads, the console logs, nor the Workshop
-      // cache. validate keeps this to the layout the profile was written for.
+      // it), nor the game's own bin (its server modules) and build files, which
+      // a restore would put back older than the install after a game update, the
+      // console logs, nor the Workshop cache. The owner's binary modules are in
+      // lua/bin, not here. validate keeps this to the layout the profile was written for.
       {
         path: '',
         children: true,
         shallow: true,
-        excludeChildren: /\.vpk$|^(garrysmod\.ver|cache|flux)$|^\.flux-|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+        excludeChildren: /\.vpk$|^(bin|steam\.inf|garrysmod\.ver|cache|flux)$|^\.flux-|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
         validate: gmodFolderSettled,
       },
     ],

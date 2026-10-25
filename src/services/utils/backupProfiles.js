@@ -255,6 +255,9 @@ function planProfiledArchive(profile, listings, now = Date.now()) {
         return { fits: false, reason: `${entry.path} holds no non-empty file matching ${entry.mustContain}` };
       }
     }
+    if (entry.shallow && (entry.excludeWithin || entry.latestWithin)) {
+      return { fits: false, reason: `${entry.path}: shallow cannot be combined with excludeWithin or latestWithin` };
+    }
     if (entry.children && !entry.shallow && listing.some((item) => item.isDirectory && (item.children === undefined
       || (entry.excludeWithin && item.children.some((child) => child.isDirectory && child.children === undefined))))) {
       return { fits: false, reason: `${entry.path} holds more than ${MAX_CHILD_FOLDERS} folders to check` };
