@@ -1631,6 +1631,69 @@ async function main() {
     );
     assert.match(conanLegacy.reason, /Saved does not exist/, 'the earlier image\'s layout');
 
+    // --- Garry's Mod ----------------------------------------------------------------
+    const gmod = backupProfiles.profileForComponent({
+      appname: 'garrysmod1790000000000', component: 'garrysmodgarrysmod', repotag: null, componentCount: 1,
+    });
+    assert.strictEqual(gmod.id, 'garrysmod-data', 'marketplace component');
+    assert.strictEqual(byComponent('garrysmod').id, 'garrysmod-data', 'hub plan component');
+    assert.strictEqual(byComponent('server', { repotag: 'ich777/steamcmd:garrysmod' }).id, 'garrysmod-data', 'the earlier image is matched too');
+
+    // The folder as the image lists it (2026-10-08): the stock .vpk files, the
+    // owner's folders, sv.db with the addons' data, the console logs.
+    const gFile = (name, size, minutesAgo = 30) => ({
+      name, size, isFile: true, isDirectory: false, modifiedAt: at(minutesAgo),
+    });
+    const gDir = (name, size) => ({
+      name, size, isFile: false, isDirectory: true, modifiedAt: at(30),
+    });
+    const gmodKept = [
+      gDir('cfg', 9000), gDir('data', 120000), gDir('addons', 4000000), gDir('gamemodes', 30000000), gDir('maps', 700000000),
+      gDir('lua', 40000000), gFile('sv.db', 24576), gDir('settings', 100),
+    ];
+    const gmodLeftOut = [
+      gFile('garrysmod_dir.vpk', 330000), gFile('garrysmod_000.vpk', 1000000000), gFile('fallbacks_dir.vpk', 900), gFile('fallbacks_000.vpk', 90000000),
+      gFile('garrysmod.ver', 40), gDir('flux', 200000000), gDir('cache', 0), gFile('.flux-backup', 1),
+    ];
+    const gmodPlanOf = async (listing) => backupProfiles.planProfiledArchive(
+      gmod,
+      await backupProfiles.collectProfileListings(gmod, async (folder) => (folder === '' ? listing : [])),
+    );
+    const gmodPlan = await gmodPlanOf([...gmodKept, ...gmodLeftOut]);
+    assert.strictEqual(gmodPlan.reason, undefined, 'the stock folder fits');
+    assert.deepStrictEqual(gmodPlan.sources, [
+      'appdata/.flux-backup', ...gmodKept.map((kept) => `appdata/${kept.name}`),
+    ]);
+    const gmodSyncing = await gmodPlanOf([...gmodKept, ...gmodLeftOut, gFile('.syncthing.sv.db.tmp', 9, 1)]);
+    assert(gmodSyncing.unsettled && /still being synced/.test(gmodSyncing.reason), 'a sync arriving');
+    // ich777/steamcmd:garrysmod: the volume is serverfiles, with the game folder one level down.
+    const gmodLegacy = await gmodPlanOf([gDir('garrysmod', 6000000000), gDir('bin', 300000000), gFile('srcds_run', 20000), gFile('srcds_linux', 90000)]);
+    assert.match(gmodLegacy.reason, /no stock garrysmod_dir\.vpk/, 'the earlier image\'s layout');
+    assert.match((await gmodPlanOf([...gmodKept, gFile('garrysmod_dir.vpk', 0)])).reason, /no stock garrysmod_dir\.vpk/, 'a game folder with no stock files yet');
+
+    // --- The games of the hub with no profile (2026-10-25) --------------------------
+    // Their data volumes are saves and settings already (the install is on a
+    // local mount, or in the image), so none of them may fall under a profile
+    // written for another game: each marketplace component and image is checked.
+    const withoutProfile = [
+      ['factorio', 'factoriotools/factorio:stable'], ['unturnedunturned', 'runonflux/unturned-server-flux:1.2.2'],
+      ['dontstarvetogetherdontstarvetogether', 'runonflux/dst-server-flux:1.0.1'], ['corekeepercorekeeper', 'runonflux/corekeeper-server-flux:1.0.4'],
+      ['tmodloadertmodloader', 'runonflux/tmodloader-server-flux:1.0.4'], ['theisletheisle', 'runonflux/theisle-server-flux:1.1.2'],
+      ['eurotrucksimulator2eurotrucksimulator2', 'runonflux/truckersim-server-flux:1.0.5'], ['americantrucksimulatoramericantrucksimulator', 'runonflux/truckersim-server-flux:1.0.5'],
+      ['teamfortress2teamfortress2', 'runonflux/tf2-server-flux:1.0.2'], ['vintagestoryvintagestory', 'runonflux/vintagestory-server-flux:1.0.3'],
+      ['beammpbeammp', 'runonflux/beammp-server-flux:1.0.3'], ['armareforgerarmareforger', 'runonflux/arma-reforger:latest'],
+    ];
+    withoutProfile.forEach(([component, repotag]) => {
+      assert.strictEqual(byComponent(component, { appname: `${component}1790000000000` }), null, `${component} by component`);
+      assert.strictEqual(byComponent('server', { repotag, appname: 'x1' }), null, `${repotag} by image`);
+    });
+    // And the four that have one do not resolve to each other, nor to a neighbour.
+    [
+      ['arksurvivalevolvedarksurvivalevolved', 'ark-evolved-world'], ['arksurvivalascendedarksurvivalascended', 'ark-ascended-world'],
+      ['soulmasksoulmask', 'soulmask-world'], ['conanexilesconanexiles', 'conan-exiles-world'], ['garrysmodgarrysmod', 'garrysmod-data'],
+      ['terrariaterraria', 'terraria-world'], ['rustrust', 'rust-world'],
+    ].forEach(([component, id]) => assert.strictEqual(byComponent(component, { appname: `${component}1790000000000` }).id, id, component));
+
     // --- Satisfactory ---------------------------------------------------------------
     const satisfactory = backupProfiles.profileForComponent({
       appname: 'satisfactory1790000000000', component: 'satisfactory', repotag: null, componentCount: 1,

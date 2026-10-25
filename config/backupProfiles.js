@@ -550,6 +550,25 @@ function conanWorldPresent(listing, now = Date.now()) {
 }
 
 /**
+ * Whether the top of a Garry's Mod game folder is a server's, and no sync
+ * arriving in it.
+ *
+ * Garry's Mod has no world: what the owner made is cfg/, data/ (sv.db and what
+ * addons write), addons/, gamemodes/ and maps/. There is no save to check them
+ * against, so this refuses a sync still arriving, and a folder that does not
+ * hold the game's stock garrysmod_dir.vpk (left out of the archive, so it is
+ * looked for beside what the listing leaves out): a volume that is a whole
+ * install has it a level down.
+ */
+function gmodFolderSettled(listing, now = Date.now()) {
+  const leftOut = listing.leftOut || [];
+  const arriving = syncArriving([...listing, ...leftOut], now);
+  if (arriving) return { reason: `${arriving.name} is still being synced`, unsettled: true };
+  const stock = leftOut.some((file) => file.isFile && /^garrysmod_dir\.vpk$/i.test(String(file.name)) && Number(file.size) > 0);
+  return stock ? null : 'no stock garrysmod_dir.vpk at the top';
+}
+
+/**
  * What the itzg Java image puts at the top of /data by itself, from TYPE,
  * VERSION and the loader variables, and fetches again on a node that lacks it:
  * the server jar and its launcher, the libraries and game versions it runs on,
@@ -886,6 +905,31 @@ module.exports = [
         path: '',
         children: true,
         excludeChildren: /^(Saved|flux|\.flux-backup)$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+      },
+    ],
+  },
+  {
+    // Garry's Mod on runonflux/garrysmod-server-flux. appdata is the game's own
+    // folder, /mnt/gmod/server/garrysmod, a g: mount inside the install, which
+    // is local (ml:) like the Workshop cache beside it. It is synced whole
+    // because Flux's mount string cannot name the owner's files one by one, so
+    // it holds ~1.1 GB of the game's stock .vpk files too, beside the owner's
+    // cfg, data, addons, gamemodes and maps and the console logs in flux/.
+    // SteamCMD downloads the stock files again, anonymously (app 4020).
+    id: 'garrysmod-data',
+    // As in the hub's catalogue. It also matches ich777/steamcmd:garrysmod,
+    // whose volume is the whole install: that one gets the full backup.
+    match: { name: 'garrysmod', repotag: 'steamcmd:garrysmod', component: '^garrysmod' },
+    include: [
+      // Everything the owner keeps, but not the stock .vpk files at the top
+      // (a vpk is only ever loaded from there when the game's own gameinfo names
+      // it), the build file the image reads, the console logs, nor the Workshop
+      // cache. validate keeps this to the layout the profile was written for.
+      {
+        path: '',
+        children: true,
+        excludeChildren: /\.vpk$|^(garrysmod\.ver|cache|flux|\.flux-backup)$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+        validate: gmodFolderSettled,
       },
     ],
   },
