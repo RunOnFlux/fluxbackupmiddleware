@@ -700,6 +700,59 @@ module.exports = [
     ],
   },
   {
+    // ARK: Survival Evolved on runonflux/ase-server-flux. appdata is /mnt/ase/data:
+    // Saved (the game's Saved folder, which the install links to) and flux, the
+    // image's state. The 23 GB install, the mods it unpacks and the logs are on
+    // local (ml:) mounts. What makes the full backup large is the world over
+    // and over: ARK writes a dated `<MAP>_DD.MM.YYYY_HH.MM.SS.ark` copy of the
+    // whole world every few saves and never deletes it (the image keeps the
+    // newest 4), a `.bak` beside each world, and the image makes its own
+    // tar.gz of Saved on every start and every few hours (flux/backups).
+    id: 'ark-evolved-world',
+    // As in the hub's catalogue. Not the Ascended profile's: that match is
+    // `arksurvivalascended`, and this layout has Saved/ under the data volume.
+    match: { name: '^arksurvivalevolved', repotag: '(^|/)ase-server-flux', component: '^arksurvivalevolved' },
+    include: [
+      // Each map folder: the world, every player's .arkprofile and tribe's
+      // .arktribe and whatever else is there, but not the dated copies, the
+      // .bak files or the image's one-off .flux-premigration, plus the newest
+      // dated copy that has settled, whole, as a restore point. The `.ark`
+      // the game loads is the one that is restored; the copies already on the
+      // node are left alone and are not loaded in its place.
+      {
+        path: 'Saved/SavedArks',
+        required: true,
+        children: true,
+        excludeChildren: /\.sync-conflict-|^\.flux-premigration$/,
+        excludeWithin: /_\d{2}\.\d{2}\.\d{4}_\d{2}\.\d{2}\.\d{2}\.ark$|\.bak$|\.tmp$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+        latestWithin: { path: '', name: ARK_DATED_COPY, settledMs: 5 * 60 * 1000 },
+        validate: arkWorldPresent,
+      },
+      // Saved/Config/LinuxServer (GameUserSettings.ini, Game.ini: the mod list
+      // is ActiveMods in it) and whatever else the owner keeps in Saved. Left
+      // out is what the game and the image write again by themselves.
+      {
+        path: 'Saved',
+        children: true,
+        excludeChildren: /^(SavedArks|Logs|Crashes|webcache.*)$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+      },
+      // The image's state: mods.json (the panel's mod list), state, the admin
+      // secret. Not its backups (the same world again), and not a restore or
+      // an update it was asked for: restore-pending would restore from
+      // flux/backups, which a node restored from this archive does not have.
+      {
+        path: 'flux',
+        children: true,
+        excludeChildren: /^(backups|tmp|restore-pending|update-.*\.json)$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+      },
+      {
+        path: '',
+        children: true,
+        excludeChildren: /^(Saved|flux|\.flux-backup)$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+      },
+    ],
+  },
+  {
     // Project Zomboid (Build 41 and 42) on danixu86/project-zomboid-dedicated-server.
     // appdata is the game's Zomboid folder; the server is in the image and the
     // Workshop mods on a local (ml:) mount. What makes the full backup large is

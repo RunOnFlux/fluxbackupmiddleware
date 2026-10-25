@@ -976,7 +976,7 @@ async function main() {
     assert.strictEqual(byComponent('server', { repotag: 'acekorneya/asa_server:2_1_latest' }).id, 'ark-ascended-world', 'by image');
     assert.strictEqual(backupProfiles.profileForComponent({
       appname: 'arksurvivalevolved1790000000000', component: 'arksurvivalevolved', repotag: 'runonflux/ase-server-flux:latest', componentCount: 1,
-    }), null, 'ARK: Survival Evolved has another layout');
+    }).id, 'ark-evolved-world', 'ARK: Survival Evolved has a profile of its own, not this one');
 
     // A save on the local ASA 94.15 run (2026-10-05): the world, a player and a
     // tribe, the game's copies of the last saves and the anti-corruption copy.
@@ -1447,6 +1447,72 @@ async function main() {
     const wArriving = await wPlanOf({ profileFolder: [wDir('RocksDB_v2', 22683654), wFile('.syncthing.x.tmp', 9, 1)] });
     assert(wArriving.unsettled && /still being synced/.test(wArriving.reason), 'a sync arriving');
     assert(!(await wPlanOf({ profileFolder: [wDir('RocksDB_v2', 22683654), wFile('.syncthing.x.tmp', 9, 600)] })).reason, 'a sync given up on hours ago');
+
+    // --- ARK: Survival Evolved ------------------------------------------------------
+    const ase = backupProfiles.profileForComponent({
+      appname: 'arksurvivalevolved1790000000000', component: 'arksurvivalevolvedarksurvivalevolved', repotag: null, componentCount: 1,
+    });
+    assert.strictEqual(ase.id, 'ark-evolved-world', 'marketplace component');
+    assert.strictEqual(byComponent('server', { repotag: 'runonflux/ase-server-flux:1.0.4' }).id, 'ark-evolved-world', 'by image');
+    assert.strictEqual(byComponent('arksurvivalascended').id, 'ark-ascended-world', 'Ascended keeps its own profile');
+    assert.strictEqual(byComponent('server', { repotag: 'acekorneya/asa_server:2_1_latest' }).id, 'ark-ascended-world');
+
+    const eFile = (name, size, minutesAgo = 30) => ({
+      name, size, isFile: true, isDirectory: false, modifiedAt: at(minutesAgo),
+    });
+    const eDir = (name, size) => ({
+      name, size, isFile: false, isDirectory: true, modifiedAt: at(30),
+    });
+    const EMAP = 'Ragnarok';
+    const aseWorld = [
+      eFile(`${EMAP}.ark`, 61000000), eFile('1415497718.arkprofile', 9000), eFile('1415497718.profilebak', 9000), eFile('2.arktribe', 4096),
+    ];
+    const aseCopies = [
+      eFile(`${EMAP}.ark.bak`, 61000000, 900),
+      eFile(`${EMAP}_17.10.2026_21.19.11.ark`, 60000000, 1100),
+      eFile(`${EMAP}_18.10.2026_13.35.12.ark`, 60500000, 138),
+      eFile(`${EMAP}_18.10.2026_15.50.12.ark`, 60900000, 2),
+    ];
+    const aseVolume = ({
+      maps = [eDir(EMAP, 244000000), eDir('clusters', 100), eDir('.flux-premigration', 300000000)], mapFiles = [...aseWorld, ...aseCopies],
+    } = {}) => async (folder) => {
+      switch (folder) {
+        case '': return [eDir('Saved', 900000000), eDir('flux', 400000000), eFile('.flux-backup', 1)];
+        case 'Saved': return [eDir('SavedArks', 700000000), eDir('Config', 21000), eDir('Logs', 9000000), eDir('Crashes', 3000)];
+        case 'Saved/SavedArks': return maps;
+        case `Saved/SavedArks/${EMAP}`: return mapFiles;
+        case 'Saved/SavedArks/clusters': return [];
+        case 'flux': return [
+          eDir('backups', 300000000), eDir('tmp', 10), eFile('state.json', 900), eFile('mods.json', 300), eFile('admin.secret', 20),
+          eFile('restore-pending', 1), eFile('update-check.json', 200),
+        ];
+        default: return [];
+      }
+    };
+    const asePlanOf = async (options) => backupProfiles.planProfiledArchive(
+      ase,
+      await backupProfiles.collectProfileListings(ase, aseVolume(options)),
+    );
+    assert.deepStrictEqual((await asePlanOf()).sources, [
+      'appdata/.flux-backup',
+      ...aseWorld.map((kept) => `appdata/Saved/SavedArks/${EMAP}/${kept.name}`),
+      // The newest dated copy that has settled, not the one written 2 minutes ago.
+      `appdata/Saved/SavedArks/${EMAP}/${EMAP}_18.10.2026_13.35.12.ark`,
+      'appdata/Saved/Config',
+      'appdata/flux/state.json', 'appdata/flux/mods.json', 'appdata/flux/admin.secret',
+    ]);
+    assert.match((await asePlanOf({ mapFiles: [eFile(`${EMAP}_18.10.2026_13.35.12.ark`, 60500000)] })).reason, /no world/, 'only a dated copy');
+    assert.match((await asePlanOf({ mapFiles: [eFile(`${EMAP}.ark`, 0)] })).reason, /no world/, 'an empty world');
+    const aseSyncing = await asePlanOf({ mapFiles: [...aseWorld, eFile(`.syncthing.${EMAP}.ark.tmp`, 9, 1)] });
+    assert(aseSyncing.unsettled && /still being synced/.test(aseSyncing.reason), 'a sync arriving');
+    // The 1.0.0/1.0.1 layout, worlds loose in SavedArks, and an older image's
+    // volume (no Saved/SavedArks at the top) both take the full backup.
+    assert.match((await asePlanOf({ maps: [eFile(`${EMAP}.ark`, 61000000)] })).reason, /no world/, 'worlds not yet in a folder per map');
+    const aseLegacy = backupProfiles.planProfiledArchive(
+      ase,
+      await backupProfiles.collectProfileListings(ase, async (folder) => (folder === '' ? [eDir('ShooterGame', 23000000000), eDir('steamapps', 1000)] : null)),
+    );
+    assert.match(aseLegacy.reason, /Saved\/SavedArks does not exist/, 'a volume that is the whole install');
 
     // --- Satisfactory ---------------------------------------------------------------
     const satisfactory = backupProfiles.profileForComponent({
