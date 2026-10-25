@@ -76,7 +76,8 @@ function resolveComponentProfiles(appname, componentNames, known = {}, profiles 
 /**
  * The most folders of one `children` entry that are listed one level deeper.
  * A world folder is one per world, so a handful is normal; past this the
- * entry is not checked and the full backup is taken instead.
+ * entry is not checked and the full backup is taken instead. An entry with
+ * `shallow` lists none of them, and has no such limit.
  */
 const MAX_CHILD_FOLDERS = 20;
 
@@ -175,7 +176,7 @@ async function collectProfileListings(profile, list) {
       Object.defineProperty(listing, 'leftOut', { value: leftOut, enumerable: false });
       for (let j = 0; j < kept.length; j += 1) {
         const item = kept[j];
-        if (item.isDirectory && folders < MAX_CHILD_FOLDERS) {
+        if (item.isDirectory && !entry.shallow && folders < MAX_CHILD_FOLDERS) {
           folders += 1;
           const folder = joinPath(entry.path, item.name);
           // eslint-disable-next-line no-await-in-loop
@@ -254,7 +255,7 @@ function planProfiledArchive(profile, listings, now = Date.now()) {
         return { fits: false, reason: `${entry.path} holds no non-empty file matching ${entry.mustContain}` };
       }
     }
-    if (entry.children && listing.some((item) => item.isDirectory && (item.children === undefined
+    if (entry.children && !entry.shallow && listing.some((item) => item.isDirectory && (item.children === undefined
       || (entry.excludeWithin && item.children.some((child) => child.isDirectory && child.children === undefined))))) {
       return { fits: false, reason: `${entry.path} holds more than ${MAX_CHILD_FOLDERS} folders to check` };
     }

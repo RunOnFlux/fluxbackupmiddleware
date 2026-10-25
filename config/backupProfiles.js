@@ -43,6 +43,11 @@
  *                folders are listed one level deeper for `validate`. On restore
  *                each archived child is replaced as a whole and the rest of the
  *                directory is left alone
+ *   shallow      with `children`: the folders of the directory are not listed
+ *                one level deeper, so there is no limit to how many it holds.
+ *                For a directory whose `validate` reads only its own entries
+ *                and whose folders are the owner's (Garry's Mod's game folder)
+ *                and are compared by their own size and time
  *   excludeWithin  with `children`: a child FOLDER is archived as what it
  *                holds, each entry on its own, leaving out those matching; the
  *                folders kept inside it are listed in turn for `validate`, and
@@ -759,7 +764,8 @@ module.exports = [
     // ARK: Survival Evolved on runonflux/ase-server-flux. appdata is /mnt/ase/data:
     // Saved (the game's Saved folder, which the install links to) and flux, the
     // image's state. The 23 GB install, the mods it unpacks and the logs are on
-    // local (ml:) mounts. What makes the full backup large is the world over
+    // local (ml:) mounts, and so is flux.log; the game's own logs are in Saved/Logs
+    // on the data volume. What makes the full backup large is the world over
     // and over: ARK writes a dated `<MAP>_DD.MM.YYYY_HH.MM.SS.ark` copy of the
     // whole world every few saves and never deletes it (the image keeps the
     // newest 4), a `.bak` beside each world, and the image makes its own
@@ -771,7 +777,9 @@ module.exports = [
     include: [
       // Each map folder: the world, every player's .arkprofile and tribe's
       // .arktribe and whatever else is there, but not the dated copies, the
-      // .bak files or the image's one-off .flux-premigration, plus the newest
+      // game's .bak, .profilebak and .tribebak copies (a server with many
+      // players would pass the 1000 sources compressobject takes) or the
+      // image's one-off .flux-premigration, plus the newest
       // dated copy that has settled, whole, as a restore point. The `.ark`
       // the game loads is the one that is restored; the copies already on the
       // node are left alone and are not loaded in its place.
@@ -780,7 +788,7 @@ module.exports = [
         required: true,
         children: true,
         excludeChildren: /\.sync-conflict-|^\.flux-premigration$/,
-        excludeWithin: /_\d{2}\.\d{2}\.\d{4}_\d{2}\.\d{2}\.\d{2}\.ark$|\.bak$|\.tmp$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+        excludeWithin: /_\d{2}\.\d{2}\.\d{4}_\d{2}\.\d{2}\.\d{2}\.ark$|\.(bak|profilebak|tribebak)$|\.tmp$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
         latestWithin: { path: '', name: ARK_DATED_COPY, settledMs: 5 * 60 * 1000 },
         validate: arkWorldPresent,
       },
@@ -793,18 +801,20 @@ module.exports = [
         excludeChildren: /^(SavedArks|Logs|Crashes|webcache.*)$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
       },
       // The image's state: mods.json (the panel's mod list), state, the admin
-      // secret. Not its backups (the same world again), and not a restore or
-      // an update it was asked for: restore-pending would restore from
-      // flux/backups, which a node restored from this archive does not have.
+      // secret. Not its backups (the same world again), nor the last restore's
+      // result, nor its staging or temp files, nor an old image's flux.log,
+      // and not a restore or an update it was asked for: restore-pending
+      // would restore from flux/backups, which a node restored from this
+      // archive does not have.
       {
         path: 'flux',
         children: true,
-        excludeChildren: /^(backups|tmp|restore-pending|update-.*\.json)$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+        excludeChildren: /^(backups|tmp|restore-pending|restore-result\.json|update-.*\.json|flux\.log(\.1)?)$|^\.flux-|\.tmp$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
       },
       {
         path: '',
         children: true,
-        excludeChildren: /^(Saved|flux|\.flux-backup)$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+        excludeChildren: /^(Saved|flux)$|^\.flux-|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
       },
     ],
   },
@@ -833,12 +843,19 @@ module.exports = [
         required: true,
         children: true,
         excludeChildren: /\.sync-conflict-/,
-        excludeWithin: /^\d{10}\.db$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+        excludeWithin: /^\d{10}\.db$|\.flux-(unusable-.*|new)$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
         latestWithin: { path: '', name: /^\d{10}\.db$/, settledMs: 5 * 60 * 1000 },
         validate: soulmaskWorldPresent,
       },
+      // Any other folder of Saved/Worlds, as the image's own backup walks it.
+      {
+        path: 'Saved/Worlds',
+        children: true,
+        excludeChildren: /^Dedicated$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+      },
       // GameplaySettings (GameXishu.json), the permission lists and the rest of
-      // Saved. Logs and Crashes are links to the local mount.
+      // Saved. Logs is a link to the local mount; Crashes, if the game writes
+      // any, is on the data volume and is not wanted.
       {
         path: 'Saved',
         children: true,
@@ -853,7 +870,7 @@ module.exports = [
       {
         path: 'flux',
         children: true,
-        excludeChildren: /^(backups|uploads|sync-conflicts|tmp|restore-pending\.json|update-.*\.json)$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+        excludeChildren: /^(backups|uploads|sync-conflicts|tmp|restore-pending\.json|update-.*\.json|flux\.log(\.1)?)$|^\.flux-|\.tmp$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
       },
       // The newest tar.gz the image made of the world, with SQLite's online
       // backup: one whole database, where the live pair may be two moments
@@ -864,7 +881,7 @@ module.exports = [
       {
         path: '',
         children: true,
-        excludeChildren: /^(Saved|flux|\.flux-backup)$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+        excludeChildren: /^(Saved|flux)$|^\.flux-|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
       },
     ],
   },
@@ -883,8 +900,10 @@ module.exports = [
     match: { name: '^conanexiles', repotag: '(^|/)(conanexiles-server-flux|docker-conanexiles)', component: '^conanexiles' },
     // The world's WAL and shared-memory files are archived with it, and a
     // restore puts back a database as of that archive: one the node still has
-    // from after it would be replayed over it.
-    restoreClear: [{ folder: 'Saved', name: /^game(_0)?\.db-(wal|shm|journal)$/ }],
+    // from after it would be replayed over it. The names are the image's
+    // put_world: a legacy game.db that is restored beside a game_0.db the node
+    // has would never be loaded, and validate guarantees the archive holds one.
+    restoreClear: [{ folder: 'Saved', name: /^game(_0)?\.db(-wal|-shm|-journal)?$/ }],
     include: [
       // game_0.db with its sidecars, Config/LinuxServer (the .ini files) and
       // blacklist.txt, but not the game's rotating copies, nor Logs, Crashes
@@ -893,7 +912,7 @@ module.exports = [
         path: 'Saved',
         required: true,
         children: true,
-        excludeChildren: /^(Logs|Crashes|ExtractedMods)$|^game(_\d+)?_backup_\d+\.db$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+        excludeChildren: /^(Logs|Crashes|ExtractedMods)$|^game(_\d+)?_backup_\d+\.db$|\.flux-(unusable-.*|new)$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
         validate: conanWorldPresent,
       },
       // The image's state: worlds.json (which the world guard goes by),
@@ -905,18 +924,19 @@ module.exports = [
       {
         path: 'flux',
         children: true,
-        excludeChildren: /^(backups|import|sync-conflicts|tmp|restore-pending\.json|update-.*\.json|mods-update-.*\.json)$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+        excludeChildren: /^(backups|import|sync-conflicts|tmp|restore-pending\.json|update-.*\.json|mods-update-.*\.json|flux\.log(\.1)?)$|^\.flux-|\.tmp$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
       },
       // The newest tar.gz the image made of the world, with SQLite's online
       // backup: one whole database, where the live pair may be two moments
       // apart (the server commits every few seconds, and the standby's
-      // database and WAL arrive on their own). The image's restore and world
-      // guard find a backup by this name.
+      // database and WAL arrive on their own). A restore point the owner can
+      // pick from the panel; the image uses one by itself only when game_0.db
+      // is missing or is not SQLite. It finds a backup by this name.
       { path: 'flux/backups', latest: { name: /^\d{8}-\d{6}-conan\.tar\.gz$/, settledMs: 5 * 60 * 1000 } },
       {
         path: '',
         children: true,
-        excludeChildren: /^(Saved|flux|\.flux-backup)$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+        excludeChildren: /^(Saved|flux)$|^\.flux-|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
       },
     ],
   },
@@ -940,7 +960,8 @@ module.exports = [
       {
         path: '',
         children: true,
-        excludeChildren: /\.vpk$|^(garrysmod\.ver|cache|flux|\.flux-backup)$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+        shallow: true,
+        excludeChildren: /\.vpk$|^(garrysmod\.ver|cache|flux)$|^\.flux-|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
         validate: gmodFolderSettled,
       },
     ],

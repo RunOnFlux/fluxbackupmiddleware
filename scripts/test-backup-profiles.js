@@ -1465,10 +1465,10 @@ async function main() {
     });
     const EMAP = 'Ragnarok';
     const aseWorld = [
-      eFile(`${EMAP}.ark`, 61000000), eFile('1415497718.arkprofile', 9000), eFile('1415497718.profilebak', 9000), eFile('2.arktribe', 4096),
+      eFile(`${EMAP}.ark`, 61000000), eFile('1415497718.arkprofile', 9000), eFile('2.arktribe', 4096),
     ];
     const aseCopies = [
-      eFile(`${EMAP}.ark.bak`, 61000000, 900),
+      eFile(`${EMAP}.ark.bak`, 61000000, 900), eFile('1415497718.profilebak', 9000), eFile('2.tribebak', 4096),
       eFile(`${EMAP}_17.10.2026_21.19.11.ark`, 60000000, 1100),
       eFile(`${EMAP}_18.10.2026_13.35.12.ark`, 60500000, 138),
       eFile(`${EMAP}_18.10.2026_15.50.12.ark`, 60900000, 2),
@@ -1484,7 +1484,8 @@ async function main() {
         case 'Saved/SavedArks/clusters': return [];
         case 'flux': return [
           eDir('backups', 300000000), eDir('tmp', 10), eFile('state.json', 900), eFile('mods.json', 300), eFile('admin.secret', 20),
-          eFile('restore-pending', 1), eFile('update-check.json', 200),
+          eFile('restore-pending', 1), eFile('update-check.json', 200), eFile('restore-result.json', 90), eFile('flux.log', 5000000),
+          eDir('.flux-before-restore-1', 700000000), eFile('.flux-x.tmp', 3),
         ];
         default: return [];
       }
@@ -1533,6 +1534,7 @@ async function main() {
     const soulWorld = [smFile('world.db', 40000000), smFile('world.db-wal', 4000000), smFile('world.db-shm', 32768)];
     const soulCopies = [
       smFile('2026102310.db', 39000000, 1500), smFile('2026102312.db', 39500000, 800), smFile('2026102314.db', 39900000, 2),
+      smFile('world.db.flux-unusable-20261024', 39000000, 3000),
     ];
     const soulVolume = ({ mapFiles = [...soulWorld, ...soulCopies], dedicated = [smDir(SMAP, 120000000)] } = {}) => async (folder) => {
       switch (folder) {
@@ -1540,6 +1542,7 @@ async function main() {
         case 'Saved': return [
           smDir('Worlds', 120000000), smDir('GameplaySettings', 4000), smDir('Logs', 0), smDir('Crashes', 0), smFile('WhiteAccountList.txt', 40),
         ];
+        case 'Saved/Worlds': return [smDir('Dedicated', 120000000), smDir('Creative', 5000)];
         case 'Saved/Worlds/Dedicated': return dedicated;
         case `Saved/Worlds/Dedicated/${SMAP}`: return mapFiles;
         case 'flux/backups': return [
@@ -1547,7 +1550,7 @@ async function main() {
           smFile('20261025-090000-soulmask.tar.gz', 8700000, 2), smFile('index.json', 900, 2),
         ];
         case 'flux': return [
-          smDir('backups', 8600000), smDir('uploads', 40000000), smDir('sync-conflicts', 10), smFile('state.json', 700), smFile('worlds.json', 90),
+          smDir('backups', 8600000), smDir('.flux-backup-ab12', 40000000), smFile('flux.log', 5000000), smDir('uploads', 40000000), smDir('sync-conflicts', 10), smFile('state.json', 700), smFile('worlds.json', 90),
           smFile('gameplay.json', 300), smFile('whitelist.json', 20), smFile('restore-pending.json', 80), smFile('update-state.json', 80),
         ];
         default: return [];
@@ -1562,6 +1565,7 @@ async function main() {
       ...soulWorld.map((kept) => `appdata/Saved/Worlds/Dedicated/${SMAP}/${kept.name}`),
       // The newest hourly copy at least five minutes old, not the one from 2 minutes ago.
       `appdata/Saved/Worlds/Dedicated/${SMAP}/2026102312.db`,
+      'appdata/Saved/Worlds/Creative',
       'appdata/Saved/GameplaySettings', 'appdata/Saved/WhiteAccountList.txt',
       'appdata/flux/state.json', 'appdata/flux/worlds.json', 'appdata/flux/gameplay.json', 'appdata/flux/whitelist.json',
       // The image's own consistent copy of the world: the newest settled one.
@@ -1589,7 +1593,9 @@ async function main() {
     assert.strictEqual(byComponent('server', { repotag: 'alinmear/docker-conanexiles:latest' }).id, 'conan-exiles-world', 'the earlier image is matched too');
     assert.deepStrictEqual(backupProfiles.restoreClearRules(conan).map((rule) => rule.folder), ['Saved']);
     assert(new RegExp(backupProfiles.restoreClearRules(conan)[0].name).test('game_0.db-wal'));
-    assert(!new RegExp(backupProfiles.restoreClearRules(conan)[0].name).test('game_0.db'), 'never the database');
+    const conanClear = new RegExp(backupProfiles.restoreClearRules(conan)[0].name);
+    assert(conanClear.test('game.db-journal') && conanClear.test('game.db') && conanClear.test('game_0.db'), 'what put_world replaces');
+    assert(!conanClear.test('game_0_backup_1.db') && !conanClear.test('game_0.db.flux-unusable-1'), 'not the copies');
     assert.deepStrictEqual(backupProfiles.restoreClearRules(soulmask).map((rule) => rule.folder), ['Saved/Worlds/Dedicated/*']);
 
     const cFile = (name, size, minutesAgo = 30) => ({
@@ -1602,7 +1608,10 @@ async function main() {
       cFile('game_0.db', 180000000), cFile('game_0.db-wal', 4000000, 1), cFile('game_0.db-shm', 32768, 1),
       cDir('Config', 21000), cFile('blacklist.txt', 40),
     ];
-    const conanCopies = [cFile('game_0_backup_1.db', 179000000, 700), cFile('game_0_backup_2.db', 178000000, 1400)];
+    const conanCopies = [
+      cFile('game_0_backup_1.db', 179000000, 700), cFile('game_0_backup_2.db', 178000000, 1400), cFile('game_0.db.flux-unusable-20261024', 180000000, 2000),
+      cFile('game_0.db.flux-new', 180000000, 1),
+    ];
     const conanVolume = ({ saved = [...conanSaved, ...conanCopies] } = {}) => async (folder) => {
       switch (folder) {
         case '': return [cDir('Saved', 540000000), cDir('flux', 190000000), cFile('.flux-backup', 1)];
@@ -1611,7 +1620,7 @@ async function main() {
           cFile('20261025-030000-conan.tar.gz', 40000000, 200), cFile('20261025-090000-conan.tar.gz', 40000000, 2), cFile('index.json', 900, 2),
         ];
         case 'flux': return [
-          cDir('backups', 180000000), cDir('import', 9000000), cDir('sync-conflicts', 10), cFile('state.json', 700), cFile('worlds.json', 90),
+          cDir('backups', 180000000), cFile('flux.log', 5000000), cDir('.flux-restore-x', 9), cDir('import', 9000000), cDir('sync-conflicts', 10), cFile('state.json', 700), cFile('worlds.json', 90),
           cFile('mods.json', 300), cFile('rcon-password', 20), cFile('bans-pending.json', 20), cFile('settings-pending.json', 80),
           cFile('restore-pending.json', 80), cFile('update-target.json', 80), cFile('mods-update-target.json', 80),
         ];
@@ -1674,6 +1683,9 @@ async function main() {
     assert.deepStrictEqual(gmodPlan.sources, [
       'appdata/.flux-backup', ...gmodKept.map((kept) => `appdata/${kept.name}`),
     ]);
+    // The stock folder count is the game's, and the owner adds more: past the 20 an entry lists one level deeper, a `shallow` entry has no limit.
+    const manyFolders = Array.from({ length: 40 }, (_, i) => gDir(`folder${i}`, 1000));
+    assert.strictEqual((await gmodPlanOf([...manyFolders, ...gmodLeftOut])).reason, undefined, '40 folders');
     const gmodSyncing = await gmodPlanOf([...gmodKept, ...gmodLeftOut, gFile('.syncthing.sv.db.tmp', 9, 1)]);
     assert(gmodSyncing.unsettled && /still being synced/.test(gmodSyncing.reason), 'a sync arriving');
     // ich777/steamcmd:garrysmod: the volume is serverfiles, with the game folder one level down.
