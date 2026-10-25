@@ -1514,6 +1514,66 @@ async function main() {
     );
     assert.match(aseLegacy.reason, /Saved\/SavedArks does not exist/, 'a volume that is the whole install');
 
+    // --- Soulmask -------------------------------------------------------------------
+    const soulmask = backupProfiles.profileForComponent({
+      appname: 'soulmask1790000000000', component: 'soulmasksoulmask', repotag: null, componentCount: 1,
+    });
+    assert.strictEqual(soulmask.id, 'soulmask-world', 'marketplace component');
+    assert.strictEqual(byComponent('server', { repotag: 'runonflux/soulmask-server-flux:1.0.2' }).id, 'soulmask-world', 'by image');
+
+    // Cloud Mist Forest on image 1.0.2 (2026-10-23): the world, SQLite's
+    // sidecars while it runs, the game's hourly copies.
+    const smFile = (name, size, minutesAgo = 30) => ({
+      name, size, isFile: true, isDirectory: false, modifiedAt: at(minutesAgo),
+    });
+    const smDir = (name, size) => ({
+      name, size, isFile: false, isDirectory: true, modifiedAt: at(30),
+    });
+    const SMAP = 'Level01_Main';
+    const soulWorld = [smFile('world.db', 40000000), smFile('world.db-wal', 4000000), smFile('world.db-shm', 32768)];
+    const soulCopies = [
+      smFile('2026102310.db', 39000000, 1500), smFile('2026102312.db', 39500000, 800), smFile('2026102314.db', 39900000, 2),
+    ];
+    const soulVolume = ({ mapFiles = [...soulWorld, ...soulCopies], dedicated = [smDir(SMAP, 120000000)] } = {}) => async (folder) => {
+      switch (folder) {
+        case '': return [smDir('Saved', 130000000), smDir('flux', 9000000), smFile('.flux-backup', 1)];
+        case 'Saved': return [
+          smDir('Worlds', 120000000), smDir('GameplaySettings', 4000), smDir('Logs', 0), smDir('Crashes', 0), smFile('WhiteAccountList.txt', 40),
+        ];
+        case 'Saved/Worlds/Dedicated': return dedicated;
+        case `Saved/Worlds/Dedicated/${SMAP}`: return mapFiles;
+        case 'flux': return [
+          smDir('backups', 8600000), smDir('uploads', 40000000), smDir('sync-conflicts', 10), smFile('state.json', 700), smFile('worlds.json', 90),
+          smFile('gameplay.json', 300), smFile('whitelist.json', 20), smFile('restore-pending.json', 80), smFile('update-state.json', 80),
+        ];
+        default: return [];
+      }
+    };
+    const soulPlanOf = async (options) => backupProfiles.planProfiledArchive(
+      soulmask,
+      await backupProfiles.collectProfileListings(soulmask, soulVolume(options)),
+    );
+    assert.deepStrictEqual((await soulPlanOf()).sources, [
+      'appdata/.flux-backup',
+      ...soulWorld.map((kept) => `appdata/Saved/Worlds/Dedicated/${SMAP}/${kept.name}`),
+      // The newest hourly copy at least five minutes old, not the one from 2 minutes ago.
+      `appdata/Saved/Worlds/Dedicated/${SMAP}/2026102312.db`,
+      'appdata/Saved/GameplaySettings', 'appdata/Saved/WhiteAccountList.txt',
+      'appdata/flux/state.json', 'appdata/flux/worlds.json', 'appdata/flux/gameplay.json', 'appdata/flux/whitelist.json',
+    ]);
+    assert.match((await soulPlanOf({ mapFiles: soulCopies })).reason, /no world/, 'only the game\'s hourly copies');
+    assert.match((await soulPlanOf({ mapFiles: [smFile('world.db', 0)] })).reason, /no world/, 'an empty world');
+    assert.match((await soulPlanOf({ dedicated: [] })).reason, /no world/, 'a server that has not made its world');
+    const soulSyncing = await soulPlanOf({ mapFiles: [...soulWorld, smFile('.syncthing.world.db.tmp', 9, 1)] });
+    assert(soulSyncing.unsettled && /still being synced/.test(soulSyncing.reason), 'a sync arriving');
+    assert(!(await soulPlanOf({ mapFiles: [...soulWorld, smFile('.syncthing.world.db.tmp', 9, 600)] })).reason, 'a sync given up on hours ago');
+    // An earlier community image kept the world elsewhere: the full backup.
+    const soulLegacy = backupProfiles.planProfiledArchive(
+      soulmask,
+      await backupProfiles.collectProfileListings(soulmask, async (folder) => (folder === '' ? [smDir('WS', 9000000000), smDir('steamcmd', 1000)] : null)),
+    );
+    assert.match(soulLegacy.reason, /Saved\/Worlds\/Dedicated does not exist/, 'sknnr layout');
+
     // --- Satisfactory ---------------------------------------------------------------
     const satisfactory = backupProfiles.profileForComponent({
       appname: 'satisfactory1790000000000', component: 'satisfactory', repotag: null, componentCount: 1,

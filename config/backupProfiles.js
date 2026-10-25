@@ -513,6 +513,25 @@ function windroseWorldPresent(listing, now = Date.now()) {
 }
 
 /**
+ * Whether Saved/Worlds/Dedicated holds a Soulmask world, and no sync arriving
+ * in it.
+ *
+ * A world is a map folder (Level01_Main, DLC_Level01_Main) holding a non-empty
+ * `world.db`, a SQLite file the server writes in place (with `-wal` and `-shm`
+ * beside it while it runs, archived with it), and the game's own hourly copies
+ * `YYYYmmddHH.db`, which are not worlds. A server that has not made its world
+ * yet, or whose world has not arrived on the standby, has no world.db.
+ */
+function soulmaskWorldPresent(listing, now = Date.now()) {
+  const inside = listing.flatMap((item) => [...(item.children || []), ...(item.excludedChildren || [])]);
+  const arriving = syncArriving([...listing, ...inside], now);
+  if (arriving) return { reason: `${arriving.name} is still being synced`, unsettled: true };
+  const world = listing.some((item) => item.isDirectory && (item.children || [])
+    .some((file) => file.isFile && file.name === 'world.db' && Number(file.size) > 0));
+  return world ? null : 'no world';
+}
+
+/**
  * What the itzg Java image puts at the top of /data by itself, from TYPE,
  * VERSION and the loader variables, and fetches again on a node that lacks it:
  * the server jar and its launcher, the libraries and game versions it runs on,
@@ -744,6 +763,56 @@ module.exports = [
         path: 'flux',
         children: true,
         excludeChildren: /^(backups|tmp|restore-pending|update-.*\.json)$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+      },
+      {
+        path: '',
+        children: true,
+        excludeChildren: /^(Saved|flux|\.flux-backup)$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+      },
+    ],
+  },
+  {
+    // Soulmask on runonflux/soulmask-server-flux. appdata is /mnt/soulmask/data:
+    // Saved (the game's Saved folder, which the install links to) and flux, the
+    // image's state. The 2.2 GB install, the Workshop mods and the logs are on
+    // local (ml:) mounts. What makes the full backup large is the world again:
+    // the game's own hourly copy of each world.db (YYYYmmddHH.db, never
+    // deleted by the image), and the tar.gz of the worlds the image makes on
+    // every start and every few hours (flux/backups, 8.6 MB on a fresh world).
+    id: 'soulmask-world',
+    // As in the hub's catalogue.
+    match: { name: '^soulmask', repotag: '(^|/)soulmask-server-flux', component: '^soulmask' },
+    include: [
+      // Each map's folder: world.db and whatever sits with it, but not the
+      // game's hourly copies, plus the newest of those that has settled as a
+      // restore point. On restore only these are replaced; the copies already
+      // on the node stay and are not loaded in place of the world.
+      {
+        path: 'Saved/Worlds/Dedicated',
+        required: true,
+        children: true,
+        excludeChildren: /\.sync-conflict-/,
+        excludeWithin: /^\d{10}\.db$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+        latestWithin: { path: '', name: /^\d{10}\.db$/, settledMs: 5 * 60 * 1000 },
+        validate: soulmaskWorldPresent,
+      },
+      // GameplaySettings (GameXishu.json), the permission lists and the rest of
+      // Saved. Logs and Crashes are links to the local mount.
+      {
+        path: 'Saved',
+        children: true,
+        excludeChildren: /^(Worlds|Logs|Crashes)$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+      },
+      // The image's state: worlds.json (which maps had a world, what its world
+      // guard goes by), gameplay.json, the whitelist and the admin password.
+      // Not its backups (the same worlds again), uploads, conflict copies, nor
+      // a restore or an update it was asked for: restore-pending.json would
+      // restore from flux/backups, which a node restored from this archive
+      // does not have.
+      {
+        path: 'flux',
+        children: true,
+        excludeChildren: /^(backups|uploads|sync-conflicts|tmp|restore-pending\.json|update-.*\.json)$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
       },
       {
         path: '',
