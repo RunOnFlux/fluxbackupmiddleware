@@ -1706,7 +1706,10 @@ async function main() {
         match: (r) => r.method === 'post' && r.url === `${NODE}/apps/compressobject`,
         reply: () => ({ status: 202, headers: {}, data: { status: 'success', data: { jobId: 'job-g' } } }),
       },
-      { match: (r) => r.url === `${NODE}/apps/operations/job-g`, reply: () => success({ status: 'Succeeded' }) },
+      {
+        match: (r) => r.url === `${NODE}/apps/operations/job-g`,
+        reply: () => success({ status: 'Succeeded' }),
+      },
     ];
     outcome = await fluxOS.testHooks.createProfiledArchiveOnNode(NODE, 'auth', GAPP, GCOMP, gmod, []);
     assert.deepStrictEqual(outcome, { fits: true });
@@ -1725,8 +1728,14 @@ async function main() {
     assert.match((await soulPlanOf({ saved: soulManyFolders })).reason, /holds more than 20 folders to check/);
     // And it is not allowed with the options that need those listings.
     assert.match(backupProfiles.planProfiledArchive(
-      { include: [{ path: '', children: true, shallow: true, excludeWithin: /x/ }] },
-      { '': [gDir('a', 1)] },
+      {
+        include: [{
+          path: '', children: true, shallow: true, excludeWithin: /x/,
+        }],
+      },
+      {
+        '': [gDir('a', 1)],
+      },
     ).reason, /shallow cannot be combined/);
     const gmodSyncing = await gmodPlanOf([...gmodKept, ...gmodLeftOut, gFile('.syncthing.sv.db.tmp', 9, 1)]);
     assert(gmodSyncing.unsettled && /still being synced/.test(gmodSyncing.reason), 'a sync arriving');
