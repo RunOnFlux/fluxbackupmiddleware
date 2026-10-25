@@ -855,6 +855,12 @@ module.exports = [
         children: true,
         excludeChildren: /^(backups|uploads|sync-conflicts|tmp|restore-pending\.json|update-.*\.json)$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
       },
+      // The newest tar.gz the image made of the world, with SQLite's online
+      // backup: one whole database, where the live pair may be two moments
+      // apart (the server commits every few seconds, and the standby's
+      // database and WAL arrive on their own). The image's restore and world
+      // guard find a backup by this name.
+      { path: 'flux/backups', latest: { name: /^\d{8}-\d{6}-soulmask\.tar\.gz$/, settledMs: 5 * 60 * 1000 } },
       {
         path: '',
         children: true,
@@ -892,7 +898,7 @@ module.exports = [
       },
       // The image's state: worlds.json (which the world guard goes by),
       // mods.json, the RCON password, the bans and settings it has queued.
-      // Not its backups (the same world again), imports, conflict copies, nor
+      // Not its backups but the newest, below, nor imports, conflict copies,
       // a restore, new-world or update it was asked for: restore-pending.json
       // is read at the next start and could wipe the world or restore from
       // flux/backups, which a node restored from this archive does not have.
@@ -901,6 +907,12 @@ module.exports = [
         children: true,
         excludeChildren: /^(backups|import|sync-conflicts|tmp|restore-pending\.json|update-.*\.json|mods-update-.*\.json)$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
       },
+      // The newest tar.gz the image made of the world, with SQLite's online
+      // backup: one whole database, where the live pair may be two moments
+      // apart (the server commits every few seconds, and the standby's
+      // database and WAL arrive on their own). The image's restore and world
+      // guard find a backup by this name.
+      { path: 'flux/backups', latest: { name: /^\d{8}-\d{6}-conan\.tar\.gz$/, settledMs: 5 * 60 * 1000 } },
       {
         path: '',
         children: true,

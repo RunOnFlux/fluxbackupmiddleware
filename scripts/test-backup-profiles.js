@@ -1542,6 +1542,10 @@ async function main() {
         ];
         case 'Saved/Worlds/Dedicated': return dedicated;
         case `Saved/Worlds/Dedicated/${SMAP}`: return mapFiles;
+        case 'flux/backups': return [
+          smFile('20261024-090000-soulmask.tar.gz', 8600000, 900), smFile('20261025-030000-soulmask.tar.gz', 8700000, 200),
+          smFile('20261025-090000-soulmask.tar.gz', 8700000, 2), smFile('index.json', 900, 2),
+        ];
         case 'flux': return [
           smDir('backups', 8600000), smDir('uploads', 40000000), smDir('sync-conflicts', 10), smFile('state.json', 700), smFile('worlds.json', 90),
           smFile('gameplay.json', 300), smFile('whitelist.json', 20), smFile('restore-pending.json', 80), smFile('update-state.json', 80),
@@ -1560,6 +1564,8 @@ async function main() {
       `appdata/Saved/Worlds/Dedicated/${SMAP}/2026102312.db`,
       'appdata/Saved/GameplaySettings', 'appdata/Saved/WhiteAccountList.txt',
       'appdata/flux/state.json', 'appdata/flux/worlds.json', 'appdata/flux/gameplay.json', 'appdata/flux/whitelist.json',
+      // The image's own consistent copy of the world: the newest settled one.
+      'appdata/flux/backups/20261025-030000-soulmask.tar.gz',
     ]);
     assert.match((await soulPlanOf({ mapFiles: soulCopies })).reason, /no world/, 'only the game\'s hourly copies');
     assert.match((await soulPlanOf({ mapFiles: [smFile('world.db', 0)] })).reason, /no world/, 'an empty world');
@@ -1601,6 +1607,9 @@ async function main() {
       switch (folder) {
         case '': return [cDir('Saved', 540000000), cDir('flux', 190000000), cFile('.flux-backup', 1)];
         case 'Saved': return [...saved, cDir('Logs', 0), cDir('Crashes', 0), cDir('ExtractedMods', 0)];
+        case 'flux/backups': return [
+          cFile('20261025-030000-conan.tar.gz', 40000000, 200), cFile('20261025-090000-conan.tar.gz', 40000000, 2), cFile('index.json', 900, 2),
+        ];
         case 'flux': return [
           cDir('backups', 180000000), cDir('import', 9000000), cDir('sync-conflicts', 10), cFile('state.json', 700), cFile('worlds.json', 90),
           cFile('mods.json', 300), cFile('rcon-password', 20), cFile('bans-pending.json', 20), cFile('settings-pending.json', 80),
@@ -1618,6 +1627,7 @@ async function main() {
       ...conanSaved.map((kept) => `appdata/Saved/${kept.name}`),
       'appdata/flux/state.json', 'appdata/flux/worlds.json', 'appdata/flux/mods.json', 'appdata/flux/rcon-password',
       'appdata/flux/bans-pending.json', 'appdata/flux/settings-pending.json',
+      'appdata/flux/backups/20261025-030000-conan.tar.gz',
     ]);
     assert.match((await conanPlanOf({ saved: conanCopies })).reason, /no world/, 'only the game\'s rotating copies');
     assert.match((await conanPlanOf({ saved: [cFile('game_0.db', 0)] })).reason, /no world/, 'an empty world');
