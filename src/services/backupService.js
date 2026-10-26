@@ -8,6 +8,7 @@ const DBClient = require('./utils/DBClient');
 const log = require('../lib/log');
 const config = require('../../config/default');
 const idService = require('./idService');
+const nodeAuthentication = require('./utils/nodeAuthentication');
 const messageHelper = require('./utils/messageHelper');
 const fileManager = require('./fileService');
 const fluxDrive = require('./fluxDrive');
@@ -749,7 +750,7 @@ async function cancelTaskDueToQuota(task, taskId, filesize) {
     uploaded: 0,
   };
   // eslint-disable-next-line no-use-before-define
-  const remoteRemoved = await removeBackupFromRemoteHost(cancelledTask.host, taskId);
+  const remoteRemoved = await removeBackupFromRemoteHost(cancelledTask, taskId);
   if (remoteRemoved) cancelledTask.remoteRemoved = 1;
   if (fileManager.fileExists(cancelledTask) || !cancelledTask.localRemoved) {
     try {
@@ -938,7 +939,7 @@ async function runTask(id) {
   try {
     if (task.extra) {
       try {
-        if (JSON.parse(task.extra).failureDiagnostic) task.extra = '';
+        if (JSON.parse(task.extra).failureDiagnostic) task.extra = fileManager.getTaskAuthHeader(task) || '';
       } catch (error) {
         // Preserve non-diagnostic legacy task metadata.
       }
@@ -1000,19 +1001,19 @@ async function runTask(id) {
     }
   } catch (error) {
     const message = getErrorMessage(error);
-    const deferredForStorage = error.deferWithoutFailure === true;
-    if (deferredForStorage || !task.status || task.status.state !== 'failed') {
+    const deferred = error.deferWithoutFailure === true;
+    if (deferred || !task.status || task.status.state !== 'failed') {
       task.status = {
-        state: deferredForStorage ? 'waiting' : 'failed',
+        state: deferred ? 'waiting' : 'failed',
         message,
         progress: 0,
       };
     }
     if (error.diagnostic) {
-      task.extra = JSON.stringify({ failureDiagnostic: error.diagnostic });
+      task.extra = JSON.stringify({ auth: fileManager.getTaskAuthHeader(task), failureDiagnostic: error.diagnostic });
     }
     if (error.terminal === true) task.fails = TASK_MAX_FAILURES;
-    else if (!deferredForStorage) task.fails += 1;
+    else if (!deferred) task.fails += 1;
 
     if (task.fails >= TASK_MAX_FAILURES) {
       try {
@@ -1035,8 +1036,8 @@ async function runTask(id) {
         log.error(`Failed to record failure activity for task ${id}: ${getErrorMessage(activityError)}`);
       }
     }
-    if (deferredForStorage) {
-      log.warn(`task ${id} deferred until local storage capacity is available: ${message}`);
+    if (deferred) {
+      log.warn(`task ${id} deferred: ${message}`);
     } else {
       log.error(`task ${id} failed:`, error instanceof Error ? error : message);
     }
@@ -1107,7 +1108,7 @@ async function checkExpiredApps() {
       // get apps that have been expired more than 7 days
       const records = await dbCli.execute(`select * from tasks where removedFromFluxdrive = 0 and uploaded = 1 and appExpireHeight > 0  and appExpireHeight < ${Number(expireHeight)} order by appExpireHeight ASC limit 10`);
       // eslint-disable-next-line no-restricted-syntax
-      for (record of records) {
+      for (const record of records) {
         // check if they have been extended
         const appSpecs = await fluxOS.getAppSpecs(record.appname, true);
         if (appSpecs && appSpecs !== 'Application not found' && appSpecs.expire + appSpecs.height !== record.appExpireHeight) {
@@ -1521,6 +1522,7 @@ async function registerBackupTask(req, res, taskObj = null) {
     if (!isValidUrl(host)) {
       throw new Error('host url is not valid');
     }
+    nodeAuthentication.parseHttpUrl(host);
     // get app expire height
     const appExpireHeight = await fluxOS.getAppExpireHeight(appname);
     if (appExpireHeight === false) {
@@ -1896,7 +1898,7 @@ async function cleanupIncompleteAutomaticBackupTasks(taskIds) {
 
     if (task.host && !task.remoteRemoved) {
       // eslint-disable-next-line no-use-before-define
-      const remoteRemoved = await removeBackupFromRemoteHost(task.host, taskId);
+      const remoteRemoved = await removeBackupFromRemoteHost(task, taskId);
       if (!remoteRemoved) {
         artifactCleanupFailed = true;
         failed += 1;
@@ -2119,38 +2121,31 @@ async function reconcileFluxDriveInventory() {
 
 /**
  * Removes backup file from remote host
- * Converts the download URL to removal URL and sends request with team authentication
+ * Converts the download URL to a removal URL with the same task authentication
  * @async
- * @param {string} host - The host URL from task (download URL)
+ * @param {object} task - The task, including its download URL and authentication metadata
  * @param {number} taskId - The task ID for updating database
  * @returns {Promise<boolean>} - true if removal was successful, false otherwise
  */
-async function removeBackupFromRemoteHost(host, taskId) {
+async function removeBackupFromRemoteHost(task, taskId) {
   try {
     // Convert download URL to removal URL
     // From: http://99.132.138.126:16177/backup/downloadlocalfile/...
     // To:   http://99.132.138.126:16177/backup/removebackupfile/...
-    const removalUrl = host.replace('/backup/downloadlocalfile/', '/backup/removebackupfile/');
+    const { url, zelidauth } = await fileManager.getTaskRequestAuthentication(task);
+    if (!url.pathname.startsWith('/backup/downloadlocalfile/')) return false;
+    url.pathname = url.pathname.replace('/backup/downloadlocalfile/', '/backup/removebackupfile/');
+    const removalUrl = url.href;
 
     log.info(`Attempting to remove remote file for task ${taskId} from: ${removalUrl}`);
-
-    // Parse URL to get node address
-    const urlParts = new URL(removalUrl);
-    const nodeUrl = `${urlParts.protocol}//${urlParts.host}`;
-
-    // Get zelidAuth for the request
-    const zelidAuth = await fluxOS.verifyTeamLogin(nodeUrl);
-
-    if (!zelidAuth) {
-      log.error(`Failed to authenticate with node for task ${taskId}`);
-      return false;
-    }
 
     // Make the removal request using axios
     const response = await axios.get(removalUrl, {
       headers: {
-        zelidauth: zelidAuth,
+        zelidauth,
       },
+      maxRedirects: 0,
+      httpsAgent: nodeAuthentication.httpsAgent,
       timeout: 30000, // 30 second timeout
     });
 
@@ -2634,7 +2629,7 @@ async function processAutomaticBackupInternal() {
           }
         }
 
-        const node = `http://${nodeAddress}`;
+        const node = nodeAuthentication.authenticatedNodeOrigin(`http://${nodeAddress}`);
         attemptedNodes.add(nodeAddress);
         log.info(`Using node: ${node}`);
 
@@ -2782,10 +2777,10 @@ async function processAutomaticBackupInternal() {
             const taskId = taskIds[i];
             // Get task details to get the host URL
             // eslint-disable-next-line no-await-in-loop
-            const taskDetails = await dbCli.execute('SELECT host FROM tasks WHERE taskId = ?', [taskId]);
+            const taskDetails = await dbCli.execute('SELECT taskId, host, owner, extra, backup_type FROM tasks WHERE taskId = ?', [taskId]);
             if (taskDetails.length > 0 && taskDetails[0].host) {
               // eslint-disable-next-line no-await-in-loop
-              const removalSuccess = await removeBackupFromRemoteHost(taskDetails[0].host, taskId);
+              const removalSuccess = await removeBackupFromRemoteHost(taskDetails[0], taskId);
               if (removalSuccess) {
                 remoteRemovalCount += 1;
               }
@@ -3088,6 +3083,8 @@ module.exports = {
   forceSendDailyBackupReport,
   forceSyncSyncthingApps,
   testHooks: {
+    checkExpiredApps,
+    removeBackupFromRemoteHost,
     enforceAppBackupRetention,
     resolveBackupProfiles,
     canRetryOnPrimary,

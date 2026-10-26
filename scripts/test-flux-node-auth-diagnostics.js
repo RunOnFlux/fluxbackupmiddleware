@@ -52,7 +52,7 @@ async function main() {
   Vault.getKey = async (key) => secrets[key] || null;
   const attempts = [];
   const fallback = await fluxOS.verifyTeamLoginDetailed(
-    'http://192.0.2.10:16127',
+    'https://192.0.2.10:16127',
     async (zelid) => {
       attempts.push(zelid);
       if (zelid === 'primary-id') {
@@ -83,7 +83,7 @@ async function main() {
 
   attempts.length = 0;
   const nodeUnavailable = await fluxOS.verifyTeamLoginDetailed(
-    'http://192.0.2.10:16127',
+    'https://192.0.2.10:16127',
     async (zelid) => {
       attempts.push(zelid);
       return {
@@ -103,7 +103,7 @@ async function main() {
   const creationLogins = [];
   const creationAttempts = [];
   const fallbackCreation = await fluxOS.createBackupTaskWithTeamCredentials(
-    'http://192.0.2.10:16127',
+    'https://192.0.2.10:16127',
     'marketplace-app',
     ['component'],
     async (zelid) => {
@@ -148,7 +148,7 @@ async function main() {
   creationLogins.length = 0;
   creationAttempts.length = 0;
   const ambiguousCreationFailure = await fluxOS.createBackupTaskWithTeamCredentials(
-    'http://192.0.2.10:16127',
+    'https://192.0.2.10:16127',
     'marketplace-app',
     ['component'],
     async (zelid) => {

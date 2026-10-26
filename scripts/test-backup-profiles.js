@@ -20,12 +20,28 @@ const profileSlotCleared = {
   reply: () => ({ status: 200, headers: {}, data: { status: 'success', data: {} } }),
 };
 async function axiosMock(request) {
-  calls.push(request);
-  const route = routes.find((candidate) => candidate.match(request))
-    || (markerAbsent.match(request) ? markerAbsent : null)
-    || (profileSlotCleared.match(request) ? profileSlotCleared : null);
-  if (!route) throw new Error(`Unexpected request in test: ${request.method} ${request.url}`);
-  return route.reply(request);
+  if (request.url === 'https://api.runonflux.io/fluxstatistics;csv') {
+    return { status: 200, data: '# pxname,svname,status\napirunonfluxiobackend,server1_203.0.113.11,UP\napirunonfluxiobackend,server2_203.0.113.12,UP\napirunonfluxiobackend,server3_203.0.113.13,UP' };
+  }
+  const registryRequest = /^https:\/\/203-0-113-1[123]-16127\.node\.api\.runonflux\.io/.test(request.url);
+  const routedRequest = registryRequest ? { ...request, url: request.url.replace(/^https:\/\/[^/]+/, 'https://api.runonflux.io') } : request;
+
+  if (request.headers?.zelidauth) {
+    assert.strictEqual(request.maxRedirects, 0, 'Authenticated node requests must not follow redirects');
+    assert.strictEqual(request.httpsAgent.options.rejectUnauthorized, true, 'Authenticated HTTPS requests must verify certificates');
+  }
+  calls.push(routedRequest);
+  const route = routes.find((candidate) => candidate.match(routedRequest))
+    || (markerAbsent.match(routedRequest) ? markerAbsent : null)
+    || (profileSlotCleared.match(routedRequest) ? profileSlotCleared : null);
+  if (!route) throw new Error(`Unexpected routedRequest in test: ${routedRequest.method} ${routedRequest.url}`);
+  const response = await route.reply(routedRequest);
+  if (registryRequest && routedRequest.url.includes('/apps/appspecifications/') && response.data?.status === 'success') {
+    response.data.data = {
+      owner: 'owner', height: 1000000, expire: 1000, ...response.data.data,
+    };
+  }
+  return response;
 }
 axiosMock.get = async (url, options) => axiosMock({ method: 'get', url, ...options });
 axiosMock.post = async (url, data, options) => axiosMock({
@@ -57,12 +73,14 @@ const backupProfiles = require('../src/services/utils/backupProfiles');
 const allProfiles = require('../config/backupProfiles');
 const idService = require('../src/services/idService');
 const fluxOS = require('../src/services/fluxOsService');
+const registryConsensus = require('../src/services/utils/registryConsensus');
 const enterpriseCrypto = require('../src/services/enterpriseCrypto');
 const backupService = require('../src/services/backupService');
 
 const { testHooks: backupHooks } = backupService;
 
-const NODE = 'http://10.0.0.2:16127';
+const NODE = 'https://10.0.0.2:16127';
+
 const APP = 'dragonwilds1790000000000';
 const COMPONENT = 'dragonwilds';
 const IMAGE = 'indifferentbroccoli/runescape-dragonwilds-server-docker:latest';
@@ -446,7 +464,7 @@ async function main() {
     });
 
     // --- the marker on a standby that refuses writes (FluxOS 8.21+) -----------------
-    const PRIMARY = 'http://10.0.0.1:16137';
+    const PRIMARY = 'https://10-0-0-1-16137.node.api.runonflux.io';
     const markerListing = (node, present) => ({
       match: (r) => r.method === 'get' && r.url === `${node}/apps/getfolderinfo/${APP}/${COMPONENT}/${encodeURIComponent('appdata/.flux-backup')}`,
       reply: () => (present() ? success([]) : missing()),
@@ -508,7 +526,7 @@ async function main() {
     routes = standbyRoutes();
     outcome = await fluxOS.testHooks.createProfiledArchiveOnNode(NODE, 'auth', APP, COMPONENT, profile, [], reachPrimary);
     assert.strictEqual(outcome.archiveFailed, true);
-    assert.match(outcome.reason, /made on the primary http:\/\/10\.0\.0\.1:16137 but had not reached this node/);
+    assert.match(outcome.reason, /made on the primary https:\/\/10-0-0-1-16137\.node\.api\.runonflux\.io but had not reached this node/);
     assert(!calls.some((r) => r.url.endsWith('/apps/compressobject')));
 
     // No way to the primary, or the primary refuses: the same.
@@ -539,15 +557,19 @@ async function main() {
       match: (r) => r.url === `https://api.runonflux.io/apps/location/${APP}`,
       reply: () => success(ips.map((ip) => ({ name: APP, ip }))),
     });
+    registryConsensus.testHooks.clearCaches();
     routes = [appips(['10.0.0.1']), locations(['10.0.0.2:16127', '10.0.0.1:16137'])];
     assert.strictEqual(await fluxOS.testHooks.getPrimaryNodeAddress(APP, []), '10.0.0.1:16137');
+    registryConsensus.testHooks.clearCaches();
     routes = [appips(['10.0.0.1']), locations(['10.0.0.1:16127', '10.0.0.1:16137'])];
     assert.strictEqual(await fluxOS.testHooks.getPrimaryNodeAddress(APP, []), null, 'two instances on one IP: no guessing');
+    registryConsensus.testHooks.clearCaches();
     routes = [appips(['10.0.0.9']), locations(['10.0.0.2:16127'])];
     assert.strictEqual(await fluxOS.testHooks.getPrimaryNodeAddress(APP, []), null);
 
     // The wrapper logs in on the primary with the credential the standby took, once,
     // and only when the node step asks.
+    registryConsensus.testHooks.clearCaches();
     routes = [appips(['10.0.0.1']), locations(['10.0.0.2:16127', '10.0.0.1:16137'])];
     const logins = [];
     const reached = [];
@@ -811,7 +833,8 @@ async function main() {
     // One save: every file of Players/ and the two Level files in the same second
     // (palworld1788788877472, 2026-10-14). `ago` in minutes.
     const SAVED = 3;
-    const at = (minutesAgo, seconds = 0) => new Date(Date.now() - minutesAgo * 60000 + seconds * 1000).toISOString();
+    const listingTime = Date.now();
+    const at = (minutesAgo, seconds = 0) => new Date(listingTime - minutesAgo * 60000 + seconds * 1000).toISOString();
     const pFile = (name, size, modifiedAt) => ({
       name, size, isFile: true, isDirectory: false, modifiedAt,
     });

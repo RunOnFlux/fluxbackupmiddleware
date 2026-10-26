@@ -87,12 +87,14 @@ async function main() {
     const firstTask = {
       taskId: 4524,
       filename: 'backup_wp.tar.gz',
+      backup_type: 'automatic',
       filesize: firstContent.length,
       host: `http://127.0.0.1:${port}/first`,
     };
     const secondTask = {
       taskId: 4527,
       filename: 'backup_wp.tar.gz',
+      backup_type: 'automatic',
       filesize: secondContent.length,
       host: `http://127.0.0.1:${port}/second`,
     };
@@ -116,6 +118,7 @@ async function main() {
     const missingTask = {
       taskId: 4530,
       filename: 'backup_wp.tar.gz',
+      backup_type: 'automatic',
       filesize: firstContent.length,
       host: `http://127.0.0.1:${port}/missing`,
     };
@@ -129,6 +132,7 @@ async function main() {
     const mismatchedTask = {
       taskId: 4531,
       filename: 'backup_wp.tar.gz',
+      backup_type: 'automatic',
       filesize: firstContent.length + 1,
       host: `http://127.0.0.1:${port}/first`,
     };
@@ -142,6 +146,7 @@ async function main() {
     const unexpectedResponseTask = {
       taskId: 4532,
       filename: 'backup_wp.tar.gz',
+      backup_type: 'automatic',
       filesize: firstContent.length,
       host: `http://127.0.0.1:${port}/unexpected`,
     };
@@ -161,6 +166,7 @@ async function main() {
     const missingRemoteFileTask = {
       taskId: 4535,
       filename: 'backup_wp.tar.gz',
+      backup_type: 'automatic',
       filesize: firstContent.length,
       host: `http://127.0.0.1:${port}/remote-file-missing`,
     };
@@ -182,6 +188,7 @@ async function main() {
     const oversizedTask = {
       taskId: 4533,
       filename: 'backup_wp.tar.gz',
+      backup_type: 'automatic',
       filesize: firstContent.length,
       host: `http://127.0.0.1:${port}/first`,
     };
@@ -196,6 +203,7 @@ async function main() {
     const capacityTask = {
       taskId: 4534,
       filename: 'backup_wp.tar.gz',
+      backup_type: 'automatic',
       filesize: firstContent.length,
       host: `http://127.0.0.1:${port}/first`,
     };

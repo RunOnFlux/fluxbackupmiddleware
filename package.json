@@ -7,6 +7,8 @@
     "test": "node index.js",
     "test:session-authorization": "node scripts/test-session-authorization.js",
     "test:wallet-compatibility": "node scripts/test-wallet-compatibility.js",
+    "test:outbound-node-auth": "node scripts/test-outbound-node-auth.js",
+    "test:registry-consensus": "node scripts/test-registry-consensus.js",
     "test:automatic-backup-dispatch": "node scripts/test-automatic-backup-dispatch.js",
     "test:backup-profiles": "node scripts/test-backup-profiles.js",
     "test:concurrent-downloads": "node scripts/test-concurrent-task-downloads.js",

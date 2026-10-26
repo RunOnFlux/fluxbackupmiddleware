@@ -100,6 +100,7 @@ async function getSasConfiguration() {
 function createSasHttpsAgent(sasConfig) {
   try {
     return new https.Agent({
+      rejectUnauthorized: true,
       key: fs.readFileSync(sasConfig.keyPath),
       cert: fs.readFileSync(sasConfig.certPath),
       ca: fs.readFileSync(sasConfig.caPath),
@@ -114,6 +115,9 @@ async function getSasRuntime() {
     sasRuntimePromise = (async () => {
       const sasConfig = await getSasConfiguration();
       const decryptUrl = new URL(sasConfig.baseUrl);
+      if (decryptUrl.protocol !== 'https:' || decryptUrl.username || decryptUrl.password) {
+        throw new Error('SAS API requires an HTTPS endpoint without URL credentials');
+      }
       decryptUrl.pathname = path.posix.join(decryptUrl.pathname, 'decryptMessageRSA');
       return {
         sasConfig,
@@ -152,6 +156,7 @@ async function decryptAesKeyViaSas(
     try {
       // eslint-disable-next-line no-await-in-loop
       const response = await axiosClient.post(decryptUrl, payload, {
+        maxRedirects: 0,
         httpsAgent: sasHttpsAgent,
         timeout: sasConfig.timeoutMs,
       });

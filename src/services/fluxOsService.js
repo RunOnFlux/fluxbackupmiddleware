@@ -1,22 +1,17 @@
 /* eslint-disable no-param-reassign */
 /* eslint-disable no-await-in-loop */
 const axios = require('axios');
-const https = require('https');
-const appOwners = require('memory-cache');
 const qs = require('qs');
 const bitcoinMessage = require('./utils/bitcoinMessage');
+const nodeAuthentication = require('./utils/nodeAuthentication');
+const registryConsensus = require('./utils/registryConsensus');
 const log = require('../lib/log');
 const Vault = require('./Vault');
 const enterpriseCrypto = require('./enterpriseCrypto');
 const enterpriseDiscoveryCache = require('./utils/enterpriseDiscoveryCache');
 const backupProfiles = require('./utils/backupProfiles');
 
-// Create HTTPS agent that accepts insecure connections
-const httpsAgent = new https.Agent({
-  rejectUnauthorized: false,
-});
-
-const sessionExpireTime = 1 * 60 * 60 * 1000;
+const { httpsAgent } = nodeAuthentication;
 
 function getSafeApiMessage(data) {
   const message = data?.data?.message || data?.message
@@ -38,146 +33,54 @@ function getRequestFailure(error) {
  * @async
  * @returns {Promise<Object|null>} - A promise that resolves to the status data if the request is successful, or null if the request fails.
  */
-async function getAppSpecs(appname, retuenApiErrors = false) {
+async function getAppSpecs(appname, returnApiErrors = false) {
   if (!appname) return false;
   try {
-    const result = await axios({
-      method: 'get',
-      url: `https://api.runonflux.io/apps/appspecifications/${appname}`,
-      httpsAgent,
-    });
-    if (result.data && result.data.status && result.data.status === 'success') {
-      return result.data.data;
-    }
-    if (retuenApiErrors && result.data && result.data.status && result.data.status === 'error') {
-      return result.data.data.message;
-    }
-    return false;
-  } catch (e) {
-    log.error(e);
+    const spec = await registryConsensus.getAppSpecs(appname, { fresh: returnApiErrors });
+    return spec || (returnApiErrors ? 'Application not found' : false);
+  } catch (error) {
+    log.warn(`App specification confirmation failed for ${appname}: ${error.message}`);
     return false;
   }
 }
 
-/**
- * Retrieves FluxOS daemon block height.
- *
- * @async
- * @returns {Promise<Object|null>} - A promise that resolves to the status data if the request is successful, or null if the request fails.
- */
 async function getBlockHeight() {
   try {
-    const result = await axios({
-      method: 'get',
-      url: 'https://api.runonflux.io/daemon/getblockcount',
-      httpsAgent,
-    });
-    if (result.data && result.data.status && result.data.status === 'success') {
-      return result.data.data;
-    }
-    return false;
-  } catch (e) {
-    log.error(e);
+    return await registryConsensus.getBlockHeight();
+  } catch (error) {
+    log.warn(`Block height confirmation failed: ${error.message}`);
     return false;
   }
 }
 
-/**
-* [verifyAppOwner]
-*/
 async function verifyAppOwner(owner, appname) {
-  // eslint-disable-next-line no-param-reassign
-  let value = appOwners.get(appname);
-  if (!value) {
-    const appSpecs = await getAppSpecs(appname);
-    if (appSpecs) {
-      value = { owner: appSpecs.owner, expireHeight: appSpecs.expire + appSpecs.height };
-      appOwners.put(appname, value, sessionExpireTime);
-    }
-  }
-
-  // Check if owner matches
-  if (value && value.owner === owner) {
-    return true;
-  }
-
+  const spec = await getAppSpecs(appname);
+  if (!spec) return false;
   // eslint-disable-next-line no-use-before-define
-  if (await isTeamFluxId(owner)) {
-    log.info(`App ${appname} verified as owned by a team Flux ID`);
-    return true;
-  }
-  return false;
+  return spec.owner === owner || isTeamFluxId(owner);
 }
-/**
-* [getAppExpireHeight]
-*/
+
 async function getAppExpireHeight(appname) {
-  // eslint-disable-next-line no-param-reassign
-  let value = appOwners.get(appname);
-  if (!value) {
-    const appSpecs = await getAppSpecs(appname);
-    if (appSpecs) {
-      value = { owner: appSpecs.owner, expireHeight: appSpecs.expire + appSpecs.height };
-      appOwners.put(appname, value, sessionExpireTime);
-    }
-  }
-  if (value) return value.expireHeight;
-  return false;
+  const spec = await getAppSpecs(appname);
+  return spec ? spec.height + spec.expire : false;
 }
 
-/**
-* [getAppOwner]
-*/
 async function getAppOwnerDetailed(appname) {
-  let value = appOwners.get(appname);
-  if (value) {
-    return {
-      owner: value.owner,
-      diagnostics: [{
-        check: 'Flux app owner',
-        outcome: 'success',
-        detail: 'App owner loaded from middleware cache',
-      }],
-    };
-  }
-
-  const endpoint = `https://api.runonflux.io/apps/appspecifications/${appname}`;
   try {
-    const response = await axios.get(endpoint, { httpsAgent, timeout: 30000 });
-    if (response.data?.status === 'success' && response.data.data?.owner) {
-      const appSpecs = response.data.data;
-      value = { owner: appSpecs.owner, expireHeight: appSpecs.expire + appSpecs.height };
-      appOwners.put(appname, value, sessionExpireTime);
-      return {
-        owner: value.owner,
-        diagnostics: [{
-          check: 'Flux app owner',
-          outcome: 'success',
-          endpoint,
-          httpStatus: response.status,
-          detail: 'App owner returned by specifications API',
-        }],
-      };
-    }
+    const spec = await registryConsensus.getAppSpecs(appname);
     return {
-      owner: null,
+      owner: spec?.owner || null,
       diagnostics: [{
         check: 'Flux app owner',
-        outcome: 'failed',
-        endpoint,
-        httpStatus: response.status,
-        detail: getSafeApiMessage(response.data) || 'Specifications API returned no app owner',
+        outcome: spec ? 'success' : 'failed',
+        detail: spec ? 'App owner confirmed by independent API backends' : 'Application not found by independent API backends',
       }],
     };
   } catch (error) {
-    log.error(`Failed to get app owner for ${appname}:`, error.message);
     return {
       owner: null,
       diagnostics: [{
-        check: 'Flux app owner',
-        outcome: 'failed',
-        endpoint,
-        ...getRequestFailure(error),
+        check: 'Flux app owner', outcome: 'failed', errorCode: error.code, detail: error.message,
       }],
     };
   }
@@ -270,7 +173,7 @@ function parseSecondaryNodeFromHAProxyStats(htmlContent, appname) {
 async function getPrimaryNodeIp(appname, diagnostics) {
   const appIpsUrl = `${getFdmBaseUrl(appname)}/api/appips/${appname}`;
   try {
-    const response = await axios.get(appIpsUrl, { httpsAgent, timeout: 30000 });
+    const response = await axios.get(appIpsUrl, { httpsAgent, maxRedirects: 0, timeout: 30000 });
 
     if (response.data?.status === 'success' && response.data?.data?.ips?.length > 0) {
       const [primaryIp] = response.data.data.ips;
@@ -314,11 +217,7 @@ async function getPrimaryNodeIp(appname, diagnostics) {
 async function getPrimaryNodeAddress(appname, diagnostics) {
   const primaryIp = await getPrimaryNodeIp(appname, diagnostics);
   if (!primaryIp) return null;
-  const locationUrl = `https://api.runonflux.io/apps/location/${appname}`;
-  const response = await axios.get(locationUrl, { httpsAgent, timeout: 30000 });
-  const locations = response.data?.status === 'success' && Array.isArray(response.data.data)
-    ? response.data.data
-    : [];
+  const locations = await registryConsensus.getLocations(appname);
   const matching = locations.filter((location) => location?.ip && extractNodeIp(location.ip) === primaryIp);
   return matching.length === 1 ? formatLocationNode(matching[0].ip) : null;
 }
@@ -331,27 +230,12 @@ async function getSecondaryNodeFromLocationApi(
 ) {
   const locationUrl = `https://api.runonflux.io/apps/location/${appname}`;
   try {
-    const locationResponse = await axios.get(locationUrl, { httpsAgent, timeout: 30000 });
-
-    if (!locationResponse.data || locationResponse.data.status !== 'success' || !locationResponse.data.data) {
-      diagnostics.push({
-        check: 'Flux location API',
-        outcome: 'failed',
-        endpoint: locationUrl,
-        httpStatus: locationResponse.status,
-        detail: getSafeApiMessage(locationResponse.data) || 'Invalid location API response',
-      });
-      log.error(`Invalid response from location API for ${appname}`);
-      return null;
-    }
-
-    const locations = locationResponse.data.data;
+    const locations = await registryConsensus.getLocations(appname);
     if (locations.length === 0) {
       diagnostics.push({
         check: 'Flux location API',
         outcome: 'failed',
         endpoint: locationUrl,
-        httpStatus: locationResponse.status,
         detail: 'No running app locations were returned',
       });
       log.error(`No locations found for ${appname} in location API`);
@@ -386,7 +270,6 @@ async function getSecondaryNodeFromLocationApi(
         check: 'Flux location API',
         outcome: 'failed',
         endpoint: locationUrl,
-        httpStatus: locationResponse.status,
         node: primaryIp,
         detail: `Only the primary IP was available (${locations.length} location record(s))`,
       });
@@ -424,9 +307,20 @@ async function getSecondaryNodeFromLocationApi(
  */
 async function getSecondaryNodeSelection(appname, excludedNodes = new Set()) {
   const diagnostics = [];
+  let verifiedLocations;
+  try {
+    verifiedLocations = await registryConsensus.getLocations(appname);
+  } catch (error) {
+    diagnostics.push({
+      check: 'Flux app locations', outcome: 'failed', errorCode: error.code, detail: error.message,
+    });
+    return {
+      node: null, primaryIp: null, reason: error.message, diagnostics,
+    };
+  }
   const statsUrl = `${getFdmBaseUrl(appname)}/fluxstatistics?scope=${appname}_`;
   try {
-    const response = await axios.get(statsUrl, { httpsAgent, timeout: 30000 });
+    const response = await axios.get(statsUrl, { httpsAgent, maxRedirects: 0, timeout: 30000 });
 
     if (!response.data) {
       diagnostics.push({
@@ -439,7 +333,9 @@ async function getSecondaryNodeSelection(appname, excludedNodes = new Set()) {
       log.error(`No data received from HAProxy statistics for ${appname}`);
     } else {
       const secondaryNode = parseSecondaryNodeFromHAProxyStats(response.data, appname);
-      if (secondaryNode && !excludedNodes.has(secondaryNode)) {
+      const confirmed = verifiedLocations.some((location) => formatLocationNode(location.ip) === secondaryNode);
+      if (secondaryNode && !excludedNodes.has(secondaryNode)
+        && confirmed) {
         diagnostics.push({
           check: 'FDM HAProxy statistics',
           outcome: 'success',
@@ -462,7 +358,7 @@ async function getSecondaryNodeSelection(appname, excludedNodes = new Set()) {
           outcome: 'skipped',
           endpoint: statsUrl,
           node: secondaryNode,
-          detail: 'Previously attempted node was skipped while looking for another secondary',
+          detail: confirmed ? 'Previously attempted node was skipped while looking for another secondary' : 'Gateway candidate was not confirmed by independent location backends',
         });
         log.info(`Skipping previously attempted HAProxy node for ${appname}: ${secondaryNode}`);
       }
@@ -523,7 +419,7 @@ async function getSecondaryNodeFromHAProxy(appname) {
 async function getLoginPhraseDetailed(node) {
   const endpoint = `${node}/id/loginphrase`;
   try {
-    const response = await axios.get(endpoint, { httpsAgent, timeout: 30000 });
+    const response = await axios.get(endpoint, { httpsAgent, maxRedirects: 0, timeout: 30000 });
     if (response.data.status === 'error') {
       const apiMessage = getSafeApiMessage(response.data) || 'unspecified node API error';
       const reason = 'Selected Flux node API is unavailable for backup authentication: login phrase endpoint returned an error response';
@@ -553,6 +449,20 @@ async function getLoginPhraseDetailed(node) {
           node,
           httpStatus: response.status,
           detail: 'Node API responded but did not provide a login phrase',
+        },
+      };
+    }
+    if (!nodeAuthentication.isValidNodeLoginPhrase(response.data.data)) {
+      return {
+        phrase: null,
+        reason: 'Node returned an invalid or expired login phrase',
+        diagnostic: {
+          check: 'Flux node login phrase',
+          outcome: 'failed',
+          endpoint,
+          node,
+          httpStatus: response.status,
+          detail: 'Node returned an invalid or expired login phrase',
         },
       };
     }
@@ -601,6 +511,14 @@ function signMessage(message, pk, strMessageMagic) {
 }
 
 async function verifyLoginDetailed(zelid, privateKeySign, node) {
+  try {
+    // Resolve before contacting the node or signing anything, including callers
+    // that invoke this lower-level helper without the team credential wrapper.
+    // eslint-disable-next-line no-param-reassign
+    node = nodeAuthentication.authenticatedNodeOrigin(node);
+  } catch (error) {
+    return nodeAuthentication.teamAuthFailure(node, error);
+  }
   const diagnostics = [];
   const verifyEndpoint = `${node}/id/verifylogin`;
   try {
@@ -636,7 +554,7 @@ async function verifyLoginDetailed(zelid, privateKeySign, node) {
     const response = await axios.post(
       verifyEndpoint,
       qs.stringify(loginInfo),
-      { httpsAgent, timeout: 30000 },
+      { httpsAgent, maxRedirects: 0, timeout: 30000 },
     );
 
     if (response.data.status === 'success') {
@@ -706,7 +624,16 @@ async function isTeamFluxId(zelid) {
     Vault.getKey('teamFluxID'),
     Vault.getKey('teamFluxID2'),
   ]);
-  return zelid === primaryId || zelid === secondaryId;
+  const canonical = (identity) => {
+    if (typeof identity !== 'string') return null;
+    if (/^0x[a-f0-9]{40}$/i.test(identity)) return identity.toLowerCase();
+    if (/^(?:0[23][a-f0-9]{64}|04[a-f0-9]{128})$/i.test(identity)) {
+      return bitcoinMessage.publicKeyToAddress(identity);
+    }
+    return identity;
+  };
+  const signingIdentity = canonical(zelid);
+  return signingIdentity !== null && [canonical(primaryId), canonical(secondaryId)].includes(signingIdentity);
 }
 
 function labelLoginDiagnostics(diagnostics, credentialLabel) {
@@ -737,6 +664,12 @@ function isExplicitAuthorizationFailure(result) {
 }
 
 async function verifyTeamLoginDetailed(node, verifier = verifyLoginDetailed) {
+  try {
+    // eslint-disable-next-line no-param-reassign
+    node = nodeAuthentication.authenticatedNodeOrigin(node);
+  } catch (error) {
+    return nodeAuthentication.teamAuthFailure(node, error);
+  }
   const credentials = await getTeamCredentials();
   if (credentials.length === 0) {
     return {
@@ -798,20 +731,9 @@ async function verifyTeamLogin(node) {
  */
 async function isAppExpiredInGlobalSpecs(appname) {
   try {
-    const result = await axios({
-      method: 'get',
-      url: `https://api.runonflux.io/apps/globalappsspecifications?appname=${encodeURIComponent(appname)}`,
-      httpsAgent,
-    });
-
-    if (result.data?.status === 'success' && Array.isArray(result.data.data)) {
-      return result.data.data.length === 0;
-    }
-
-    log.warn(`Unexpected globalappsspecifications response for ${appname}`);
-    return null;
+    return await registryConsensus.getAppSpecs(appname, { fresh: true }) === null;
   } catch (error) {
-    log.error(`Failed to check global app specifications for ${appname}:`, error.message);
+    log.warn(`App expiry confirmation failed for ${appname}: ${error.message}`);
     return null;
   }
 }
@@ -834,6 +756,7 @@ async function discoverAppsWithSyncthing(
       method: 'get',
       url: `${enterpriseCrypto.FLUX_API}/apps/globalappsspecifications`,
       httpsAgent,
+      maxRedirects: 0,
       timeout: 120000,
       headers: { 'x-apicache-bypass': 'true' },
     });
@@ -958,6 +881,15 @@ function retryAfterMs(headers, fallbackSeconds = 5) {
  * Ask the node for the full appdata archive of each component
  * (appendbackuptask), and give it time to write it.
  */
+function authenticatedNodeRequest(options) {
+  return axios({
+    ...options,
+    url: nodeAuthentication.authenticatedNodeUrl(options.url).href,
+    httpsAgent,
+    maxRedirects: 0,
+  });
+}
+
 async function requestFullBackupOnNode(node, zelidAuth, appname, componentList, diagnostics) {
   const createEndpoint = `${node}/apps/appendbackuptask`;
   const backupPayload = {
@@ -969,7 +901,7 @@ async function requestFullBackupOnNode(node, zelidAuth, appname, componentList, 
   };
 
   // Make the backup request
-  const backupResponse = await axios({
+  const backupResponse = await authenticatedNodeRequest({
     method: 'post',
     url: createEndpoint,
     headers: {
@@ -979,6 +911,7 @@ async function requestFullBackupOnNode(node, zelidAuth, appname, componentList, 
     data: backupPayload,
     timeout: 300000, // 5 minutes timeout for backup process
     httpsAgent,
+    maxRedirects: 0,
   });
 
   if (!backupResponse.data) {
@@ -1015,12 +948,13 @@ async function requestFullBackupOnNode(node, zelidAuth, appname, componentList, 
  */
 async function listVolumeFolder(node, zelidAuth, appname, component, folder) {
   const endpoint = `${node}/apps/getfolderinfo/${appname}/${component}/${encodeURIComponent(folder)}`;
-  const response = await axios({
+  const response = await authenticatedNodeRequest({
     method: 'get',
     url: endpoint,
     headers: { zelidauth: zelidAuth },
     timeout: 30000,
     httpsAgent,
+    maxRedirects: 0,
   });
   const { data } = response;
   if (data?.status === 'success' && Array.isArray(data.data)) return data.data;
@@ -1033,12 +967,13 @@ async function listVolumeFolder(node, zelidAuth, appname, component, folder) {
 /** Create a directory on the volume; one that already exists is fine. */
 async function ensureVolumeFolder(node, zelidAuth, appname, component, folder) {
   const endpoint = `${node}/apps/createfolder/${appname}/${component}/${encodeURIComponent(folder)}`;
-  const response = await axios({
+  const response = await authenticatedNodeRequest({
     method: 'get',
     url: endpoint,
     headers: { zelidauth: zelidAuth },
     timeout: 60000,
     httpsAgent,
+    maxRedirects: 0,
     validateStatus: () => true,
   });
   const { data } = response;
@@ -1069,11 +1004,12 @@ async function ensureVolumeFolder(node, zelidAuth, appname, component, folder) {
 async function runVolumeOperation(node, zelidAuth, label, request, onAnswer = () => {}) {
   let response;
   for (let attempt = 0; ; attempt += 1) {
-    response = await axios({
+    response = await authenticatedNodeRequest({
       ...request,
       headers: { ...(request.data ? { 'Content-Type': 'application/json' } : {}), zelidauth: zelidAuth },
       timeout: 60000,
       httpsAgent,
+      maxRedirects: 0,
       validateStatus: () => true,
     });
     if (response.status !== 503 || attempt >= FILE_OPERATION_MAX_BUSY_RETRIES) break;
@@ -1094,12 +1030,13 @@ async function runVolumeOperation(node, zelidAuth, label, request, onAnswer = ()
     while (Date.now() < giveUpAt) {
       await new Promise((resolve) => { setTimeout(resolve, 2000); });
       try {
-        const poll = await axios({
+        const poll = await authenticatedNodeRequest({
           method: 'get',
           url: `${node}${statusPath}`,
           headers: { zelidauth: zelidAuth },
           timeout: 30000,
           httpsAgent,
+          maxRedirects: 0,
         });
         const view = poll.data?.data || {};
         if (FILE_OPERATION_TERMINAL_STATES.includes(view.status)) {
@@ -1227,8 +1164,8 @@ const PRIMARY_MAX_FREE_SHARE = 0.25;
 /** The bytes free on a component's volume, as the node reports them. */
 async function getVolumeAvailableBytes(node, zelidAuth, appname, component) {
   const endpoint = `${node}/backup/getvolumedataofcomponent/${appname}/${component}/B/0/available`;
-  const response = await axios({
-    method: 'get', url: endpoint, headers: { zelidauth: zelidAuth }, timeout: 10000, httpsAgent,
+  const response = await authenticatedNodeRequest({
+    method: 'get', url: endpoint, headers: { zelidauth: zelidAuth }, timeout: 10000, httpsAgent, maxRedirects: 0,
   });
   const available = Number(response.data?.data?.available);
   if (response.data?.status !== 'success' || !Number.isFinite(available)) {
@@ -1432,7 +1369,7 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList, c
       const component = componentList[i];
       try {
         const volumeEndpoint = `${node}/backup/getvolumedataofcomponent/${appname}/${component}/B/0/mount`;
-        const volumeResponse = await axios({
+        const volumeResponse = await authenticatedNodeRequest({
           method: 'get',
           url: volumeEndpoint,
           headers: {
@@ -1440,6 +1377,7 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList, c
           },
           timeout: 10000,
           httpsAgent,
+          maxRedirects: 0,
         });
 
         if (volumeResponse.data && volumeResponse.data.status === 'success' && volumeResponse.data.data.mount) {
@@ -1489,7 +1427,7 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList, c
         const testUrl = `${node}/backup/getlocalbackuplist/${testPath}/B/0/true/${appname}`;
         readinessEndpoint = testUrl;
 
-        const testResponse = await axios({
+        const testResponse = await authenticatedNodeRequest({
           method: 'get',
           url: testUrl,
           headers: {
@@ -1497,6 +1435,7 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList, c
           },
           timeout: 10000,
           httpsAgent,
+          maxRedirects: 0,
         });
 
         if (testResponse.data && testResponse.data.status === 'success' && testResponse.data.data.length > 0) {
@@ -1569,13 +1508,15 @@ async function createBackupTaskOnNode(node, zelidAuth, appname, componentList, c
 
           log.info(`Fetching backup list for component ${component}, attempt ${retryCount + 1}, mount: ${mount}`);
 
-          const backupListResponse = await axios({
+          const backupListResponse = await authenticatedNodeRequest({
             method: 'get',
             url: backupListUrl,
             headers: {
               zelidauth: zelidAuth,
             },
             timeout: 30000, // 30 seconds timeout
+            httpsAgent,
+            maxRedirects: 0,
           });
 
           if (backupListResponse.data && backupListResponse.data.status === 'success') {
@@ -1702,6 +1643,15 @@ async function createBackupTaskWithTeamCredentials(
   componentProfiles = null,
   options = {},
 ) {
+  try {
+    // eslint-disable-next-line no-param-reassign
+    node = nodeAuthentication.authenticatedNodeOrigin(node);
+  } catch (error) {
+    const failure = nodeAuthentication.teamAuthFailure(node, error);
+    return {
+      appname, status: 'failed', components: [], error: failure.reason, failureStage: 'node_auth', diagnostics: failure.diagnostics,
+    };
+  }
   const credentials = await getTeamCredentials();
   if (credentials.length === 0) {
     return {
@@ -1752,7 +1702,7 @@ async function createBackupTaskWithTeamCredentials(
       primaryAccess = primaryAccess || (async () => {
         const address = await getPrimaryNodeAddress(appname, []);
         if (!address) throw new Error('the primary node could not be identified');
-        const primaryNode = `http://${address}`;
+        const primaryNode = nodeAuthentication.authenticatedNodeOrigin(`http://${address}`);
         if (primaryNode === node) throw new Error(`${node} is the primary itself`);
         const primaryLogin = await verifier(credential.zelid, credential.privateKey, primaryNode);
         if (!primaryLogin.zelidAuth) {
