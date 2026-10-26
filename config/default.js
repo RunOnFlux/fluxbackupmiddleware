@@ -13,6 +13,10 @@ module.exports = {
   dbOperationTimeoutMs: 20000,
   dbSlowQueryMs: 2000,
   maxConcurrentTasks: 10,
+  maxConcurrentTasksPerOwner: 2,
+  maxPendingTasksPerOwner: 100,
+  maxPendingManualTasks: 1000,
+  backupDownloadTimeoutMs: 2 * 60 * 60 * 1000,
   quotaPerUser: 20, // GiB
   maxUploadedBackupsPerApp: 7, // Completed runs per owner/app, including all components
   automaticBackupSchedule: {

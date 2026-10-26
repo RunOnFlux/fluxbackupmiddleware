@@ -31,6 +31,40 @@ const {
 let dbCli = null;
 
 const taskQueue = new Map();
+let admissionTail = Promise.resolve();
+const registrationWindows = new Map();
+
+function withTaskAdmission(operation) {
+  const result = admissionTail.then(operation);
+  admissionTail = result.catch(() => {});
+  return result;
+}
+
+function consumeRegistration(owner) {
+  const now = Date.now();
+  registrationWindows.forEach((value, key) => {
+    if (value.expires <= now) registrationWindows.delete(key);
+  });
+  let window = registrationWindows.get(owner);
+  if (!window) {
+    if (registrationWindows.size >= 10000) throw new Error('Task registration is busy; try again later');
+    window = { expires: now + 10 * 60 * 1000, count: 0 };
+    registrationWindows.set(owner, window);
+  }
+  if (window.count >= 60) {
+    const error = new Error('Too many backup registrations; try again later');
+    error.code = 'BACKUP_RATE_LIMIT';
+    throw error;
+  }
+  window.count += 1;
+}
+
+function hasTaskCapacity(task) {
+  if (taskQueue.has(Number(task.taskId)) || taskQueue.size >= config.maxConcurrentTasks) return false;
+  let ownerTasks = 0;
+  taskQueue.forEach((running) => { if (running.owner === task.owner) ownerTasks += 1; });
+  return ownerTasks < config.maxConcurrentTasksPerOwner;
+}
 const userQuotaOperations = new Map();
 const TASK_MAX_FAILURES = 4;
 let fluxDriveReconciliationRunning = false;
@@ -1053,44 +1087,37 @@ function launchTask(id) {
   });
 }
 
-/**
- * This function updates the task queue. It first removes any tasks from the queue that have been running for more than an hour.
- * Then, if the queue has space, it fetches the latest remaining tasks from the database and adds them to the queue.
- * It only fetches tasks that have not finished and have attempts remaining.
- * It then runs each newly added task.
- *
- * @async
- * @throws Will throw an error if the database query fails.
- */
-async function updateQueue() {
-  // remove failed tasks from queue
-  const now = Math.floor(Date.now() / 1000);
-  const failTime = 30 * 60; // 30 minutes
-  taskQueue.forEach((value, key) => {
-    if (now - value.startTime > failTime) {
-      log.info(`deleting ${key} from queue.`);
-      taskQueue.delete(key);
-    }
-  });
-  // check if queue has space
-  if (taskQueue.size < config.maxConcurrentTasks) {
-    // read latest remaining tasks from db
-    const emptySlots = config.maxConcurrentTasks - taskQueue.size;
-    const records = await dbCli.execute(`select * from tasks where finishTime=0 and fails<${TASK_MAX_FAILURES} order by timestamp limit ${Number(emptySlots)}`);
-    // if (records.length) log.debug(`${records.length} failed tasks, retrying...`);
+/** Fill free slots without releasing ownership of any running transfer. */
+async function updateQueueInternal() {
+  if (taskQueue.size >= config.maxConcurrentTasks) return;
+  const maxPasses = config.maxConcurrentTasks;
+  for (let pass = 0; pass < maxPasses && taskQueue.size < config.maxConcurrentTasks; pass += 1) {
+    const active = [...taskQueue.keys()];
+    const owners = new Map();
+    taskQueue.forEach((task) => owners.set(task.owner, (owners.get(task.owner) || 0) + 1));
+    const saturated = [...owners].filter(([, count]) => count >= config.maxConcurrentTasksPerOwner).map(([owner]) => owner);
+    const exclude = active.length ? ` AND taskId NOT IN (${active.map(() => '?').join(',')})` : '';
+    const ownerExclude = saturated.length ? ` AND owner NOT IN (${saturated.map(() => '?').join(',')})` : '';
+    // Both ordering fields are server-controlled. Retry attempts go behind
+    // never-started tasks. Filter saturated owners before applying LIMIT so
+    // their backlog cannot hide other owners from the scheduler.
+    const records = await dbCli.execute(`SELECT * FROM tasks WHERE finishTime=0 AND fails<${TASK_MAX_FAILURES}${exclude}${ownerExclude} ORDER BY startTime, taskId LIMIT ${Number(config.maxConcurrentTasks)}`, [...active, ...saturated]);
+    let launched = 0;
     for (let i = 0; i < records.length; i += 1) {
-      if (!taskQueue.has(records[i].taskId)) {
-        // add task to the queue
-        taskQueue.set(Number(records[i].taskId), records[i]);
-        // run task
-        log.debug(`retrying task ${records[i].taskId}`);
-        launchTask(Number(records[i].taskId));
-      } else {
-        // log.warn(`task ${records[i].taskId} already in queue.`);
+      const task = records[i];
+      if (taskQueue.size >= config.maxConcurrentTasks) break;
+      if (hasTaskCapacity(task)) {
+        taskQueue.set(Number(task.taskId), task);
+        launchTask(Number(task.taskId));
+        launched += 1;
       }
     }
-    // console.log(taskQueue.entries());
+    if (launched === 0) break;
   }
+}
+
+function updateQueue() {
+  return withTaskAdmission(updateQueueInternal);
 }
 
 /**
@@ -1494,6 +1521,7 @@ async function registerBackupTask(req, res, taskObj = null) {
         throw new Error('Unauthorized access. Session expired.');
       }
     }
+    if (!taskObj) consumeRegistration(owner);
     // validate app and component name
     if (!appname || !component) {
       throw new Error('Invalid app or component name.');
@@ -1530,56 +1558,72 @@ async function registerBackupTask(req, res, taskObj = null) {
     }
     // When taskObj is provided, extra can be empty
     const extra = taskObj ? '' : req.headers.zelidauth;
-    // check if task is a duplicate (needed before quota check to avoid double-counting)
-    const record = await dbCli.execute(`
-      SELECT *
-      FROM tasks
-      WHERE owner = ?
-      AND timestamp = ?
-      AND appname = ?
-      AND component = ?
-      AND removedFromFluxdrive = 0
-      AND (uploaded = 1 OR (uploaded = 0 AND finishTime = 0 AND fails < ?))
-      ORDER BY taskId DESC
-      LIMIT 1
-    `, [owner, timestamp, appname, component, TASK_MAX_FAILURES]);
-    if (record.length > 0 && record[0].uploaded === 1) {
-      throw new Error('Checkpoint has already been uploaded to FluxDrive.');
-    }
-    let taskId = null;
-    if (record.length > 0 && record[0].uploaded === 0) {
-      // Resume existing task; return its ID even if the queue is full (updateQueue will retry)
-      taskId = record[0].taskId;
-      if (taskQueue.size < config.maxConcurrentTasks) {
-        const task = await dbCli.getTask(taskId);
-        if (task) {
-          task.extra = taskObj ? '' : req.headers.zelidauth;
-          task.removedFromFluxdrive = 0;
-          await dbCli.updateTask(task);
-          taskQueue.set(Number(taskId), task);
-          launchTask(Number(taskId));
+    const taskId = await withTaskAdmission(async () => {
+      // check if task is a duplicate (needed before quota check to avoid double-counting)
+      const record = await dbCli.execute(`
+        SELECT *
+        FROM tasks
+        WHERE owner = ?
+        AND timestamp = ?
+        AND appname = ?
+        AND component = ?
+        AND removedFromFluxdrive = 0
+        AND (uploaded = 1 OR (uploaded = 0 AND finishTime = 0 AND fails < ?))
+        ORDER BY taskId DESC
+        LIMIT 1
+      `, [owner, timestamp, appname, component, TASK_MAX_FAILURES]);
+      if (record.length > 0 && record[0].uploaded === 1) {
+        throw new Error('Checkpoint has already been uploaded to FluxDrive.');
+      }
+      let admittedTaskId = null;
+      if (record.length > 0 && record[0].uploaded === 0) {
+        // Resume existing task; return its ID even if the queue is full (updateQueue will retry)
+        admittedTaskId = record[0].taskId;
+        if (!taskQueue.has(Number(admittedTaskId))) {
+          const task = await dbCli.getTask(admittedTaskId);
+          if (task) {
+            task.extra = taskObj ? '' : req.headers.zelidauth;
+            task.removedFromFluxdrive = 0;
+            await dbCli.updateTask(task);
+            if (hasTaskCapacity(task)) {
+              taskQueue.set(Number(admittedTaskId), task);
+              launchTask(Number(admittedTaskId));
+            }
+          }
+        }
+      } else {
+        if (!taskObj) {
+          const counts = await dbCli.execute(`
+            SELECT SUM(owner = ?) AS ownerPending,
+            SUM(backup_type = 'manual' OR backup_type IS NULL) AS manualPending
+            FROM tasks WHERE finishTime = 0 AND fails < ? AND uploaded = 0
+          `, [owner, TASK_MAX_FAILURES]);
+          if (Number(counts[0]?.ownerPending || 0) >= config.maxPendingTasksPerOwner
+            || Number(counts[0]?.manualPending || 0) >= config.maxPendingManualTasks) {
+            throw new Error('Too many pending backup tasks; wait for existing tasks to finish');
+          }
+        }
+        // add task to the db
+        const newTask = {
+          owner, timestamp, filename, appname, component, filesize, host, extra, appExpireHeight, backup_type: backupType,
+        };
+        if (backupProfile) newTask.backup_profile = backupProfile;
+        const result = await dbCli.addNewTask(newTask);
+        admittedTaskId = result.insertId;
+        if (!admittedTaskId) {
+          throw new Error('Failed to create backup task in database');
+        }
+        // run the task if there is space in queue
+        if (!taskQueue.has(Number(admittedTaskId)) && taskQueue.size < config.maxConcurrentTasks) {
+          const task = await dbCli.getTask(admittedTaskId);
+          if (task && hasTaskCapacity(task)) {
+            taskQueue.set(Number(admittedTaskId), task);
+            launchTask(Number(admittedTaskId));
+          }
         }
       }
-    } else {
-      // add task to the db
-      const newTask = {
-        owner, timestamp, filename, appname, component, filesize, host, extra, appExpireHeight, backup_type: backupType,
-      };
-      if (backupProfile) newTask.backup_profile = backupProfile;
-      const result = await dbCli.addNewTask(newTask);
-      taskId = result.insertId;
-      if (!taskId) {
-        throw new Error('Failed to create backup task in database');
-      }
-      // run the task if there is space in queue
-      if (taskQueue.size < config.maxConcurrentTasks) {
-        const task = await dbCli.getTask(taskId);
-        if (task) {
-          taskQueue.set(Number(taskId), task);
-          launchTask(Number(taskId));
-        }
-      }
-    }
+      return admittedTaskId;
+    });
     const phraseResponse = messageHelper.createDataMessage({ taskId });
     res.json(phraseResponse);
   } catch (error) {
@@ -3083,6 +3127,10 @@ module.exports = {
   forceSendDailyBackupReport,
   forceSyncSyncthingApps,
   testHooks: {
+    updateQueue,
+    getActiveTasks: () => [...taskQueue.values()],
+    consumeRegistration,
+    resetRegistrationLimits: () => registrationWindows.clear(),
     checkExpiredApps,
     removeBackupFromRemoteHost,
     enforceAppBackupRetention,

@@ -2,6 +2,7 @@
 /* eslint-disable no-await-in-loop */
 const axios = require('axios');
 const qs = require('qs');
+const net = require('net');
 const bitcoinMessage = require('./utils/bitcoinMessage');
 const nodeAuthentication = require('./utils/nodeAuthentication');
 const registryConsensus = require('./utils/registryConsensus');
@@ -122,52 +123,35 @@ function formatLocationNode(ipOrHostPort) {
   return `${ipOrHostPort}:${DEFAULT_FLUX_API_PORT}`;
 }
 
-function parseSecondaryNodeFromHAProxyStats(htmlContent, appname) {
-  const serverRowRegex = /<tr class="(?:active_up|backup_up|active_down|backup_down)[^"]*"[^>]*>([\s\S]*?)<\/tr>/gi;
-
-  let secondaryNode = null;
-  const activeNodes = [];
-  let match = serverRowRegex.exec(htmlContent);
-
-  while (match !== null) {
-    const rowContent = match[1];
-    const ipMatch = rowContent.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+)/);
-
-    if (ipMatch) {
-      if (match[0].includes('backup_up')) {
-        [secondaryNode] = ipMatch;
-        break;
-      }
-      if (match[0].includes('active_up')) {
-        activeNodes.push(ipMatch[0]);
-      }
-    }
-    match = serverRowRegex.exec(htmlContent);
-  }
-
-  if (!secondaryNode) {
-    const tableRegex = /<table[^>]*>[\s\S]*?<\/table>/gi;
-    const tables = htmlContent.match(tableRegex);
-
-    if (tables) {
-      tables.forEach((table) => {
-        if (!secondaryNode && table.includes(appname) && table.includes('Backend')) {
-          const backupServerRegex = /<tr[^>]*class="[^"]*backup[^"]*"[^>]*>[\s\S]*?<td[^>]*>(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+)[^<]*<\/td>[\s\S]*?<td[^>]*>UP<\/td>/gi;
-          const backupMatch = backupServerRegex.exec(table);
-          if (backupMatch) {
-            [, secondaryNode] = backupMatch;
-          }
-        }
-      });
-    }
-  }
-
-  if (!secondaryNode && activeNodes.length > 1) {
-    [, secondaryNode] = activeNodes;
-    log.info(`No backup nodes found for ${appname}, using second active node: ${secondaryNode}`);
-  }
-
-  return secondaryNode;
+function parseSecondaryNodeFromHAProxyStats(csv, appname) {
+  if (typeof csv !== 'string' || !/^[a-z0-9_-]{1,128}$/i.test(appname)) return null;
+  const lines = csv.trim().replace(/^#\s*/, '').split(/\r?\n/);
+  const columns = lines.shift().split(',');
+  const index = Object.fromEntries(['pxname', 'svname', 'status', 'bck', 'act'].map((name) => [name, columns.indexOf(name)]));
+  if (Object.values(index).some((value) => value < 0)) return null;
+  const name = appname.toLowerCase();
+  const backends = new Map();
+  lines.forEach((line) => {
+    const fields = line.split(',');
+    const backend = String(fields[index.pxname] || '').toLowerCase();
+    // FDM generates name_port.app.runonflux.io, removing dots for HAProxy.
+    // The underscore and complete suffix bind the row to this exact app.
+    if (!backend.startsWith(`${name}_`)) return;
+    const suffix = backend.slice(name.length + 1);
+    const port = /^(\d{1,5})app(?:2)?runonfluxiobackend$/.exec(suffix);
+    if (!port || Number(port[1]) < 1 || Number(port[1]) > 65535 || fields[index.status] !== 'UP') return;
+    const server = /^(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})$/.exec(fields[index.svname]);
+    if (!server || !net.isIPv4(server[1]) || Number(server[2]) < 1 || Number(server[2]) > 65535) return;
+    if (!backends.has(backend)) backends.set(backend, { backup: new Set(), active: new Set() });
+    const nodes = backends.get(backend);
+    if (fields[index.bck] === '1') nodes.backup.add(server[0]);
+    else if (fields[index.act] === '1') nodes.active.add(server[0]);
+  });
+  const candidates = [...backends.values()];
+  const backup = candidates.find((nodes) => nodes.backup.size > 0);
+  if (backup) return [...backup.backup][0];
+  const active = candidates.find((nodes) => nodes.active.size > 1);
+  return active ? [...active.active][1] : null;
 }
 
 async function getPrimaryNodeIp(appname, diagnostics) {
@@ -318,9 +302,11 @@ async function getSecondaryNodeSelection(appname, excludedNodes = new Set()) {
       node: null, primaryIp: null, reason: error.message, diagnostics,
     };
   }
-  const statsUrl = `${getFdmBaseUrl(appname)}/fluxstatistics?scope=${appname}_`;
+  const statsUrl = `${getFdmBaseUrl(appname)}/fluxstatistics;csv?scope=${encodeURIComponent(appname)}_`;
   try {
-    const response = await axios.get(statsUrl, { httpsAgent, maxRedirects: 0, timeout: 30000 });
+    const response = await axios.get(statsUrl, {
+      httpsAgent, maxRedirects: 0, timeout: 30000, maxContentLength: 8 * 1024 * 1024, responseType: 'text',
+    });
 
     if (!response.data) {
       diagnostics.push({
@@ -1755,6 +1741,7 @@ async function createBackupTaskWithTeamCredentials(
 }
 
 module.exports = {
+  parseSecondaryNodeFromHAProxyStats,
   getAppSpecs,
   getBlockHeight,
   verifyAppOwner,

@@ -45,8 +45,8 @@ async function main() {
       if (discoveryFailure) throw new Error('Gateway statistics unavailable');
       return { status: 200, data: pool };
     }
-    if (url.includes('/fluxstatistics?scope=')) {
-      return { status: 200, data: '<tr class="backup_up"><td>203.0.113.200:16127</td></tr>' };
+    if (url.includes('/fluxstatistics;csv?scope=')) {
+      return { status: 200, data: '# pxname,svname,status,bck,act\nvictim_30000apprunonfluxiobackend,203.0.113.200:16127,UP,1,0' };
     }
     if (url.includes('/api/appips/')) return { status: 200, data: { status: 'success', data: { ips: ['198.51.100.1'] } } };
     const backend = /^https:\/\/203-0-113-(1[123])-16127\.node\.api\.runonflux\.io\//.exec(url);

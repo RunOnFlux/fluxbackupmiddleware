@@ -34,7 +34,11 @@
     "test:task-completion-monitoring": "node scripts/test-task-completion-monitoring.js",
     "start": "node index.js",
     "lint": "eslint ./",
-    "lint:fix": "eslint ./ --fix"
+    "lint:fix": "eslint ./ --fix",
+    "test:backup-resource-limits": "node scripts/test-backup-resource-limits.js",
+    "test:task-queue-admission": "node scripts/test-task-queue-admission.js",
+    "test:api-rate-limits": "node scripts/test-api-rate-limits.js",
+    "test:haproxy-app-scope": "node scripts/test-haproxy-app-scope.js"
   },
   "author": "Ali Mahdavi",
   "license": "ISC",
