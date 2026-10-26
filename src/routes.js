@@ -7,6 +7,7 @@ const backupService = require('./services/backupService');
 const log = require('./lib/log');
 const adminAuth = require('./services/adminAuth');
 const adminData = require('./services/adminData');
+const { loginLimiter, mutationLimiter } = require('./services/utils/requestLimits');
 
 function adminPage(filename) {
   return (req, res) => {
@@ -41,12 +42,12 @@ function registerRoutes(app) {
   app.get('/', (req, res) => {
     res.send({ status: 'OK' });
   });
-  app.post('/verifylogin', asyncRoute(idService.verifyLogin));
-  app.post('/registerbackupfile', asyncRoute(backupService.registerBackupTask));
+  app.post('/verifylogin', loginLimiter, asyncRoute(idService.verifyLogin));
+  app.post('/registerbackupfile', mutationLimiter, asyncRoute(backupService.registerBackupTask));
   app.get('/getbackuplist', asyncRoute(backupService.getBackupList));
   app.get('/getrestorerules', asyncRoute(backupService.getRestoreRules));
   app.get('/getTaskStatus', asyncRoute(backupService.getTaskStatus));
-  app.post('/removeCheckpoint', asyncRoute(backupService.removeCheckpoint));
+  app.post('/removeCheckpoint', mutationLimiter, asyncRoute(backupService.removeCheckpoint));
   app.get('/getfile', asyncRoute(fluxDrive.getFile));
   app.get('/dailybackupreport', asyncRoute(backupService.getDailyBackupReport));
   app.post('/dailybackupreport/send', asyncRoute(backupService.forceSendDailyBackupReport));

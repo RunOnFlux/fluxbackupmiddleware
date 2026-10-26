@@ -1,6 +1,7 @@
 const axios = require('axios');
 const config = require('../../config/default');
 const log = require('../lib/log');
+const { httpsAgent } = require('./utils/nodeAuthentication');
 
 let marketplaceTemplatesCache = null;
 let marketplaceCacheTimestamp = 0;
@@ -57,7 +58,7 @@ async function getMarketplaceTemplates(forceRefresh = false) {
   }
 
   try {
-    const response = await axios.get(config.marketplaceCatalog.url, { timeout: 30000 });
+    const response = await axios.get(config.marketplaceCatalog.url, { httpsAgent, maxRedirects: 0, timeout: 30000 });
     const templates = extractMarketplaceTemplates(response.data);
     if (!templates || templates.length === 0) {
       throw new Error('Marketplace catalog contained no valid compose templates');

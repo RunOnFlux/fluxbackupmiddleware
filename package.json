@@ -7,6 +7,8 @@
     "test": "node index.js",
     "test:session-authorization": "node scripts/test-session-authorization.js",
     "test:wallet-compatibility": "node scripts/test-wallet-compatibility.js",
+    "test:outbound-node-auth": "node scripts/test-outbound-node-auth.js",
+    "test:registry-consensus": "node scripts/test-registry-consensus.js",
     "test:automatic-backup-dispatch": "node scripts/test-automatic-backup-dispatch.js",
     "test:backup-profiles": "node scripts/test-backup-profiles.js",
     "test:concurrent-downloads": "node scripts/test-concurrent-task-downloads.js",
@@ -32,7 +34,11 @@
     "test:task-completion-monitoring": "node scripts/test-task-completion-monitoring.js",
     "start": "node index.js",
     "lint": "eslint ./",
-    "lint:fix": "eslint ./ --fix"
+    "lint:fix": "eslint ./ --fix",
+    "test:backup-resource-limits": "node scripts/test-backup-resource-limits.js",
+    "test:task-queue-admission": "node scripts/test-task-queue-admission.js",
+    "test:api-rate-limits": "node scripts/test-api-rate-limits.js",
+    "test:haproxy-app-scope": "node scripts/test-haproxy-app-scope.js"
   },
   "author": "Ali Mahdavi",
   "license": "ISC",

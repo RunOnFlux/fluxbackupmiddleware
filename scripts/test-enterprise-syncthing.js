@@ -15,7 +15,7 @@ const https = require('https');
 const fluxOS = require('../src/services/fluxOsService');
 const enterpriseCrypto = require('../src/services/enterpriseCrypto');
 
-const httpsAgent = new https.Agent({ rejectUnauthorized: false });
+const httpsAgent = new https.Agent({ rejectUnauthorized: true });
 const ENTERPRISE_LIMIT = Number(process.env.TEST_ENTERPRISE_LIMIT || 10);
 const ENTERPRISE_APP = process.env.TEST_ENTERPRISE_APP;
 const RUN_FULL_DISCOVERY = process.env.TEST_ENTERPRISE_FULL_DISCOVERY === 'true';
@@ -30,6 +30,7 @@ async function fetchGlobalAppSpecs() {
     `${enterpriseCrypto.FLUX_API}/apps/globalappsspecifications`,
     {
       httpsAgent,
+      maxRedirects: 0,
       timeout: 120000,
       headers: { 'x-apicache-bypass': 'true' },
     },

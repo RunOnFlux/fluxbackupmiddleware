@@ -13,6 +13,9 @@ async function main() {
   log.info = () => {};
   log.warn = () => {};
   axios.get = async (url) => {
+    if (url.endsWith('/fluxstatistics;csv')) {
+      return { status: 200, data: '# pxname,svname,status\napirunonfluxiobackend,server1_203.0.113.11,UP\napirunonfluxiobackend,server2_203.0.113.12,UP\napirunonfluxiobackend,server3_203.0.113.13,UP' };
+    }
     if (url.includes('/fluxstatistics')) {
       return { status: 200, data: '<html><body>No healthy secondary</body></html>' };
     }

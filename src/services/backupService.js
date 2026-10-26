@@ -8,6 +8,7 @@ const DBClient = require('./utils/DBClient');
 const log = require('../lib/log');
 const config = require('../../config/default');
 const idService = require('./idService');
+const nodeAuthentication = require('./utils/nodeAuthentication');
 const messageHelper = require('./utils/messageHelper');
 const fileManager = require('./fileService');
 const fluxDrive = require('./fluxDrive');
@@ -30,6 +31,40 @@ const {
 let dbCli = null;
 
 const taskQueue = new Map();
+let admissionTail = Promise.resolve();
+const registrationWindows = new Map();
+
+function withTaskAdmission(operation) {
+  const result = admissionTail.then(operation);
+  admissionTail = result.catch(() => {});
+  return result;
+}
+
+function consumeRegistration(owner) {
+  const now = Date.now();
+  registrationWindows.forEach((value, key) => {
+    if (value.expires <= now) registrationWindows.delete(key);
+  });
+  let window = registrationWindows.get(owner);
+  if (!window) {
+    if (registrationWindows.size >= 10000) throw new Error('Task registration is busy; try again later');
+    window = { expires: now + 10 * 60 * 1000, count: 0 };
+    registrationWindows.set(owner, window);
+  }
+  if (window.count >= 60) {
+    const error = new Error('Too many backup registrations; try again later');
+    error.code = 'BACKUP_RATE_LIMIT';
+    throw error;
+  }
+  window.count += 1;
+}
+
+function hasTaskCapacity(task) {
+  if (taskQueue.has(Number(task.taskId)) || taskQueue.size >= config.maxConcurrentTasks) return false;
+  let ownerTasks = 0;
+  taskQueue.forEach((running) => { if (running.owner === task.owner) ownerTasks += 1; });
+  return ownerTasks < config.maxConcurrentTasksPerOwner;
+}
 const userQuotaOperations = new Map();
 const TASK_MAX_FAILURES = 4;
 let fluxDriveReconciliationRunning = false;
@@ -749,7 +784,7 @@ async function cancelTaskDueToQuota(task, taskId, filesize) {
     uploaded: 0,
   };
   // eslint-disable-next-line no-use-before-define
-  const remoteRemoved = await removeBackupFromRemoteHost(cancelledTask.host, taskId);
+  const remoteRemoved = await removeBackupFromRemoteHost(cancelledTask, taskId);
   if (remoteRemoved) cancelledTask.remoteRemoved = 1;
   if (fileManager.fileExists(cancelledTask) || !cancelledTask.localRemoved) {
     try {
@@ -938,7 +973,7 @@ async function runTask(id) {
   try {
     if (task.extra) {
       try {
-        if (JSON.parse(task.extra).failureDiagnostic) task.extra = '';
+        if (JSON.parse(task.extra).failureDiagnostic) task.extra = fileManager.getTaskAuthHeader(task) || '';
       } catch (error) {
         // Preserve non-diagnostic legacy task metadata.
       }
@@ -1000,19 +1035,19 @@ async function runTask(id) {
     }
   } catch (error) {
     const message = getErrorMessage(error);
-    const deferredForStorage = error.deferWithoutFailure === true;
-    if (deferredForStorage || !task.status || task.status.state !== 'failed') {
+    const deferred = error.deferWithoutFailure === true;
+    if (deferred || !task.status || task.status.state !== 'failed') {
       task.status = {
-        state: deferredForStorage ? 'waiting' : 'failed',
+        state: deferred ? 'waiting' : 'failed',
         message,
         progress: 0,
       };
     }
     if (error.diagnostic) {
-      task.extra = JSON.stringify({ failureDiagnostic: error.diagnostic });
+      task.extra = JSON.stringify({ auth: fileManager.getTaskAuthHeader(task), failureDiagnostic: error.diagnostic });
     }
     if (error.terminal === true) task.fails = TASK_MAX_FAILURES;
-    else if (!deferredForStorage) task.fails += 1;
+    else if (!deferred) task.fails += 1;
 
     if (task.fails >= TASK_MAX_FAILURES) {
       try {
@@ -1035,8 +1070,8 @@ async function runTask(id) {
         log.error(`Failed to record failure activity for task ${id}: ${getErrorMessage(activityError)}`);
       }
     }
-    if (deferredForStorage) {
-      log.warn(`task ${id} deferred until local storage capacity is available: ${message}`);
+    if (deferred) {
+      log.warn(`task ${id} deferred: ${message}`);
     } else {
       log.error(`task ${id} failed:`, error instanceof Error ? error : message);
     }
@@ -1052,44 +1087,37 @@ function launchTask(id) {
   });
 }
 
-/**
- * This function updates the task queue. It first removes any tasks from the queue that have been running for more than an hour.
- * Then, if the queue has space, it fetches the latest remaining tasks from the database and adds them to the queue.
- * It only fetches tasks that have not finished and have attempts remaining.
- * It then runs each newly added task.
- *
- * @async
- * @throws Will throw an error if the database query fails.
- */
-async function updateQueue() {
-  // remove failed tasks from queue
-  const now = Math.floor(Date.now() / 1000);
-  const failTime = 30 * 60; // 30 minutes
-  taskQueue.forEach((value, key) => {
-    if (now - value.startTime > failTime) {
-      log.info(`deleting ${key} from queue.`);
-      taskQueue.delete(key);
-    }
-  });
-  // check if queue has space
-  if (taskQueue.size < config.maxConcurrentTasks) {
-    // read latest remaining tasks from db
-    const emptySlots = config.maxConcurrentTasks - taskQueue.size;
-    const records = await dbCli.execute(`select * from tasks where finishTime=0 and fails<${TASK_MAX_FAILURES} order by timestamp limit ${Number(emptySlots)}`);
-    // if (records.length) log.debug(`${records.length} failed tasks, retrying...`);
+/** Fill free slots without releasing ownership of any running transfer. */
+async function updateQueueInternal() {
+  if (taskQueue.size >= config.maxConcurrentTasks) return;
+  const maxPasses = config.maxConcurrentTasks;
+  for (let pass = 0; pass < maxPasses && taskQueue.size < config.maxConcurrentTasks; pass += 1) {
+    const active = [...taskQueue.keys()];
+    const owners = new Map();
+    taskQueue.forEach((task) => owners.set(task.owner, (owners.get(task.owner) || 0) + 1));
+    const saturated = [...owners].filter(([, count]) => count >= config.maxConcurrentTasksPerOwner).map(([owner]) => owner);
+    const exclude = active.length ? ` AND taskId NOT IN (${active.map(() => '?').join(',')})` : '';
+    const ownerExclude = saturated.length ? ` AND owner NOT IN (${saturated.map(() => '?').join(',')})` : '';
+    // Both ordering fields are server-controlled. Retry attempts go behind
+    // never-started tasks. Filter saturated owners before applying LIMIT so
+    // their backlog cannot hide other owners from the scheduler.
+    const records = await dbCli.execute(`SELECT * FROM tasks WHERE finishTime=0 AND fails<${TASK_MAX_FAILURES}${exclude}${ownerExclude} ORDER BY startTime, taskId LIMIT ${Number(config.maxConcurrentTasks)}`, [...active, ...saturated]);
+    let launched = 0;
     for (let i = 0; i < records.length; i += 1) {
-      if (!taskQueue.has(records[i].taskId)) {
-        // add task to the queue
-        taskQueue.set(Number(records[i].taskId), records[i]);
-        // run task
-        log.debug(`retrying task ${records[i].taskId}`);
-        launchTask(Number(records[i].taskId));
-      } else {
-        // log.warn(`task ${records[i].taskId} already in queue.`);
+      const task = records[i];
+      if (taskQueue.size >= config.maxConcurrentTasks) break;
+      if (hasTaskCapacity(task)) {
+        taskQueue.set(Number(task.taskId), task);
+        launchTask(Number(task.taskId));
+        launched += 1;
       }
     }
-    // console.log(taskQueue.entries());
+    if (launched === 0) break;
   }
+}
+
+function updateQueue() {
+  return withTaskAdmission(updateQueueInternal);
 }
 
 /**
@@ -1107,7 +1135,7 @@ async function checkExpiredApps() {
       // get apps that have been expired more than 7 days
       const records = await dbCli.execute(`select * from tasks where removedFromFluxdrive = 0 and uploaded = 1 and appExpireHeight > 0  and appExpireHeight < ${Number(expireHeight)} order by appExpireHeight ASC limit 10`);
       // eslint-disable-next-line no-restricted-syntax
-      for (record of records) {
+      for (const record of records) {
         // check if they have been extended
         const appSpecs = await fluxOS.getAppSpecs(record.appname, true);
         if (appSpecs && appSpecs !== 'Application not found' && appSpecs.expire + appSpecs.height !== record.appExpireHeight) {
@@ -1493,6 +1521,7 @@ async function registerBackupTask(req, res, taskObj = null) {
         throw new Error('Unauthorized access. Session expired.');
       }
     }
+    if (!taskObj) consumeRegistration(owner);
     // validate app and component name
     if (!appname || !component) {
       throw new Error('Invalid app or component name.');
@@ -1521,6 +1550,7 @@ async function registerBackupTask(req, res, taskObj = null) {
     if (!isValidUrl(host)) {
       throw new Error('host url is not valid');
     }
+    nodeAuthentication.parseHttpUrl(host);
     // get app expire height
     const appExpireHeight = await fluxOS.getAppExpireHeight(appname);
     if (appExpireHeight === false) {
@@ -1528,56 +1558,72 @@ async function registerBackupTask(req, res, taskObj = null) {
     }
     // When taskObj is provided, extra can be empty
     const extra = taskObj ? '' : req.headers.zelidauth;
-    // check if task is a duplicate (needed before quota check to avoid double-counting)
-    const record = await dbCli.execute(`
-      SELECT *
-      FROM tasks
-      WHERE owner = ?
-      AND timestamp = ?
-      AND appname = ?
-      AND component = ?
-      AND removedFromFluxdrive = 0
-      AND (uploaded = 1 OR (uploaded = 0 AND finishTime = 0 AND fails < ?))
-      ORDER BY taskId DESC
-      LIMIT 1
-    `, [owner, timestamp, appname, component, TASK_MAX_FAILURES]);
-    if (record.length > 0 && record[0].uploaded === 1) {
-      throw new Error('Checkpoint has already been uploaded to FluxDrive.');
-    }
-    let taskId = null;
-    if (record.length > 0 && record[0].uploaded === 0) {
-      // Resume existing task; return its ID even if the queue is full (updateQueue will retry)
-      taskId = record[0].taskId;
-      if (taskQueue.size < config.maxConcurrentTasks) {
-        const task = await dbCli.getTask(taskId);
-        if (task) {
-          task.extra = taskObj ? '' : req.headers.zelidauth;
-          task.removedFromFluxdrive = 0;
-          await dbCli.updateTask(task);
-          taskQueue.set(Number(taskId), task);
-          launchTask(Number(taskId));
+    const taskId = await withTaskAdmission(async () => {
+      // check if task is a duplicate (needed before quota check to avoid double-counting)
+      const record = await dbCli.execute(`
+        SELECT *
+        FROM tasks
+        WHERE owner = ?
+        AND timestamp = ?
+        AND appname = ?
+        AND component = ?
+        AND removedFromFluxdrive = 0
+        AND (uploaded = 1 OR (uploaded = 0 AND finishTime = 0 AND fails < ?))
+        ORDER BY taskId DESC
+        LIMIT 1
+      `, [owner, timestamp, appname, component, TASK_MAX_FAILURES]);
+      if (record.length > 0 && record[0].uploaded === 1) {
+        throw new Error('Checkpoint has already been uploaded to FluxDrive.');
+      }
+      let admittedTaskId = null;
+      if (record.length > 0 && record[0].uploaded === 0) {
+        // Resume existing task; return its ID even if the queue is full (updateQueue will retry)
+        admittedTaskId = record[0].taskId;
+        if (!taskQueue.has(Number(admittedTaskId))) {
+          const task = await dbCli.getTask(admittedTaskId);
+          if (task) {
+            task.extra = taskObj ? '' : req.headers.zelidauth;
+            task.removedFromFluxdrive = 0;
+            await dbCli.updateTask(task);
+            if (hasTaskCapacity(task)) {
+              taskQueue.set(Number(admittedTaskId), task);
+              launchTask(Number(admittedTaskId));
+            }
+          }
+        }
+      } else {
+        if (!taskObj) {
+          const counts = await dbCli.execute(`
+            SELECT SUM(owner = ?) AS ownerPending,
+            SUM(backup_type = 'manual' OR backup_type IS NULL) AS manualPending
+            FROM tasks WHERE finishTime = 0 AND fails < ? AND uploaded = 0
+          `, [owner, TASK_MAX_FAILURES]);
+          if (Number(counts[0]?.ownerPending || 0) >= config.maxPendingTasksPerOwner
+            || Number(counts[0]?.manualPending || 0) >= config.maxPendingManualTasks) {
+            throw new Error('Too many pending backup tasks; wait for existing tasks to finish');
+          }
+        }
+        // add task to the db
+        const newTask = {
+          owner, timestamp, filename, appname, component, filesize, host, extra, appExpireHeight, backup_type: backupType,
+        };
+        if (backupProfile) newTask.backup_profile = backupProfile;
+        const result = await dbCli.addNewTask(newTask);
+        admittedTaskId = result.insertId;
+        if (!admittedTaskId) {
+          throw new Error('Failed to create backup task in database');
+        }
+        // run the task if there is space in queue
+        if (!taskQueue.has(Number(admittedTaskId)) && taskQueue.size < config.maxConcurrentTasks) {
+          const task = await dbCli.getTask(admittedTaskId);
+          if (task && hasTaskCapacity(task)) {
+            taskQueue.set(Number(admittedTaskId), task);
+            launchTask(Number(admittedTaskId));
+          }
         }
       }
-    } else {
-      // add task to the db
-      const newTask = {
-        owner, timestamp, filename, appname, component, filesize, host, extra, appExpireHeight, backup_type: backupType,
-      };
-      if (backupProfile) newTask.backup_profile = backupProfile;
-      const result = await dbCli.addNewTask(newTask);
-      taskId = result.insertId;
-      if (!taskId) {
-        throw new Error('Failed to create backup task in database');
-      }
-      // run the task if there is space in queue
-      if (taskQueue.size < config.maxConcurrentTasks) {
-        const task = await dbCli.getTask(taskId);
-        if (task) {
-          taskQueue.set(Number(taskId), task);
-          launchTask(Number(taskId));
-        }
-      }
-    }
+      return admittedTaskId;
+    });
     const phraseResponse = messageHelper.createDataMessage({ taskId });
     res.json(phraseResponse);
   } catch (error) {
@@ -1896,7 +1942,7 @@ async function cleanupIncompleteAutomaticBackupTasks(taskIds) {
 
     if (task.host && !task.remoteRemoved) {
       // eslint-disable-next-line no-use-before-define
-      const remoteRemoved = await removeBackupFromRemoteHost(task.host, taskId);
+      const remoteRemoved = await removeBackupFromRemoteHost(task, taskId);
       if (!remoteRemoved) {
         artifactCleanupFailed = true;
         failed += 1;
@@ -2119,38 +2165,31 @@ async function reconcileFluxDriveInventory() {
 
 /**
  * Removes backup file from remote host
- * Converts the download URL to removal URL and sends request with team authentication
+ * Converts the download URL to a removal URL with the same task authentication
  * @async
- * @param {string} host - The host URL from task (download URL)
+ * @param {object} task - The task, including its download URL and authentication metadata
  * @param {number} taskId - The task ID for updating database
  * @returns {Promise<boolean>} - true if removal was successful, false otherwise
  */
-async function removeBackupFromRemoteHost(host, taskId) {
+async function removeBackupFromRemoteHost(task, taskId) {
   try {
     // Convert download URL to removal URL
     // From: http://99.132.138.126:16177/backup/downloadlocalfile/...
     // To:   http://99.132.138.126:16177/backup/removebackupfile/...
-    const removalUrl = host.replace('/backup/downloadlocalfile/', '/backup/removebackupfile/');
+    const { url, zelidauth } = await fileManager.getTaskRequestAuthentication(task);
+    if (!url.pathname.startsWith('/backup/downloadlocalfile/')) return false;
+    url.pathname = url.pathname.replace('/backup/downloadlocalfile/', '/backup/removebackupfile/');
+    const removalUrl = url.href;
 
     log.info(`Attempting to remove remote file for task ${taskId} from: ${removalUrl}`);
-
-    // Parse URL to get node address
-    const urlParts = new URL(removalUrl);
-    const nodeUrl = `${urlParts.protocol}//${urlParts.host}`;
-
-    // Get zelidAuth for the request
-    const zelidAuth = await fluxOS.verifyTeamLogin(nodeUrl);
-
-    if (!zelidAuth) {
-      log.error(`Failed to authenticate with node for task ${taskId}`);
-      return false;
-    }
 
     // Make the removal request using axios
     const response = await axios.get(removalUrl, {
       headers: {
-        zelidauth: zelidAuth,
+        zelidauth,
       },
+      maxRedirects: 0,
+      httpsAgent: nodeAuthentication.httpsAgent,
       timeout: 30000, // 30 second timeout
     });
 
@@ -2634,7 +2673,7 @@ async function processAutomaticBackupInternal() {
           }
         }
 
-        const node = `http://${nodeAddress}`;
+        const node = nodeAuthentication.authenticatedNodeOrigin(`http://${nodeAddress}`);
         attemptedNodes.add(nodeAddress);
         log.info(`Using node: ${node}`);
 
@@ -2782,10 +2821,10 @@ async function processAutomaticBackupInternal() {
             const taskId = taskIds[i];
             // Get task details to get the host URL
             // eslint-disable-next-line no-await-in-loop
-            const taskDetails = await dbCli.execute('SELECT host FROM tasks WHERE taskId = ?', [taskId]);
+            const taskDetails = await dbCli.execute('SELECT taskId, host, owner, extra, backup_type FROM tasks WHERE taskId = ?', [taskId]);
             if (taskDetails.length > 0 && taskDetails[0].host) {
               // eslint-disable-next-line no-await-in-loop
-              const removalSuccess = await removeBackupFromRemoteHost(taskDetails[0].host, taskId);
+              const removalSuccess = await removeBackupFromRemoteHost(taskDetails[0], taskId);
               if (removalSuccess) {
                 remoteRemovalCount += 1;
               }
@@ -3088,6 +3127,12 @@ module.exports = {
   forceSendDailyBackupReport,
   forceSyncSyncthingApps,
   testHooks: {
+    updateQueue,
+    getActiveTasks: () => [...taskQueue.values()],
+    consumeRegistration,
+    resetRegistrationLimits: () => registrationWindows.clear(),
+    checkExpiredApps,
+    removeBackupFromRemoteHost,
     enforceAppBackupRetention,
     resolveBackupProfiles,
     canRetryOnPrimary,

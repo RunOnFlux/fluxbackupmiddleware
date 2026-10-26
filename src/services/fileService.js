@@ -7,6 +7,8 @@ const { pipeline } = require('stream/promises');
 const log = require('../lib/log');
 const config = require('../../config/default');
 const fluxOS = require('./fluxOsService');
+const idService = require('./idService');
+const nodeAuthentication = require('./utils/nodeAuthentication');
 const taskFileStorage = require('./utils/taskFileStorage');
 
 const MEBIBYTE = 1024 * 1024;
@@ -51,7 +53,7 @@ function createFileSizeLimitError(task) {
 function validateFluxDriveFileSize(task) {
   const expectedSize = Number(task.filesize);
   const maxBytes = getFluxDriveMaxFileSizeBytes();
-  if (!Number.isFinite(expectedSize) || expectedSize < 0) {
+  if (!Number.isSafeInteger(expectedSize) || expectedSize < 0) {
     throw new Error(`Invalid expected backup size for task ${task.taskId || 'new'}`);
   }
   if (!Number.isFinite(maxBytes) || maxBytes <= 0) {
@@ -127,6 +129,34 @@ function deleteFile(task) {
   }
 }
 
+function getTaskAuthHeader(task) {
+  if (typeof task.extra !== 'string' || !task.extra) return null;
+  try {
+    const extra = JSON.parse(task.extra);
+    if (extra?.failureDiagnostic) return typeof extra.auth === 'string' ? extra.auth : null;
+  } catch (error) {
+    // URL-encoded authentication headers are also supported.
+  }
+  return task.extra;
+}
+
+async function getTaskRequestAuthentication(task) {
+  const url = nodeAuthentication.authenticatedNodeUrl(task.host);
+  const suppliedAuth = getTaskAuthHeader(task);
+  if (suppliedAuth) {
+    const owner = await idService.verifyUserSession({ zelidauth: suppliedAuth });
+    if (owner && owner === task.owner) {
+      return { url, zelidauth: suppliedAuth };
+    }
+  }
+  if (!String(task.backup_type || '').startsWith('automatic')) {
+    throw nodeAuthentication.securityError('Manual backup authentication expired or is missing; register again with a valid owner session', 'BACKUP_OWNER_AUTH_REQUIRED');
+  }
+  const zelidauth = await fluxOS.verifyTeamLogin(url.origin);
+  if (!zelidauth) throw new Error('Failed to authenticate with trusted backup node');
+  return { url, zelidauth };
+}
+
 /**
  * Probes the remote backup file size before downloading.
  *
@@ -135,21 +165,13 @@ function deleteFile(task) {
  * @returns {Promise<number|null>}
  */
 async function getRemoteFileSize(task) {
-  const url = new URL(`${task.host}`);
-  const protocol = url.protocol.startsWith('https:') ? 'https' : 'http';
-  const node = `${protocol}://${url.hostname}${url.port ? `:${url.port}` : ''}`;
-
-  let zelidauth;
+  let authentication;
   try {
-    zelidauth = await fluxOS.verifyTeamLogin(node);
-  } catch (authError) {
-    log.error('Failed to authenticate with node for file size probe:', authError);
+    authentication = await getTaskRequestAuthentication(task);
+  } catch (error) {
     return null;
   }
-
-  if (!zelidauth) {
-    return null;
-  }
+  const { url, zelidauth } = authentication;
 
   return new Promise((resolve) => {
     const requestFn = url.protocol.startsWith('https:') ? https.request : http.request;
@@ -158,6 +180,7 @@ async function getRemoteFileSize(task) {
       port: url.port,
       path: url.pathname + url.search,
       method: 'HEAD',
+      rejectUnauthorized: true,
       headers: { zelidauth },
     }, (response) => {
       response.resume();
@@ -179,10 +202,10 @@ async function getRemoteFileSize(task) {
   });
 }
 
-async function getDownloadResponse(url, headers, redirectsRemaining = 5) {
+async function getDownloadResponse(url, headers, signal, redirectsRemaining = 5) {
   const requestFn = url.protocol.startsWith('https:') ? https.get : http.get;
   const response = await new Promise((resolve, reject) => {
-    const request = requestFn(url, { headers }, resolve);
+    const request = requestFn(url, { headers, rejectUnauthorized: true, signal }, resolve);
     request.on('error', reject);
     request.setTimeout(5 * 60 * 1000, () => {
       request.destroy(new Error('Backup download timed out due to inactivity'));
@@ -190,12 +213,16 @@ async function getDownloadResponse(url, headers, redirectsRemaining = 5) {
   });
 
   if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
-    response.resume();
+    response.destroy();
     if (redirectsRemaining === 0) {
       throw new Error('Backup download exceeded redirect limit');
     }
     const redirectUrl = new URL(response.headers.location, url);
-    return getDownloadResponse(redirectUrl, headers, redirectsRemaining - 1);
+    nodeAuthentication.parseHttpUrl(redirectUrl.href);
+    if (redirectUrl.origin !== url.origin) {
+      throw nodeAuthentication.securityError('Authenticated backup downloads cannot redirect to another origin', 'BACKUP_REDIRECT_BLOCKED');
+    }
+    return getDownloadResponse(redirectUrl, headers, signal, redirectsRemaining - 1);
   }
 
   return response;
@@ -205,9 +232,8 @@ async function getResponseSummary(response, maxLength = 500) {
   let summary = '';
   // eslint-disable-next-line no-restricted-syntax
   for await (const chunk of response) {
-    if (summary.length < maxLength) {
-      summary += chunk.toString().slice(0, maxLength - summary.length);
-    }
+    summary += chunk.toString().slice(0, maxLength - summary.length);
+    if (summary.length >= maxLength) break;
   }
   return summary.replace(/[\r\n]+/g, ' ');
 }
@@ -278,21 +304,23 @@ function getFluxNodeResponseError(responseBody, httpStatus) {
  */
 async function downloadFileFromHost(task) {
   const { filename } = task;
-  const url = new URL(`${task.host}`);
-  const protocol = url.protocol.startsWith('https:') ? 'https' : 'http';
-  const node = `${protocol}://${url.hostname}${url.port ? `:${url.port}` : ''}`;
+  let url = nodeAuthentication.authenticatedNodeUrl(task.host);
+  let node = url.origin;
 
   const expectedSize = validateFluxDriveFileSize(task);
   taskFileStorage.ensureTaskDirectory(task);
   taskFileStorage.unlinkIfPresent(taskFileStorage.getTaskFilePath(task));
   taskFileStorage.unlinkIfPresent(taskFileStorage.getTaskPartialFilePath(task));
 
+  const controller = new AbortController();
+  const deadline = setTimeout(() => controller.abort(), config.backupDownloadTimeoutMs);
+  deadline.unref();
   try {
     reserveDownloadCapacity(task, expectedSize);
-    // Get fresh zelidauth token first (outside of Promise)
     let zelidauth;
     try {
-      zelidauth = await fluxOS.verifyTeamLogin(node);
+      ({ url, zelidauth } = await getTaskRequestAuthentication(task));
+      node = url.origin;
     } catch (authError) {
       log.error('Failed to authenticate with node:', authError);
       throw addDownloadDiagnostic(authError, task, url, node);
@@ -310,7 +338,7 @@ async function downloadFileFromHost(task) {
     const partialPath = taskFileStorage.getTaskPartialFilePath(task);
 
     log.info(`Downloading ${filename} for task ${task.taskId} from ${url.href}`);
-    const response = await getDownloadResponse(url, { zelidauth });
+    const response = await getDownloadResponse(url, { zelidauth }, controller.signal);
     if (response.statusCode < 200 || response.statusCode >= 300) {
       const responseBody = await getResponseSummary(response);
       const httpError = new Error(`Backup download returned HTTP ${response.statusCode}`);
@@ -319,9 +347,24 @@ async function downloadFileFromHost(task) {
     }
 
     const contentLength = Number(response.headers['content-length']);
+    if (Number.isFinite(contentLength) && contentLength > expectedSize) {
+      response.destroy();
+      const error = new Error(`Backup response exceeds declared size: ${contentLength}>${expectedSize}`);
+      error.code = 'BACKUP_DOWNLOAD_TOO_LARGE';
+      error.terminal = true;
+      throw error;
+    }
     let receivedBytes = 0;
     const progressStream = new Transform({
       transform(chunk, encoding, callback) {
+        if (chunk.length > expectedSize - receivedBytes) {
+          const error = new Error(`Backup stream exceeds declared size of ${expectedSize} bytes`);
+          error.code = 'BACKUP_DOWNLOAD_TOO_LARGE';
+          error.terminal = true;
+          error.receivedSize = receivedBytes + chunk.length;
+          callback(error);
+          return;
+        }
         receivedBytes += chunk.length;
         updateDownloadReservation(task.taskId, receivedBytes);
         const progressTotal = Number.isFinite(contentLength) && contentLength > 0
@@ -359,6 +402,10 @@ async function downloadFileFromHost(task) {
     task.downloaded = true;
     return true;
   } catch (error) {
+    if (controller.signal.aborted) {
+      error.code = 'BACKUP_DOWNLOAD_TIMEOUT';
+      error.message = `Backup download exceeded its ${config.backupDownloadTimeoutMs}ms deadline`;
+    }
     addDownloadDiagnostic(error, task, url, node);
     try {
       taskFileStorage.removeTaskArtifacts(task);
@@ -370,6 +417,7 @@ async function downloadFileFromHost(task) {
     log.error(`Downloading ${filename} for task ${task.taskId} failed: ${error.message}`);
     throw error;
   } finally {
+    clearTimeout(deadline);
     releaseDownloadCapacity(task.taskId);
   }
 }
@@ -378,6 +426,8 @@ module.exports = {
   fileExists,
   deleteFile,
   getRemoteFileSize,
+  getTaskAuthHeader,
+  getTaskRequestAuthentication,
   getFluxDriveMaxFileSizeBytes,
   validateFluxDriveFileSize,
   downloadFileFromHost,
