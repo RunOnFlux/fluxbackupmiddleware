@@ -539,6 +539,23 @@ function soulmaskWorldPresent(listing, now = Date.now()) {
 }
 
 /**
+ * Whether the SaveFiles folder of a SCUM server holds its save snapshot, and
+ * no sync arriving in it.
+ *
+ * The game keeps the live SCUM.db on the install's local (ml:) mount; the g:
+ * volume holds only the image's snapshot of it (SQLite's online backup every
+ * five minutes and at a stop), written beside it as SCUM.db.part and renamed
+ * into place, with snapshot.json. A server that has not made its save yet has
+ * no snapshot.
+ */
+function scumSnapshotPresent(listing, now = Date.now()) {
+  const arriving = syncArriving([...listing, ...(listing.leftOut || [])], now);
+  if (arriving) return { reason: `${arriving.name} is still being synced`, unsettled: true };
+  const snapshot = listing.some((item) => item.isFile && item.name === 'SCUM.db' && Number(item.size) > 0);
+  return snapshot ? null : 'no world';
+}
+
+/**
  * Whether the Saved folder of a Conan Exiles server holds its world, and no
  * sync arriving in it.
  *
@@ -940,6 +957,73 @@ module.exports = [
         path: '',
         children: true,
         excludeChildren: /^(Saved|flux)$|^\.flux-|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+      },
+    ],
+  },
+  {
+    // SCUM on runonflux/scum-server-flux. appdata is /mnt/scum/data, a g: mount:
+    // Config/WindowsServer (ServerSettings.ini, the player lists and the rule
+    // files), SaveFiles (the snapshot of the save) and flux, the image's state.
+    // The 15.5 GB install, the Wine prefix, the LIVE SCUM.db (a SQLite file in
+    // WAL mode, which a file synchroniser must never carry) and the game's logs
+    // and own database copies are on the local (ml:) mount. What makes the full
+    // backup large is the image's own: flux/uploads (a save brought for
+    // import-save, up to 4 GB), the tar.gz of the save it makes on every start
+    // and every few hours (flux/backups, 8 kept), and the .flux-backup-* and
+    // .flux-restore-* scratch folders that images before 1.0.1 make on the
+    // synced volume, each holding a whole copy of the save.
+    id: 'scum-world',
+    // As in the hub's catalogue.
+    match: { name: '^scum', repotag: '(^|/)scum-server-flux', component: '^scum' },
+    // SaveFiles/SCUM.db is the image's snapshot, one whole database written
+    // aside and renamed, so no -wal or -shm of it is archived. A restore puts
+    // back a database as of that archive: a sidecar the node still has from
+    // after it would be replayed over it. SCUM.db.part is a snapshot that was
+    // being written.
+    restoreClear: [{ folder: 'SaveFiles', name: /^SCUM\.db(-wal|-shm|-journal|\.part)$/ }],
+    include: [
+      // The snapshot (SCUM.db) and snapshot.json, which tells the image when
+      // it was taken. Not a sidecar or a half-written copy.
+      {
+        path: 'SaveFiles',
+        required: true,
+        children: true,
+        excludeChildren: /\.part$|^SCUM\.db-(wal|shm|journal)$|\.flux-(unusable-.*|new)$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+        validate: scumSnapshotPresent,
+      },
+      // Config/WindowsServer: ServerSettings.ini (the server name, password and
+      // the 400 odd rules), the admin, ban, whitelist, exclusive and silenced
+      // lists, RaidTimes.json, EconomyOverride.json and Notifications.json.
+      // The game's own Config folder is a link to this one.
+      {
+        path: 'Config',
+        children: true,
+        excludeChildren: /\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+      },
+      // The image's state: state.json, env-applied.json (which environment
+      // values the panel has already written, so its edits survive a start)
+      // and db-seen.json (this server has had a save, so the start waits for
+      // one rather than making a new world). Not its backups but the newest,
+      // below, nor uploads, conflict copies, last-restore.json, nor a restore
+      // or an update it was asked for: restore-pending.json is read at the
+      // next start and would restore from flux/backups, which a node restored
+      // from this archive does not have.
+      {
+        path: 'flux',
+        children: true,
+        excludeChildren: /^(backups|uploads|sync-conflicts|tmp|restore-pending\.json|last-restore\.json|update-.*\.json|flux\.log(\.1)?)$|^\.flux-|\.tmp$|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
+      },
+      // The newest tar.gz the image made of the save, with SQLite's online
+      // backup of the live database: the restore point `flux-scum restore`
+      // takes. The image prefers its live database to the snapshot unless the
+      // snapshot is much newer, so on a node that still has one, restoring
+      // this archive alone does not change what the game loads: restoring this
+      // backup from the panel does. It finds a backup by this name.
+      { path: 'flux/backups', latest: { name: /^\d{8}-\d{6}-scum\.tar\.gz$/, settledMs: 5 * 60 * 1000 } },
+      {
+        path: '',
+        children: true,
+        excludeChildren: /^(Config|SaveFiles|flux)$|^\.flux-|\.sync-conflict-|^\.syncthing\..*\.tmp$|^~syncthing~.*\.tmp$/i,
       },
     ],
   },
