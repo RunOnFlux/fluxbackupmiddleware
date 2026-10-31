@@ -1673,6 +1673,84 @@ async function main() {
     );
     assert.match(conanLegacy.reason, /Saved does not exist/, 'the earlier image\'s layout');
 
+    // --- SCUM -----------------------------------------------------------------------
+    const scum = backupProfiles.profileForComponent({
+      appname: 'scum1790000000000', component: 'scumscum', repotag: null, componentCount: 1,
+    });
+    assert.strictEqual(scum.id, 'scum-world', 'marketplace component');
+    assert.strictEqual(byComponent('server', { repotag: 'runonflux/scum-server-flux:1.0.1' }).id, 'scum-world', 'by image');
+    // The save snapshot is whole, so its sidecars are cleared, never the snapshot itself
+    // (the archive replaces that), the backups, nor anything in another folder.
+    assert.deepStrictEqual(backupProfiles.restoreClearRules(scum).map((rule) => rule.folder), ['SaveFiles']);
+    const scumClear = new RegExp(backupProfiles.restoreClearRules(scum)[0].name);
+    assert(scumClear.test('SCUM.db-wal') && scumClear.test('SCUM.db-shm') && scumClear.test('SCUM.db-journal') && scumClear.test('SCUM.db.part'), 'stale sidecars');
+    assert(!scumClear.test('SCUM.db') && !scumClear.test('snapshot.json'), 'the snapshot pair is restored, not cleared');
+
+    // The volume of image 1.0.0 (2026-10-29): the snapshot pair, the config, the
+    // image's state, 8 tar.gz of the save, an import in uploads, and the scratch
+    // folders an image before 1.0.1 leaves on the synced volume.
+    const uFile = (name, size, minutesAgo = 30) => ({
+      name, size, isFile: true, isDirectory: false, modifiedAt: at(minutesAgo),
+    });
+    const uDir = (name, size) => ({
+      name, size, isFile: false, isDirectory: true, modifiedAt: at(30),
+    });
+    const scumSaveFiles = [uFile('SCUM.db', 4700000, 3), uFile('snapshot.json', 80, 3)];
+    const scumSaveJunk = [
+      uFile('SCUM.db.part', 2000000, 0), uFile('SCUM.db-wal', 400000, 3), uFile('SCUM.db-shm', 32768, 3),
+      uFile('SCUM.db.sync-conflict-20261029-101500-ABCDEFG', 4700000, 600),
+    ];
+    const scumConfig = [
+      uFile('ServerSettings.ini', 28000), uFile('AdminUsers.ini', 40), uFile('BannedUsers.ini', 0), uFile('WhitelistedUsers.ini', 0),
+      uFile('ExclusiveUsers.ini', 0), uFile('SilencedUsers.ini', 0), uFile('ServerSettingsAdminUsers.ini', 0),
+      uFile('RaidTimes.json', 300), uFile('EconomyOverride.json', 9000), uFile('Notifications.json', 900),
+    ];
+    const scumVolume = ({ saveFiles = [...scumSaveFiles, ...scumSaveJunk] } = {}) => async (folder) => {
+      switch (folder) {
+        case '': return [
+          uDir('Config', 40000), uDir('SaveFiles', 4800000), uDir('flux', 4100000000), uFile('.flux-backup', 1),
+          uDir('.flux-backup-ab12cd', 4700000), uDir('.flux-restore-ef34gh', 4700000),
+        ];
+        case 'Config': return [uDir('WindowsServer', 40000)];
+        case 'Config/WindowsServer': return scumConfig;
+        case 'SaveFiles': return saveFiles;
+        case 'flux/backups': return [
+          uFile('20261029-030000-scum.tar.gz', 1200000, 400), uFile('20261029-090000-scum.tar.gz', 1200000, 120),
+          uFile('20261029-150000-scum.tar.gz', 1200000, 2), uFile('20261029-150000-scum.tar.gz.part', 300000, 0), uFile('index.json', 900, 2),
+        ];
+        case 'flux': return [
+          uDir('backups', 9600000), uDir('uploads', 4000000000), uDir('sync-conflicts', 10), uDir('.flux-restore-x', 9), uFile('flux.log', 5000000),
+          uFile('state.json', 700), uFile('env-applied.json', 200), uFile('db-seen.json', 20), uFile('last-restore.json', 90),
+          uFile('restore-pending.json', 80), uFile('update-target.json', 80), uFile('update-failed.json', 80),
+        ];
+        default: return [];
+      }
+    };
+    const scumPlanOf = async (options) => backupProfiles.planProfiledArchive(
+      scum,
+      await backupProfiles.collectProfileListings(scum, scumVolume(options)),
+    );
+    assert.deepStrictEqual((await scumPlanOf()).sources, [
+      'appdata/.flux-backup',
+      'appdata/SaveFiles/SCUM.db', 'appdata/SaveFiles/snapshot.json',
+      'appdata/Config/WindowsServer',
+      'appdata/flux/state.json', 'appdata/flux/env-applied.json', 'appdata/flux/db-seen.json',
+      // The image's own consistent copy of the save: the newest settled one.
+      'appdata/flux/backups/20261029-090000-scum.tar.gz',
+    ]);
+    assert.match((await scumPlanOf({ saveFiles: scumSaveJunk })).reason, /no world/, 'only sidecars and a half-written snapshot');
+    assert.match((await scumPlanOf({ saveFiles: [uFile('SCUM.db', 0)] })).reason, /no world/, 'an empty snapshot');
+    assert.match((await scumPlanOf({ saveFiles: [uFile('snapshot.json', 80)] })).reason, /no world/, 'metadata without a snapshot');
+    const scumSyncing = await scumPlanOf({ saveFiles: [...scumSaveFiles, uFile('.syncthing.SCUM.db.tmp', 9, 1)] });
+    assert(scumSyncing.unsettled && /still being synced/.test(scumSyncing.reason), 'a sync arriving');
+    // A volume with no SaveFiles (a server that has not made its first snapshot, or another
+    // image): the full backup.
+    const scumLegacy = backupProfiles.planProfiledArchive(
+      scum,
+      await backupProfiles.collectProfileListings(scum, async (folder) => (folder === '' ? [uDir('SCUM', 9000000000), uDir('steamcmd', 1000)] : null)),
+    );
+    assert.match(scumLegacy.reason, /SaveFiles does not exist/, 'a volume that is the whole install');
+
     // --- Garry's Mod ----------------------------------------------------------------
     const gmod = backupProfiles.profileForComponent({
       appname: 'garrysmod1790000000000', component: 'garrysmodgarrysmod', repotag: null, componentCount: 1,
@@ -1786,7 +1864,7 @@ async function main() {
     // And the four that have one do not resolve to each other, nor to a neighbour.
     [
       ['arksurvivalevolvedarksurvivalevolved', 'ark-evolved-world'], ['arksurvivalascendedarksurvivalascended', 'ark-ascended-world'],
-      ['soulmasksoulmask', 'soulmask-world'], ['conanexilesconanexiles', 'conan-exiles-world'], ['garrysmodgarrysmod', 'garrysmod-data'],
+      ['soulmasksoulmask', 'soulmask-world'], ['conanexilesconanexiles', 'conan-exiles-world'], ['scumscum', 'scum-world'], ['garrysmodgarrysmod', 'garrysmod-data'],
       ['terrariaterraria', 'terraria-world'], ['rustrust', 'rust-world'],
     ].forEach(([component, id]) => assert.strictEqual(byComponent(component, { appname: `${component}1790000000000` }).id, id, component));
 
