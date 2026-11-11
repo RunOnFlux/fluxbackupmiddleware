@@ -119,7 +119,10 @@ async function cached(key, ttl, operation, fresh = false) {
 
 function normalizeSpec(body, appname) {
   // The API words it "Application: <name> not found"; older nodes said "Application not found".
-  if (body?.status === 'error' && /^Application:?(?: [\w-]{1,128})? not found$/i.test(String(body.data?.message || ''))) return null;
+  // A reply that names another app is not an answer about this one.
+  const notFound = body?.status === 'error'
+    && /^Application:?(?: ([\w-]{1,128}))? not found$/i.exec(String(body.data?.message || ''));
+  if (notFound && (!notFound[1] || notFound[1].toLowerCase() === appname.toLowerCase())) return null;
   const spec = body?.data;
   if (body?.status !== 'success' || !spec || typeof spec !== 'object' || Array.isArray(spec)
     || typeof spec.name !== 'string' || spec.name.toLowerCase() !== appname.toLowerCase()
