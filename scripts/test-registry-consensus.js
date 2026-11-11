@@ -35,7 +35,7 @@ async function main() {
   const spec = {
     name: 'victim', owner: victim.zelid, height: 1000000, expire: 1000, version: 8, compose: [],
   };
-  const notFound = { status: 'error', data: { message: 'Application not found' } };
+  const notFound = { status: 'error', data: { name: 'Error', message: 'Application: victim not found' } };
   axios.get = async (url, options) => {
     requests.push(url);
     assert.strictEqual(options.httpsAgent.options.rejectUnauthorized, true);
