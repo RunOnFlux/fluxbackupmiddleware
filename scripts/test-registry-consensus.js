@@ -35,7 +35,7 @@ async function main() {
   const spec = {
     name: 'victim', owner: victim.zelid, height: 1000000, expire: 1000, version: 8, compose: [],
   };
-  const notFound = { status: 'error', data: { message: 'Application not found' } };
+  const notFound = { status: 'error', data: { name: 'Error', message: 'Application: victim not found' } };
   axios.get = async (url, options) => {
     requests.push(url);
     assert.strictEqual(options.httpsAgent.options.rejectUnauthorized, true);
@@ -64,6 +64,8 @@ async function main() {
     specRequests += 1;
     if (mode === 'no-quorum' && !rogue) throw new Error('Backend unavailable');
     if (mode === 'not-found' || (mode === 'rogue-not-found' && rogue)) return { status: 200, data: notFound };
+    if (mode === 'not-found-legacy') return { status: 200, data: { status: 'error', data: { message: 'Application not found' } } };
+    if (mode === 'not-found-other-app') return { status: 200, data: { status: 'error', data: { name: 'Error', message: 'Application: someoneelse not found' } } };
     if (mode === 'no-quorum' || (mode === 'rogue-owner' && rogue)) {
       return { status: 200, headers: { fluxnode: 'pretending-to-be-another-backend' }, data: { status: 'success', data: { ...spec, owner: attacker.zelid } } };
     }
@@ -133,6 +135,12 @@ async function main() {
     // A failed quorum is never cached; a recovered majority works immediately.
     mode = 'healthy';
     assert.strictEqual(await fluxOS.getAppOwner('victim'), victim.zelid);
+    mode = 'not-found-legacy';
+    registry.testHooks.clearCaches();
+    assert.strictEqual(await fluxOS.isAppExpiredInGlobalSpecs('victim'), true, 'Older nodes\' wording still counts as not found');
+    mode = 'not-found-other-app';
+    registry.testHooks.clearCaches();
+    assert.strictEqual(await fluxOS.isAppExpiredInGlobalSpecs('victim'), null, 'A not-found reply about another app proves nothing');
     mode = 'not-found';
     const requestsBeforeExpiry = specRequests;
     assert.strictEqual(await fluxOS.isAppExpiredInGlobalSpecs('victim'), true);
